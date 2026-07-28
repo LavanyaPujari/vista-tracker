@@ -33,7 +33,6 @@ let activeRow = null;
 let lastSyncedAt = null;
 let isRefreshing = false;
 let pieSelected = null;
-let followUpDone = new Set();
 
 // dynamically detected column names for the "awaiting owner response" tracking —
 // null if this dataset doesn't have anything matching
@@ -97,6 +96,10 @@ async function boot(){
     renderTabStrip();
     renderActiveTab();
     updateSyncLabel();
+    // if this tab was opened via a "View Full Details" link (#/property/<name>),
+    // land directly on that property's full record instead of the dashboard
+    applyHashRoute();
+    window.addEventListener('hashchange', applyHashRoute);
     // keep the dashboard fresh without a full page reload
     setInterval(manualRefresh, 60000);
   }catch(e){
@@ -340,7 +343,8 @@ function renderTabStrip(){
   const strip = document.getElementById('tab-strip');
   strip.innerHTML = openTabs.map(t=>{
     const p = parseTab(t);
-    const label = t==='ALL' ? '🏠 All Properties' : `${p.type==='SQUAD'?'📍':'🧑'} ${escapeHtml(p.name)}`;
+    const icon = p.type==='SQUAD' ? '📍' : p.type==='STATUS' ? '📊' : '🧑';
+    const label = t==='ALL' ? '🏠 All Properties' : `${icon} ${escapeHtml(tabDisplayName(p))}`;
     return `
     <div class="browser-tab ${activeTabId===t?'active':''}" onclick="openTab('${t.replace(/'/g,"\\'")}')">
       <span>${label}</span>
@@ -355,6 +359,7 @@ function rowsForTab(tabId){
   const p = parseTab(tabId);
   if(p.type==='SQUAD') return allRows.filter(r=>fieldsFor(r).squad === p.name);
   if(p.type==='POC') return allRows.filter(r=>fieldsFor(r).owner === p.name);
+  if(p.type==='STATUS') return allRows.filter(r=>statusKey(fieldsFor(r).status) === p.name);
   return allRows;
 }
 
@@ -468,122 +473,6 @@ function topSquadStripsHtml(){
     </div>`;
 }
 
-/* ---------- COMPACT LEADERBOARDS ---------- */
-function leaderboardData(field){
-  const grouped = {};
-  allRows.forEach(row=>{ const key = fieldsFor(row)[field]; (grouped[key] = grouped[key] || []).push(row); });
-  return Object.entries(grouped).map(([name, rows])=>{
-    const health = Math.round(rows.reduce((sum,row)=>sum + healthFor(row).score,0) / rows.length);
-    const risk = rows.filter(row=>healthFor(row).score < 40).length;
-    return {name, health, risk, total:rows.length};
-  }).sort((a,b)=>b.health-a.health || b.total-a.total).slice(0,3);
-}
-function compactLeaderboardHtml(){
-  const block = (title, subtitle, field) => `<div class="leaderboard-panel"><div><div class="section-title">${title}</div><div class="section-desc">${subtitle}</div></div><div class="leaderboard-tiles">${leaderboardData(field).map((item,index)=>`<div class="leaderboard-tile"><span class="rank-no">0${index+1}</span><div class="mini-score ${item.health>=80?'good':item.health>=60?'steady':'watch'}"><b>${item.health}</b><small>health</small></div><strong title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</strong><span>${item.total} homes · ${item.risk} at risk</span></div>`).join('')}</div></div>`;
-  return `<section class="leaderboard-duo">${block('Squad pulse','Top health performers at a glance.','squad')}${block('KAM pulse','The clearest compact view of ownership.','owner')}</section>`;
-}
-
-/* ---------- NEEDS ATTENTION — 2 categories, squad rollup with dropdown ---------- */
-let attnActiveTab = 'exp';
-function setAttnTab(t){ attnActiveTab = t; renderActiveTab(); }
-
-function urgencyRing(daysVal, isAwaiting){
-  const r = 12, stroke = 4, circ = 2*Math.PI*r;
-  let pct, color, label;
-  if(isAwaiting){
-    pct = Math.min((daysVal||0)/30, 1);
-    color = daysVal>=30 ? '#a13f30' : daysVal>=21 ? '#b58a1f' : '#c9a227';
-    label = daysVal;
-  } else if(daysVal < 0){
-    pct = 1; color = '#6b1f14'; label = '!';
-  } else {
-    pct = 1 - Math.min(daysVal/30, 1);
-    color = daysVal<=7 ? '#a13f30' : '#b58a1f';
-    label = daysVal;
-  }
-  const dash = pct*circ;
-  return `<svg width="30" height="30" viewBox="0 0 30 30" class="urgency-ring" title="${isAwaiting?daysVal+'d waiting':(daysVal<0?'Expired':daysVal+'d left')}">
-    <circle cx="15" cy="15" r="${r}" fill="none" stroke="#eee" stroke-width="${stroke}"/>
-    <circle cx="15" cy="15" r="${r}" fill="none" stroke="${color}" stroke-width="${stroke}" stroke-dasharray="${dash.toFixed(2)} ${(circ-dash).toFixed(2)}" stroke-dashoffset="${(circ/4).toFixed(2)}" transform="rotate(-90 15 15)"/>
-    <text x="15" y="19" text-anchor="middle" font-size="9" font-weight="700" fill="${color}">${label}</text>
-  </svg>`;
-}
-
-function needsAttentionCompactHtml(){
-  const enriched = allRows.map(row=>{
-    const f = fieldsFor(row);
-    const lvl = urgencyLevel(f.endDateRaw);
-    const d = daysRemaining(f.endDateRaw);
-    const awaiting = isAwaitingResponse(f);
-    const waitingDays = awaiting ? daysSince(f.sentToOwnerRaw) : null;
-    return { row, f, lvl, d, awaiting, waitingDays };
-  });
-  const expiryGroup = enriched.filter(x=>x.lvl);
-  const responseGroup = enriched.filter(x=>x.awaiting);
-
-  function bySquad(list){
-    const map = {};
-    list.forEach(x=>{ (map[x.f.squad] = map[x.f.squad] || []).push(x); });
-    return Object.entries(map).sort((a,b)=>b[1].length-a[1].length);
-  }
-  const expiryBySquad = bySquad(expiryGroup);
-  const responseBySquad = bySquad(responseGroup);
-
-  const isAwaitingTab = attnActiveTab === 'resp';
-  const entries = isAwaitingTab ? responseBySquad : expiryBySquad;
-  const emptyMsg = isAwaitingTab
-    ? (SENT_DATE_KEY ? 'No properties waiting on a response right now.' : 'This category needs a "sent to owner date" column in Supabase to work.')
-    : 'Nothing urgent right now.';
-
-  const maxCount = Math.max(...entries.map(([,l])=>l.length), 1);
-  const miniChart = entries.length ? `
-    <div class="attn-mini-chart">
-      ${entries.slice(0,8).map(([sq,list])=>`
-        <div class="attn-mini-bar-row">
-          <span class="attn-mini-label">${escapeHtml(sq)}</span>
-          <div class="attn-mini-track"><div class="attn-mini-fill" style="width:${(list.length/maxCount)*100}%;background:${isAwaitingTab?'#b58a1f':'#a13f30'}"></div></div>
-          <span class="attn-mini-value">${list.length}</span>
-        </div>`).join('')}
-    </div>` : '';
-
-  const squadListHtml = entries.length===0 ? `<div class="empty-note">${emptyMsg}</div>` : `
-    <div class="attn-squad-list">
-      ${entries.map(([sq, list], i)=>`
-        <div class="attn-squad-row">
-          <div class="attn-squad-head" onclick="toggleAttnSquad('${attnActiveTab}-${i}')">
-            <span class="attn-caret" id="attn-caret-${attnActiveTab}-${i}">▸</span>
-            <span class="attn-squad-name">${escapeHtml(sq)}</span>
-            <span class="attn-squad-count">${list.length}</span>
-          </div>
-          <div class="attn-squad-body hidden" id="attn-body-${attnActiveTab}-${i}">
-            ${list.map(x=>`
-              <div class="attn-prop-row" onclick='openDetailFromRow(${JSON.stringify(JSON.stringify(x.row))})'>
-                ${urgencyRing(isAwaitingTab ? x.waitingDays : x.d, isAwaitingTab)}
-                <span class="attn-prop-name">${escapeHtml(x.f.name)}</span>
-              </div>`).join('')}
-          </div>
-        </div>`).join('')}
-    </div>`;
-
-  return `
-    <div class="section-card">
-      <div class="section-title">Needs Attention</div>
-      <div class="section-desc">Click a squad to see property names.</div>
-      <div class="attn-tabs">
-        <div class="attn-tab ${attnActiveTab==='exp'?'active':''}" onclick="setAttnTab('exp')">Expired / Needs Renewal <span class="attn-tab-count">${expiryGroup.length}</span></div>
-        <div class="attn-tab ${attnActiveTab==='resp'?'active':''}" onclick="setAttnTab('resp')">Awaiting Owner Response <span class="attn-tab-count">${responseGroup.length}</span></div>
-      </div>
-      ${miniChart}
-      ${squadListHtml}
-    </div>`;
-}
-function toggleAttnSquad(key){
-  const body = document.getElementById('attn-body-'+key);
-  const caret = document.getElementById('attn-caret-'+key);
-  if(!body) return;
-  body.classList.toggle('hidden');
-  caret.textContent = body.classList.contains('hidden') ? '▸' : '▾';
-}
 function openDetailFromRow(rowJsonStr){ activeRow = JSON.parse(rowJsonStr); renderActiveTab(); }
 
 /* ---------- PORTFOLIO OPERATIONS ---------- */
@@ -599,23 +488,11 @@ function healthFor(row){
   const tone = score >= 80 ? 'good' : score >= 60 ? 'steady' : score >= 40 ? 'watch' : 'risk';
   return {score,label,tone};
 }
-function healthSummaryHtml(rows, scopeName){
-  const values = rows.map(healthFor), average = values.length ? Math.round(values.reduce((sum, item)=>sum + item.score, 0) / values.length) : 0;
-  const atRisk = values.filter(item=>item.score < 40).length, thriving = values.filter(item=>item.score >= 80).length;
-  const tone = average >= 80 ? 'good' : average >= 60 ? 'steady' : average >= 40 ? 'watch' : 'risk';
-  return `<section class="scope-summary"><div class="scope-score ${tone}"><span class="scope-score-label">${escapeHtml(scopeName)} health</span><strong>${average}</strong><span>/ 100</span></div><div class="scope-insight"><b>${thriving}</b><span>homes are thriving</span></div><div class="scope-insight"><b>${atRisk}</b><span>homes need intervention</span></div><div class="scope-insight scope-tip"><span>Focus first on expired agreements and owner responses older than ${NO_RESPONSE_THRESHOLD_DAYS} days.</span></div></section>`;
-}
 function renewalTimelineHtml(rows){
   const dated = rows.map(row=>({row, f:fieldsFor(row), days:daysRemaining(fieldsFor(row).endDateRaw)})).filter(item=>item.days !== null && item.days <= 120);
   const upcoming = [...dated.filter(item=>item.days >= 0).sort((a,b)=>a.days-b.days).slice(0,5), ...dated.filter(item=>item.days < 0).sort((a,b)=>b.days-a.days).slice(0,3)];
   if(!upcoming.length) return `<div class="section-card"><div class="section-title">Renewal runway</div><div class="empty-note">No agreement end dates are available for the next 120 days.</div></div>`;
   return `<section class="section-card renewal-card"><div class="section-title">Renewal runway</div><div class="section-desc">A visual view of the next 120 days. Start with the homes closest to their renewal date.</div><div class="renewal-axis"><span>Overdue</span><span>30 days</span><span>60 days</span><span>90 days</span><span>120 days</span></div><div class="renewal-list">${upcoming.map(item=>{ const health = healthFor(item.row), position = Math.max(0, Math.min(100, (Math.max(item.days,0)/120)*100)), marker = item.days < 0 ? 'overdue' : item.days <= 30 ? 'soon' : item.days <= 60 ? 'watch' : 'planned', title = item.days < 0 ? `${Math.abs(item.days)}d overdue` : `${item.days}d to renewal`; return `<button class="renewal-row" onclick='openDetailFromRow(${JSON.stringify(JSON.stringify(item.row))})'><span class="renewal-name">${escapeHtml(item.f.name)}</span><span class="renewal-track"><i class="renewal-marker ${marker}" style="left:${position}%"></i></span><span class="renewal-days ${marker}">${title}</span><span class="health-mini ${health.tone}">${health.score}</span></button>`; }).join('')}</div></section>`;
-}
-function followUpWorkflowHtml(rows){
-  const dated = rows.map(row=>({row, f:fieldsFor(row), days:daysRemaining(fieldsFor(row).endDateRaw)})).filter(item=>item.days !== null && item.days <= 30);
-  const candidates = [...dated.filter(item=>item.days >= 0).sort((a,b)=>a.days-b.days).slice(0,3), ...dated.filter(item=>item.days < 0).sort((a,b)=>b.days-a.days).slice(0,2)];
-  if(!candidates.length) return '';
-  return `<section class="section-card followup-card"><div class="section-title">Owner follow-up queue</div><div class="section-desc">A focused working list for this session. Mark items done once the owner has been contacted.</div><div class="followup-list">${candidates.map(item=>{ const key = `${activeTabId}-${item.f.name}-${item.f.endDateRaw}`, done = followUpDone.has(key), due = item.days < 0 ? `Overdue by ${Math.abs(item.days)}d` : `Due in ${item.days}d`; return `<div class="followup-item ${done?'done':''}"><button class="followup-check" onclick="toggleFollowUp(${JSON.stringify(key)})" aria-label="Mark follow-up complete">${done?'✓':''}</button><div class="followup-copy"><b>${escapeHtml(item.f.name)}</b><span>${escapeHtml(item.f.owner)} · ${due}</span></div><button class="nudge-btn" onclick='prepareNudge(${JSON.stringify(JSON.stringify(item.row))})'>Prepare nudge</button></div>`; }).join('')}</div><div id="nudge-note" class="nudge-note" aria-live="polite"></div></section>`;
 }
 function portfolioAskHtml(){ return `<section class="ask-card"><div><span class="eyebrow">Portfolio intelligence</span><h3>Ask the portfolio</h3><p>Try “expiring in 30 days”, “at risk in Goa”, or “live homes with KAM Rahul”.</p></div><div class="ask-form"><input id="ask-portfolio-input" placeholder="Ask a portfolio question..." onkeydown="if(event.key==='Enter') askPortfolio()"><button onclick="askPortfolio()">Ask</button></div><div id="ask-portfolio-answer" class="ask-answer"></div></section>`; }
 function askPortfolio(){
@@ -629,8 +506,6 @@ function askPortfolio(){
   if(token) matches = matches.filter(row=>{const f=fieldsFor(row); return f.squad===token || f.owner===token || f.city===token;});
   const preview = matches.slice(0,3).map(row=>escapeHtml(fieldsFor(row).name)).join(', '); answer.innerHTML = `<b>${matches.length} home${matches.length===1?'':'s'} found.</b>${preview ? ` Start with ${preview}.` : ' Try a city, squad, KAM, status, or renewal window.'}`;
 }
-function toggleFollowUp(key){ followUpDone.has(key) ? followUpDone.delete(key) : followUpDone.add(key); renderActiveTab(); }
-function prepareNudge(rowJson){ const f = fieldsFor(JSON.parse(rowJson)), note = document.getElementById('nudge-note'); if(note) note.textContent = `Draft ready: Hi ${f.owner}, could you share an update on ${f.name} and its agreement renewal?`; }
 function sopHtml(){ return `<div class="view-header"><div><h2>Playbook & SOPs</h2><p class="desc">A shared rhythm for renewals, owner follow-ups, and portfolio health.</p></div></div><section class="sop-hero"><span class="eyebrow">Operations playbook</span><h1>Consistent actions.<br><em>Better stays.</em></h1><p>Use these lightweight SOPs to turn every dashboard signal into a clear next step.</p></section><div class="sop-grid"><article class="sop-card"><span>01</span><h3>Renewal runway</h3><p>Review the 120-day timeline weekly. Start outreach at 90 days; escalate at 30 days; flag overdue agreements immediately.</p></article><article class="sop-card"><span>02</span><h3>Owner follow-up</h3><p>Log an owner contact attempt, prepare a nudge, and mark it complete only when the next action and due date are clear.</p></article><article class="sop-card"><span>03</span><h3>Health review</h3><p>Investigate homes below 60. Prioritise expired agreements, paused homes, and unanswered owner communications.</p></article><article class="sop-card"><span>04</span><h3>Squad & KAM review</h3><p>Open each team tab in the weekly review. Agree one owner, one next step, and one due date for every at-risk home.</p></article></div>`; }
 
 /* ---------- MIS DOWNLOAD (button lives next to Refresh, no separate tab) ---------- */
@@ -663,6 +538,13 @@ function renderActiveTab(){
     document.getElementById('view-root').innerHTML = sopHtml();
     return;
   }
+  // Squad, POC (KAM), and status (e.g. "Live Properties") entry points open a
+  // dedicated expanded details page — a full table plus an agreement summary —
+  // instead of a filtered copy of the main dashboard.
+  if(p.type === 'SQUAD' || p.type === 'POC' || p.type === 'STATUS'){
+    renderExpandedDetailsPage(p, rowsForTab(activeTabId));
+    return;
+  }
   const rows = rowsForTab(activeTabId);
   const state = getTabState(activeTabId);
   const root = document.getElementById('view-root');
@@ -672,7 +554,8 @@ function renderActiveTab(){
   rows.forEach(r=>{ const k = statusKey(fieldsFor(r).status); counts[k]=(counts[k]||0)+1; });
 
   // Alerts are only about agreements genuinely expiring soon — red (7d) / orange (30d).
-  // Already-expired agreements are not alerted here; they live in Needs Attention below.
+  // Already-expired agreements aren't alerted here; open the relevant status card
+  // (or a Squad/POC tab) for the full expired list.
   let urgentRed=0, urgentOrange=0;
   rows.forEach(r=>{
     const lvl = urgencyLevel(fieldsFor(r).endDateRaw);
@@ -711,8 +594,9 @@ function renderActiveTab(){
     </div>
     ${KPI_ORDER.map(k=>{
       const sem = semanticStyleFor(k);
+      const keyArg = k.replace(/'/g,"\\'");
       return `
-      <div class="kpi-card ${state.statusFilter===k?'active':''}" style="background:linear-gradient(135deg, ${hexMix(sem.dot,0.82)}, ${hexMix(sem.dot,0.55)});border-color:${sem.dot};" onclick="setStatusFilter('${k}')">
+      <div class="kpi-card ${state.statusFilter===k?'active':''}" style="background:linear-gradient(135deg, ${hexMix(sem.dot,0.82)}, ${hexMix(sem.dot,0.55)});border-color:${sem.dot};" onclick="openStatusDetail('${keyArg}')" title="Open ${escapeHtml(KPI_LABELS[k])} properties">
         <div class="kpi-number" style="color:${sem.fg}">${counts[k]||0}</div>
         <div class="kpi-label" style="color:${sem.fg}">${escapeHtml(KPI_LABELS[k])}</div>
       </div>`;
@@ -725,53 +609,24 @@ function renderActiveTab(){
   if(urgentRed > 0) alertHtml += `<div class="alert-banner red" onclick="setUrgentFilter('red')">⚠ ${urgentRed} agreement${urgentRed===1?'':'s'} expiring within 7 days ${state.urgentOnly==='red' ? '<span class="clear-btn" onclick="clearUrgentFilter(event)">clear filter</span>' : ''}</div>`;
   if(urgentOrange > 0) alertHtml += `<div class="alert-banner orange" onclick="setUrgentFilter('orange')">⚠ ${urgentOrange} agreement${urgentOrange===1?'':'s'} expiring within 30 days ${state.urgentOnly==='orange' ? '<span class="clear-btn" onclick="clearUrgentFilter(event)">clear filter</span>' : ''}</div>`;
 
-  let bodyExtra = '';
-  let propertiesSection = '';
-  const scopeSummary = p.type === 'SQUAD' ? healthSummaryHtml(rows, `${p.name} squad`) : p.type === 'POC' ? healthSummaryHtml(rows, `${p.name}'s portfolio`) : '';
-  if(p.type === 'ALL'){
-    // Main dashboard combines portfolio signals with action-oriented work queues.
-    bodyExtra = `
-      ${portfolioAskHtml()}
-      ${healthSummaryHtml(rows, 'Portfolio')}
-      ${compactLeaderboardHtml()}
-      ${renewalTimelineHtml(rows)}
-      ${followUpWorkflowHtml(rows)}
-      ${squadDistributionChartHtml()}
-      ${topSquadStripsHtml()}
-      ${needsAttentionCompactHtml()}
-    `;
-  } else {
-    propertiesSection = `
-      ${renewalTimelineHtml(rows)}
-      ${followUpWorkflowHtml(rows)}
-      <div class="section-card">
-        <div class="section-title">Properties</div>
-        <div class="section-desc">Search within ${escapeHtml(p.name)}.</div>
-        <div class="search-row"><input id="search-box" placeholder="Search by property, city, or POC…" /></div>
-        <div id="result-area"></div>
-      </div>`;
-  }
+  // Main dashboard combines portfolio signals with action-oriented panels.
+  const bodyExtra = `
+    ${portfolioAskHtml()}
+    ${renewalTimelineHtml(rows)}
+    ${squadDistributionChartHtml()}
+    ${topSquadStripsHtml()}
+  `;
 
   root.innerHTML = `
     ${heroHtml}
     <div class="view-header">
-      <div><h2>${p.name}</h2><p class="desc">${p.type==='ALL' ? 'Portfolio-wide summary' : p.type==='SQUAD' ? 'Squad-level view' : 'POC-level view'} · live from Supabase</p></div>
-      ${p.type!=='ALL' ? '<div class="btn" style="cursor:default;">↓ Export</div>' : ''}
+      <div><h2>${p.name}</h2><p class="desc">Portfolio-wide summary · live from Supabase</p></div>
     </div>
     ${healthHtml}
-    ${scopeSummary}
     <div class="kpi-row">${kpiHtml}</div>
     ${alertHtml}
     ${bodyExtra}
-    ${propertiesSection}
   `;
-
-  if(p.type !== 'ALL' && p.type !== 'SOP'){
-    const searchBox = document.getElementById('search-box');
-    searchBox.value = state.search;
-    searchBox.addEventListener('input', (e)=>{ state.search = e.target.value.toLowerCase(); renderResultArea(); });
-    renderResultArea();
-  }
 }
 
 function setStatusFilter(key){ getTabState(activeTabId).statusFilter = key; renderActiveTab(); }
@@ -782,69 +637,177 @@ function setUrgentFilter(level){
 }
 function clearUrgentFilter(evt){ evt.stopPropagation(); getTabState(activeTabId).urgentOnly = null; renderActiveTab(); }
 
-function applyFilters(rows){
-  const state = getTabState(activeTabId);
+/* ---------- EXPANDED DETAILS PAGE (Squad / POC / Status) ---------- */
+// Opened as its own tab when a user clicks a status KPI (e.g. "Live Properties")
+// or a Squad / KAM (POC) entry in the sidebar — shows every property in scope as
+// a full detailed table, plus an agreement-status summary, rather than a filtered
+// copy of the main dashboard.
+function tabDisplayName(p){
+  if(p.type === 'STATUS') return `${KPI_LABELS[p.name] || p.name} Properties`;
+  return p.name;
+}
+
+function computeAgreementSummary(rows){
+  let completed=0, pending=0, expiringSoon=0, expired=0, noStatus=0;
+  rows.forEach(row=>{
+    const f = fieldsFor(row);
+    const cs = (f.contractStatus||'').toString().trim().toLowerCase();
+    if(!cs || cs === '—') noStatus++;
+    else if(/complete|signed|executed|active/.test(cs)) completed++;
+    else if(/pending|awaiting|draft|progress|review/.test(cs)) pending++;
+    const lvl = urgencyLevel(f.endDateRaw);
+    if(lvl === 'red' || lvl === 'orange') expiringSoon++;
+    else if(lvl === 'expired') expired++;
+  });
+  return { total: rows.length, completed, pending, expiringSoon, expired, noStatus };
+}
+
+function agreementSummaryHtml(rows){
+  const s = computeAgreementSummary(rows);
+  const cards = [
+    { label:'Total Properties', value:s.total },
+    { label:'Agreement Completed', value:s.completed },
+    { label:'Agreement Pending', value:s.pending },
+    { label:'Expiring Soon', value:s.expiringSoon },
+    { label:'Expired', value:s.expired },
+  ];
+  return `
+    <div class="section-card">
+      <div class="section-title">Agreement Summary</div>
+      <div class="section-desc">Based on contract status and agreement end date fields available in Supabase.</div>
+      <div class="kpi-row">
+        ${cards.map(c=>`<div class="kpi-card" style="cursor:default;"><div class="kpi-number">${c.value}</div><div class="kpi-label">${escapeHtml(c.label)}</div></div>`).join('')}
+      </div>
+      ${s.noStatus ? `<div class="empty-note" style="margin-top:12px;padding:14px;">${s.noStatus} propert${s.noStatus===1?'y has':'ies have'} no contract status on file.</div>` : ''}
+    </div>`;
+}
+
+function renewalPillHtml(lvl, d){
+  if(!lvl) return '<span style="color:var(--muted)">—</span>';
+  if(lvl === 'expired') return `<span class="pill" style="background:var(--expired-bg);color:var(--expired)">Expired</span>`;
+  const isRed = lvl === 'red';
+  return `<span class="pill" style="background:${isRed?'var(--urgent-red-bg)':'var(--urgent-orange-bg)'};color:${isRed?'var(--urgent-red)':'var(--urgent-orange)'}">${d}d left</span>`;
+}
+
+function filterExpandedRows(rows, search){
+  if(!search) return rows;
   return rows.filter(row=>{
     const f = fieldsFor(row);
-    const matchesSearch = !state.search || f.name.toLowerCase().includes(state.search) || f.owner.toLowerCase().includes(state.search) || f.city.toLowerCase().includes(state.search);
-    const matchesStatus = state.statusFilter === 'all' || statusKey(f.status) === state.statusFilter;
-    const matchesUrgent = !state.urgentOnly || urgencyLevel(f.endDateRaw) === state.urgentOnly;
-    return matchesSearch && matchesStatus && matchesUrgent;
+    return f.name.toLowerCase().includes(search) || f.owner.toLowerCase().includes(search) || f.city.toLowerCase().includes(search) || f.squad.toLowerCase().includes(search);
   });
 }
 
-function renderResultArea(){
-  const area = document.getElementById('result-area');
-  const rows = rowsForTab(activeTabId);
-  const filtered = applyFilters(rows);
-  window.__filteredRows = filtered;
+function detailedTableRowHtml(row){
+  const f = fieldsFor(row);
+  const st = styleFor(statusKey(f.status));
+  const lvl = urgencyLevel(f.endDateRaw);
+  const d = daysRemaining(f.endDateRaw);
+  return `
+    <tr>
+      <td><strong>${escapeHtml(f.name)}</strong></td>
+      <td>${escapeHtml(f.squad)}</td>
+      <td>${escapeHtml(f.owner)}</td>
+      <td><span class="pill" style="background:${st.bg};color:${st.fg}">${escapeHtml(f.status)}</span></td>
+      <td>${escapeHtml(f.kickoff)}</td>
+      <td>${escapeHtml(f.contractStatus)}</td>
+      <td>${escapeHtml(f.endDateRaw || '—')}</td>
+      <td>${renewalPillHtml(lvl, d)}</td>
+      <td>${escapeHtml(f.city)}</td>
+      <td><a class="view-btn" href="${propertyHash(f.name)}" target="_blank" rel="noopener noreferrer">View Full Details →</a></td>
+    </tr>`;
+}
+
+function renderExpandedTableArea(rows){
+  const area = document.getElementById('expanded-table-area');
+  if(!area) return;
+  const state = getTabState(activeTabId);
+  const filtered = filterExpandedRows(rows, state.search);
   if(filtered.length === 0){
-    area.innerHTML = `<div class="empty-note">No properties match this search/filter.</div>`;
+    area.innerHTML = `<div class="empty-note">No properties match this search.</div>`;
     return;
   }
   area.innerHTML = `
     <div class="result-count">${filtered.length} result${filtered.length===1?'':'s'}</div>
-    <div class="grid">${filtered.map((row,i)=>cardHtml(row,i)).join('')}</div>
-  `;
-}
-
-function cardHtml(row, idx){
-  const f = fieldsFor(row);
-  const st = styleFor(statusKey(f.status));
-  const health = healthFor(row);
-  const lvl = urgencyLevel(f.endDateRaw);
-  const d = daysRemaining(f.endDateRaw);
-  const badgeHtml = lvl ? `<div class="urgency-badge ${lvl}">${d<0 ? 'Expired' : d+' days left'}</div>` : '';
-  return `
-    <div class="card ${lvl?'urgent-'+lvl:''}">
-      ${badgeHtml}
-      <div class="card-top">
-        <h3>${escapeHtml(f.name)}</h3>
-        <div class="card-status"><span class="health-badge ${health.tone}">${health.score}<small>${health.label}</small></span><span class="pill" style="background:${st.bg};color:${st.fg}">${escapeHtml(f.status)}</span></div>
-      </div>
-      <div class="highlight-block">
-        <div class="highlight-row"><span class="k">POC</span><span class="v">${escapeHtml(f.owner)}</span></div>
-        <div class="highlight-row"><span class="k">Live Date</span><span class="v">${escapeHtml(f.kickoff)}</span></div>
-        <div class="highlight-row"><span class="k">Contract Status</span><span class="v">${escapeHtml(f.contractStatus)}</span></div>
-      </div>
-      <button class="view-btn" onclick="openRowDirect(${idx})">View full details →</button>
+    <div class="detail-table-wrap">
+      <table class="detail-table">
+        <thead><tr>
+          <th>Property</th><th>Squad</th><th>POC</th><th>Status</th><th>Live Date</th><th>Contract Status</th><th>Agreement End</th><th>Renewal</th><th>City</th><th>Details</th>
+        </tr></thead>
+        <tbody>${filtered.map(row=>detailedTableRowHtml(row)).join('')}</tbody>
+      </table>
     </div>`;
 }
 
-function openRowDirect(idx){
-  const filtered = window.__filteredRows || [];
-  activeRow = filtered[idx];
-  renderActiveTab();
+function renderExpandedDetailsPage(p, rows){
+  const root = document.getElementById('view-root');
+  const state = getTabState(activeTabId);
+  const displayName = tabDisplayName(p);
+  const subtitle = p.type === 'STATUS' ? 'Status detail view' : p.type === 'SQUAD' ? 'Squad detail view' : 'POC (KAM) detail view';
+
+  root.innerHTML = `
+    <button class="back-link" onclick="openTab('ALL')">← Back to dashboard</button>
+    <div class="view-header">
+      <div><h2>${escapeHtml(displayName)}</h2><p class="desc">${subtitle} · ${rows.length} propert${rows.length===1?'y':'ies'} · live from Supabase</p></div>
+      <div class="btn" style="cursor:pointer;" onclick="downloadReportCsv()">↓ Export MIS</div>
+    </div>
+    ${agreementSummaryHtml(rows)}
+    <div class="section-card">
+      <div class="section-title">All Properties</div>
+      <div class="section-desc">Full detailed list for ${escapeHtml(displayName)}. The table scrolls both vertically and horizontally.</div>
+      <div class="search-row"><input id="expanded-search-box" placeholder="Search by property, city, squad, or POC…" /></div>
+      <div id="expanded-table-area"></div>
+    </div>
+  `;
+
+  const searchBox = document.getElementById('expanded-search-box');
+  searchBox.value = state.search || '';
+  searchBox.addEventListener('input', (e)=>{ state.search = e.target.value.toLowerCase(); renderExpandedTableArea(rows); });
+  renderExpandedTableArea(rows);
+}
+
+function openStatusDetail(key){
+  openTab(`STATUS::${key}`);
+}
+
+/* ---------- SINGLE-PROPERTY DETAIL PAGE + HASH ROUTING ---------- */
+// "View Full Details" links use a real #/property/<name> URL (instead of a plain
+// onclick button) so they can be opened in a new tab, middle-clicked, or copied.
+function propertyHash(name){ return `#/property/${encodeURIComponent(name)}`; }
+function findRowByName(name){ return allRows.find(r=>fieldsFor(r).name === name) || null; }
+function applyHashRoute(){
+  const m = window.location.hash.match(/^#\/property\/(.+)$/);
+  if(!m) return false;
+  const row = findRowByName(decodeURIComponent(m[1]));
+  if(row){ activeRow = row; renderActiveTab(); return true; }
+  return false;
+}
+
+function isUrlLike(val){
+  if(typeof val !== 'string') return false;
+  return /^(https?:\/\/|www\.)\S+$/i.test(val.trim());
+}
+function normalizeUrl(val){
+  const t = val.trim();
+  return /^https?:\/\//i.test(t) ? t : `https://${t}`;
 }
 
 function renderRowDetail(){
   const root = document.getElementById('view-root');
   const f = fieldsFor(activeRow);
-  const rowsHtml = Object.entries(activeRow).map(([key,val])=>`
-    <div class="detail-row"><div class="label">${escapeHtml(key)}</div><div class="val">${val===null||val===undefined||val===''?'<span style="color:#bbb">—</span>':escapeHtml(String(val))}</div></div>
-  `).join('');
+  const rowsHtml = Object.entries(activeRow).map(([key,val])=>{
+    let display;
+    if(val===null || val===undefined || val===''){
+      display = '<span style="color:#bbb">—</span>';
+    } else if(isUrlLike(val)){
+      // plain-text link values become real, clickable hyperlinks that open in a new tab
+      display = `<a href="${escapeHtml(normalizeUrl(String(val)))}" target="_blank" rel="noopener noreferrer">${escapeHtml(String(val))}</a>`;
+    } else {
+      display = escapeHtml(String(val));
+    }
+    return `<div class="detail-row"><div class="label">${escapeHtml(key)}</div><div class="val">${display}</div></div>`;
+  }).join('');
   root.innerHTML = `
-    <button class="back-link" onclick="activeRow=null; renderActiveTab();">← Back</button>
+    <button class="back-link" onclick="activeRow=null; history.replaceState(null,'',window.location.pathname+window.location.search); renderActiveTab();">← Back</button>
     <div class="view-header"><div><h2>${escapeHtml(f.name)}</h2><p class="desc">Full record from Supabase</p></div></div>
     <div class="detail-list">${rowsHtml}</div>
   `;
@@ -864,14 +827,10 @@ window.closeTab = closeTab;
 window.setStatusFilter = setStatusFilter;
 window.setUrgentFilter = setUrgentFilter;
 window.clearUrgentFilter = clearUrgentFilter;
-window.openRowDirect = openRowDirect;
 window.openDetailFromRow = openDetailFromRow;
-window.toggleAttnSquad = toggleAttnSquad;
-window.setAttnTab = setAttnTab;
+window.openStatusDetail = openStatusDetail;
 window.selectPieSlice = selectPieSlice;
 window.closePieInfo = closePieInfo;
 window.manualRefresh = manualRefresh;
 window.downloadReportCsv = downloadReportCsv;
-window.toggleFollowUp = toggleFollowUp;
-window.prepareNudge = prepareNudge;
 window.askPortfolio = askPortfolio;

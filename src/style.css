@@ -154,8 +154,20 @@
   .detail-row{display:flex;padding:11px 18px;border-bottom:1px solid var(--line);font-size:13px;gap:14px;}
   .detail-row:last-child{border-bottom:none;}
   .detail-row .label{width:300px;flex-shrink:0;color:var(--muted);}
-  .detail-row .val{flex:1;font-weight:500;}
+  .detail-row .val{flex:1;font-weight:500;word-break:break-word;}
+  .detail-row .val a{color:var(--moss,#2f6b3f);text-decoration:underline;}
   .back-link{background:none;border:none;color:var(--muted);font-size:12.5px;cursor:pointer;margin-bottom:14px;padding:0;}
+
+  /* ---------- EXPANDED DETAILS PAGE (Squad / POC / Status table view) ---------- */
+  a.view-btn{display:block;text-align:center;text-decoration:none;box-sizing:border-box;}
+  .detail-table-wrap{overflow:auto;max-height:640px;border:1px solid var(--line);border-radius:10px;}
+  table.detail-table{width:100%;min-width:840px;border-collapse:collapse;font-size:12.5px;}
+  table.detail-table thead th{position:sticky;top:0;background:var(--panel,#fff);text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);white-space:nowrap;z-index:1;}
+  table.detail-table tbody td{padding:10px 12px;border-bottom:1px solid var(--line);white-space:nowrap;}
+  table.detail-table tbody tr:hover{background:#f7f7f5;}
+  table.detail-table tbody td:first-child{white-space:normal;min-width:170px;}
+  table.detail-table .view-btn{display:inline-block;width:auto;padding:6px 10px;}
+  @media (max-width:760px){.detail-table-wrap{max-height:70vh;}}
 
   /* ---------- EXPIRED (distinct from expiring-soon red/orange) ---------- */
   :root{ --expired:#6b1f14; --expired-bg:#e9d9d6; }
