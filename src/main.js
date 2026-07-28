@@ -1,6 +1,6 @@
-const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
-const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
-const TABLE_NAME = import.meta.env.VITE_SUPABASE_TABLE || "agreement track";
+const SUPABASE_URL = "https://benzjvkbevombzjwwtqr.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJlbnpqdmtiZXZvbWJ6and3dHFyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ3ODY3NjIsImV4cCI6MjEwMDM2Mjc2Mn0.E8ZxzUmT5xdOwmAd8Yg_i8lLkBXHM3vh8itV1WBZV8M";
+const TABLE_NAME = "agreement track";
 
 // Color palette assigned dynamically to whatever status values actually exist in this data
 const STATUS_PALETTE = [
@@ -88,6 +88,7 @@ async function boot(){
   root.innerHTML = `<div class="loading-note">Loading data from Supabase…</div>`;
   try{
     allRows = await fetchAllRows();
+    buildColumnIndex();
     buildStatusStyles();
     buildGroupLists();
     detectOwnerResponseColumns();
@@ -112,6 +113,7 @@ async function manualRefresh(){
     const fresh = await fetchAllRows();
     if(fresh && fresh.length){
       allRows = fresh;
+      buildColumnIndex();
       buildStatusStyles();
       buildGroupLists();
       detectOwnerResponseColumns();
@@ -136,17 +138,47 @@ function updateSyncLabel(){
   if(label) label.textContent = lastSyncedAt ? `Synced ${lastSyncedAt.toLocaleTimeString()}` : '';
 }
 
+// ---------- RESILIENT COLUMN LOOKUP ----------
+// Supabase/CSV imports sometimes rename columns (e.g. "Vista Name" -> "vista_name")
+// depending on how a table was created. Instead of hardcoding one exact spelling,
+// build a normalized index once per data load, and look fields up by trying several
+// likely names. This means renaming/re-importing a table won't silently break the
+// dashboard the way it did with "Squad"/"Current Status" showing as blank.
+let COLUMN_INDEX = {}; // normalized name -> actual key as it appears in the data
+
+function normalizeKey(k){
+  return k.toString().toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+function buildColumnIndex(){
+  COLUMN_INDEX = {};
+  if(!allRows.length) return;
+  Object.keys(allRows[0]).forEach(k=>{
+    COLUMN_INDEX[normalizeKey(k)] = k;
+  });
+}
+// tries each candidate name (any casing/spacing/underscore style) and returns the
+// first one that actually exists in this row's data
+function getVal(row, candidates){
+  for(const c of candidates){
+    const actualKey = COLUMN_INDEX[normalizeKey(c)];
+    if(actualKey !== undefined && row[actualKey] !== undefined && row[actualKey] !== null && row[actualKey] !== ''){
+      return row[actualKey];
+    }
+  }
+  return null;
+}
+
 function fieldsFor(row){
   return {
-    name: row["Vista Name"] || row["Property Name"] || "Unnamed property",
-    // this sheet has no "Owner Facing Account Manager" column — using POC as the closest stand-in for KAM
-    owner: (row["POC"] || "").toString().trim() || "Unassigned",
-    status: (row["Current Status"] || "").toString().trim() || "Unknown",
-    kickoff: row["Live date"] || "—",
-    endDateRaw: row["Agreement end date"] || null,
-    contractStatus: row["Contract status"] || row["Contract Status"] || "—",
-    squad: (row["Squad"] || "").toString().trim() || "Unassigned",
-    city: (row["City"] || "").toString().trim() || "—",
+    name: getVal(row, ["Vista Name","Property Name","vista_name","property_name"]) || "Unnamed property",
+    // this sheet has no "Owner Facing Account Manager" column in some imports — POC is the closest stand-in for KAM
+    owner: (getVal(row, ["POC","Owner Facing Account Manager","poc"]) || "").toString().trim() || "Unassigned",
+    status: (getVal(row, ["Current Status","current_status","Property Current Status"]) || "").toString().trim() || "Unknown",
+    kickoff: getVal(row, ["Live date","Live Date","live_date"]) || "—",
+    endDateRaw: getVal(row, ["Agreement end date","Agreement End Date","agreement_end_date"]) || null,
+    contractStatus: getVal(row, ["Contract status","Contract Status","contract_status"]) || "—",
+    squad: (getVal(row, ["Squad","squad","New Squad Mapping"]) || "").toString().trim() || "Unassigned",
+    city: (getVal(row, ["City","city"]) || "").toString().trim() || "—",
     sentToOwnerRaw: SENT_DATE_KEY ? row[SENT_DATE_KEY] : null,
     ownerResponse: RESPONSE_KEY ? (row[RESPONSE_KEY] || "").toString().trim() : "",
   };
@@ -258,7 +290,7 @@ function renderSidebar(){
       <span>All Properties</span><span class="sidebar-count">${allRows.length}</span>
     </div>
     <div class="sidebar-item ${activeTabId==='SOP'?'active':''}" onclick="openTab('SOP')">
-      <span>Playbook & SOPs</span><span class="sidebar-count">4</span>
+      <span>Playbook &amp; SOPs</span><span class="sidebar-count">4</span>
     </div>
     <div class="sidebar-divider"></div>
 
