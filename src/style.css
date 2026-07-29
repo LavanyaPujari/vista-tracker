@@ -1089,3 +1089,53 @@ td.pct-cell { font-weight: 600; }
   .panel { break-inside: avoid; box-shadow: none; }
   table.grid thead th { position: static; }
 }
+
+/* 13 ------------------------------------------- refresh control & link cards */
+.stamp {
+  font-size: 11.5px;
+  color: var(--muted-2);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.refresh {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px 6px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--ink-2);
+  transition: border-color .15s, background .15s, color .15s;
+}
+.refresh:hover:not(:disabled) { border-color: var(--ink); color: var(--ink); background: var(--surface-2); }
+.refresh:disabled { opacity: .6; cursor: default; }
+.refresh svg { flex: none; }
+.refresh.spinning svg { animation: spin .8s linear infinite; }
+
+/* clickable KPI card (Live properties) */
+a.kpi-link {
+  display: block;
+  text-decoration: none;
+  color: inherit;
+  transition: border-color .15s, transform .1s, box-shadow .15s;
+}
+a.kpi-link:hover {
+  border-color: var(--line-strong);
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-2), inset 3px 0 0 var(--good);
+}
+a.kpi-link .k-label { display: flex; align-items: center; gap: 5px; }
+a.kpi-link .k-label .ext { font-size: 10px; color: var(--muted-2); }
+
+@media (max-width: 980px) {
+  .refresh-text { display: none; }
+  .refresh { padding: 7px 9px; }
+}
+@media (max-width: 760px) {
+  .stamp { display: none; }
+}

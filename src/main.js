@@ -22,10 +22,17 @@ const SUPABASE_KEY   = ENV.VITE_SUPABASE_ANON_KEY || '';
 const SUPABASE_TABLE = ENV.VITE_SUPABASE_TABLE || 'agreement track';
 
 /* Optional. If set, the Live Properties nav item opens this URL instead of the
-   in-app Live Properties page. Either way it opens in a new browser tab. */
+   in-app Live Properties page. Either way it opens in another tab. */
 const LIVE_PROPERTIES_URL = ENV.VITE_LIVE_PROPERTIES_URL || '';
 
+/* Named window target: opens a tab in the SAME browser window and reuses that
+   same tab on every later click, rather than piling up tabs or windows. */
+const LIVE_TAB_NAME = 'vista-tracker-live';
+
 const PAGE_SIZE = 1000; // Supabase returns at most 1000 rows per request
+
+/* How many days before agreement_end_date counts as "To Expire". */
+const EXPIRY_WINDOW_DAYS = Number(ENV.VITE_EXPIRY_WINDOW_DAYS) || 90;
 
 /* The seven MIS columns, in MIS order. "Grand Total" is derived. */
 const STATUS_ORDER = [
@@ -94,9 +101,10 @@ function isTruthy(v) {
 /* 3 ------------------------------ column resolution + row normalisation ------ */
 
 /**
- * Column names in the sheet drift (spaces, casing, renames). Resolve each field
- * we need by matching against a list of normalised candidates, so a rename in
- * the Acq Master doesn't silently empty out a whole tab.
+ * The live table uses its own names (squad, poc, contract_signing_status, ...).
+ * Each field lists the real column first, then looser fallbacks, so a rename or
+ * a differently-cased header still resolves. Matching ignores case, spaces,
+ * underscores and punctuation throughout.
  */
 function resolveColumns(sample) {
   const keys = Object.keys(sample || {});
@@ -115,49 +123,67 @@ function resolveColumns(sample) {
 
   return {
     kam: pick([
+      is('poc'),
       is('ownerfacingaccountmanager'),
       has('ownerfacing', 'manager'),
       has('account', 'manager'),
-      is('kam', 'kamname', 'accountmanager'),
+      is('kam', 'kamname', 'accountmanager', 'owner'),
     ]),
     squad: pick([
+      is('squad'),
       is('newsquadmapping'),
-      has('newsquad'),
-      has('squad', 'mapping'),
       has('squad'),
-      is('cluster', 'region', 'location'),
+      is('city', 'cluster', 'region'),
     ]),
-    status: pick([
+    // pre-signature states: Not Signed / Email Confirmation / Founder-Partner Approved
+    signing: pick([
+      is('contractsigningstatus'),
+      has('signing', 'status'),
+      has('contract', 'status'),
       is('agreementstatus'),
-      has('agreement', 'status'),
-      is('status'),
-      has('agreement'),
     ]),
+    // post-signature states: Valid / To Expire / Expired
+    lifecycle: pick([
+      is('contractlifecyclestatus'),
+      has('lifecycle', 'status'),
+      is('agreementstatus'),
+    ]),
+    endDate: pick([
+      is('agreementenddate'),
+      has('agreement', 'end'),
+      has('contract', 'end'),
+      has('expiry'), has('expiration'),
+    ]),
+    reason: pick([is('reasonnotsigned'), has('reason', 'signed'), has('reason')]),
     property: pick([
+      is('vistaname'),
       is('propertyname'),
+      has('vista', 'name'),
       has('property', 'name'),
-      is('villaname', 'listingname', 'vistaname'),
-      has('villa'),
+      has('villa', 'name'),
       is('name', 'title'),
     ]),
     url: pick([
+      is('villadetailslink'),
+      has('villa', 'link'),
+      has('details', 'link'),
+      is('googlelink'),
       has('property', 'link'),
-      has('listing', 'url'),
-      has('live', 'link'),
-      has('url'),
-      has('link'),
-      has('website'),
+      has('link'), has('url'),
     ]),
-    live: pick([
+    agreementUrl: pick([is('agreementlink'), has('agreement', 'link')]),
+    // current_status carries Live / Delisted / Paused
+    liveStatus: pick([
+      is('currentstatus'),
+      has('current', 'status'),
       is('livestatus', 'islive', 'live'),
       has('live', 'status'),
-      has('golive'),
-      has('live'),
     ]),
-    code: pick([
-      is('propertycode', 'propertyid', 'vistacode', 'code', 'id'),
-      has('property', 'code'),
-    ]),
+    liveDate:   pick([is('livedate'), has('live', 'date'), has('golive')]),
+    delistDate: pick([is('delistdate'), has('delist')]),
+    pauseDate:  pick([is('pausedate'), has('pause')]),
+    city:       pick([is('city'), has('city')]),
+    code:       pick([is('propertyid'), has('property', 'id'), is('propertycode', 'id')]),
   };
 }
 
@@ -168,68 +194,227 @@ function resolveColumns(sample) {
  */
 function normalizeStatus(raw) {
   const n = norm(raw);
-  if (!n) return UNMAPPED;
-  if (n.includes('emailconfirm') || n.includes('confirmationemail')) return 'Email Confirmation';
+  if (!n) return '';
+  if (n.includes('emailconfirm') || n.includes('confirmationemail') || n.includes('confirmationmail')) return 'Email Confirmation';
   if (n.includes('founder') || n.includes('partnerapproved') || n.includes('partnerapproval')) return 'Founder/Partner Approved';
-  if (n.includes('notsigned') || n.includes('unsigned') || n.includes('yettosign') || n.includes('pendingsignature')) return 'Not Signed';
-  if (n.includes('toexpire') || n.includes('abouttoexpire') || n.includes('expiringsoon') || n.includes('nearingexpiry')) return 'To Expire';
-  if (n.includes('expired') || n.includes('expiry')) return 'Expired';
-  if (n.includes('valid') || n.includes('active') || n.includes('signed')) return 'Valid';
-  return UNMAPPED;
+  if (n.includes('notsigned') || n.includes('unsigned') || n.includes('yettosign') || n.includes('pendingsignature') || n.includes('nosign')) return 'Not Signed';
+  if (n.includes('toexpire') || n.includes('abouttoexpire') || n.includes('expiringsoon') || n.includes('nearingexpiry') || n.includes('duefor')) return 'To Expire';
+  if (n.includes('expired') || n.includes('lapsed')) return 'Expired';
+  if (n.includes('valid') || n.includes('signed') || n.includes('executed') || n.includes('active')) return 'Valid';
+  return '';
+}
+
+const DAY = 86400000;
+function parseDate(v) {
+  if (!v) return null;
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+/**
+ * The MIS "Agreement status" is not one column in this table — it is the
+ * signing state until a contract exists, then the lifecycle state, then the
+ * end date. Resolved in that order, and the Connection check tab reports which
+ * source each row actually used.
+ */
+function resolveAgreementStatus(row, cols, now, windowDays) {
+  const signing = normalizeStatus(cols.signing ? row[cols.signing] : '');
+  if (signing === 'Not Signed' || signing === 'Email Confirmation' || signing === 'Founder/Partner Approved') {
+    return { status: signing, source: cols.signing };
+  }
+
+  const lifecycle = normalizeStatus(cols.lifecycle ? row[cols.lifecycle] : '');
+  if (lifecycle === 'Valid' || lifecycle === 'To Expire' || lifecycle === 'Expired') {
+    return { status: lifecycle, source: cols.lifecycle };
+  }
+
+  const end = parseDate(cols.endDate ? row[cols.endDate] : null);
+  if (end) {
+    const days = Math.floor((end - now) / DAY);
+    if (days < 0) return { status: 'Expired', source: `${cols.endDate} (date)` };
+    if (days <= windowDays) return { status: 'To Expire', source: `${cols.endDate} (date)` };
+    return { status: 'Valid', source: `${cols.endDate} (date)` };
+  }
+
+  if (signing) return { status: signing, source: cols.signing };
+  if (lifecycle) return { status: lifecycle, source: cols.lifecycle };
+  return { status: UNMAPPED, source: null };
+}
+
+/** A property is live unless current_status says otherwise, or it is delisted. */
+function resolveLive(row, cols, now) {
+  const label = norm(cols.liveStatus ? row[cols.liveStatus] : '');
+  if (label) {
+    if (label.includes('delist') || label.includes('churn') || label.includes('exit') || label.includes('inactive') || label.includes('notlive')) return false;
+    if (label.includes('pause') || label.includes('hold')) return false;
+    if (label.includes('live') || label.includes('active')) return true;
+  }
+  const delist = parseDate(cols.delistDate ? row[cols.delistDate] : null);
+  if (delist && delist <= now) return false;
+  const live = parseDate(cols.liveDate ? row[cols.liveDate] : null);
+  if (live) return live <= now;
+  return label ? false : null; // null = cannot tell
+}
+
+/**
+ * Values drift in case and spacing too — "Goa", "GOA", "goa " and "Ooty-Coorg"
+ * vs "Ooty Coorg" are all the same squad. Group them on a normalised key and
+ * display whichever spelling appears most often, so a single squad can never
+ * split into two rows of the pivot.
+ */
+function buildCanonicalizer(raw, column) {
+  const groups = new Map();
+  if (!column) return () => BLANK;
+
+  for (const r of raw) {
+    const value = clean(r[column]);
+    if (!value) continue;
+    const key = norm(value);
+    if (!groups.has(key)) groups.set(key, new Map());
+    const spellings = groups.get(key);
+    spellings.set(value, (spellings.get(value) || 0) + 1);
+  }
+
+  const chosen = new Map();
+  for (const [key, spellings] of groups) {
+    const best = [...spellings.entries()].sort((a, b) => b[1] - a[1] || cmp(a[0], b[0]))[0][0];
+    chosen.set(key, best);
+  }
+
+  return (v) => {
+    const value = clean(v);
+    if (!value) return BLANK;
+    return chosen.get(norm(value)) || value;
+  };
 }
 
 function normalizeRows(raw, cols) {
-  return raw.map((r, i) => ({
-    __i: i,
-    __kam:      clean(cols.kam      ? r[cols.kam]      : '') || BLANK,
-    __squad:    clean(cols.squad    ? r[cols.squad]    : '') || BLANK,
-    __statusRaw: clean(cols.status  ? r[cols.status]   : ''),
-    __status:   normalizeStatus(cols.status ? r[cols.status] : ''),
-    __property: clean(cols.property ? r[cols.property] : '') || '—',
-    __code:     clean(cols.code     ? r[cols.code]     : ''),
-    __url:      clean(cols.url      ? r[cols.url]      : ''),
-    __live:     cols.live ? isTruthy(r[cols.live]) : null,
-    __raw: r,
-  }));
+  const canonKam   = buildCanonicalizer(raw, cols.kam);
+  const canonSquad = buildCanonicalizer(raw, cols.squad);
+  const now = new Date();
+
+  return raw.map((r, i) => {
+    const agreement = resolveAgreementStatus(r, cols, now, EXPIRY_WINDOW_DAYS);
+    return {
+      __i: i,
+      __kam:      canonKam(cols.kam     ? r[cols.kam]   : ''),
+      __squad:    canonSquad(cols.squad ? r[cols.squad] : ''),
+      __statusRaw: [cols.signing && clean(r[cols.signing]), cols.lifecycle && clean(r[cols.lifecycle])].filter(Boolean).join(' / '),
+      __status:   agreement.status,
+      __source:   agreement.source,
+      __property: clean(cols.property ? r[cols.property] : '') || '—',
+      __city:     clean(cols.city     ? r[cols.city]     : ''),
+      __code:     clean(cols.code     ? r[cols.code]     : ''),
+      __url:      clean(cols.url      ? r[cols.url]      : ''),
+      __agreementUrl: clean(cols.agreementUrl ? r[cols.agreementUrl] : ''),
+      __reason:   clean(cols.reason   ? r[cols.reason]   : ''),
+      __endDate:  cols.endDate ? clean(r[cols.endDate]) : '',
+      __live:     resolveLive(r, cols, now),
+      __raw: r,
+    };
+  });
 }
 
-/* 4 ------------------------------------------------------------- data loading */
+
+const authHeaders = () => ({
+  apikey: SUPABASE_KEY,
+  Authorization: `Bearer ${SUPABASE_KEY}`,
+});
+
+/**
+ * Postgres table names ARE case-sensitive over PostgREST: a table actually
+ * called "Agreement Track" will 404 if .env says "agreement track". So ask the
+ * API which tables exist and match on a normalised key.
+ */
+async function listTables() {
+  try {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/`, { headers: authHeaders() });
+    if (!res.ok) return [];
+    const doc = await res.json();
+    const fromDefs  = Object.keys(doc.definitions || {});
+    const fromPaths = Object.keys(doc.paths || {}).map((p) => p.replace(/^\//, ''));
+    return [...new Set([...fromDefs, ...fromPaths])].filter((t) => t && !t.startsWith('rpc/'));
+  } catch {
+    return [];
+  }
+}
+
+async function probeTable(name) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${encodeURIComponent(name)}?select=*&limit=1`, {
+    headers: authHeaders(),
+  });
+  return { ok: res.ok, status: res.status, body: res.ok ? '' : await res.text().catch(() => '') };
+}
 
 /** Fetch every row, 1000 at a time. Without this the tabs silently cap at 1000. */
-async function fetchAllRows() {
+async function fetchAllRows(diag) {
   if (!SUPABASE_URL || !SUPABASE_KEY) {
-    throw new Error('Missing VITE_SUPABASE_URL or VITE_SUPABASE_ANON_KEY. Check your .env file (or Vercel environment variables) and redeploy.');
+    throw new Error('Missing VITE_SUPABASE_URL or VITE_SUPABASE_ANON_KEY. Check .env (or Vercel → Settings → Environment Variables) and redeploy.');
   }
 
-  const endpoint = `${SUPABASE_URL}/rest/v1/${encodeURIComponent(SUPABASE_TABLE)}?select=*`;
+  diag.projectUrl = SUPABASE_URL;
+  diag.tableRequested = SUPABASE_TABLE;
+  diag.tableUsed = SUPABASE_TABLE;
+  diag.tableAutoCorrected = false;
+
+  // 1. try the configured name
+  let probe = await probeTable(SUPABASE_TABLE);
+  diag.httpStatus = probe.status;
+
+  // 2. if it isn't there, find it case-insensitively among the real tables
+  if (!probe.ok) {
+    diag.availableTables = await listTables();
+    const match = diag.availableTables.find((t) => norm(t) === norm(SUPABASE_TABLE));
+    if (match) {
+      diag.tableUsed = match;
+      diag.tableAutoCorrected = match !== SUPABASE_TABLE;
+      probe = await probeTable(match);
+      diag.httpStatus = probe.status;
+    }
+  }
+
+  if (!probe.ok) {
+    const hint = diag.availableTables && diag.availableTables.length
+      ? ` Tables this key can see: ${diag.availableTables.join(', ')}.`
+      : ' The key could not list any tables, which usually means the anon key is wrong or Row Level Security blocks everything.';
+    throw new Error(`Supabase returned ${probe.status} for “${SUPABASE_TABLE}”.${hint} ${probe.body.slice(0, 200)}`);
+  }
+
+  const endpoint = `${SUPABASE_URL}/rest/v1/${encodeURIComponent(diag.tableUsed)}?select=*`;
+  diag.endpoint = endpoint;
+
   const out = [];
   let from = 0;
 
   for (let guard = 0; guard < 60; guard++) {
     const res = await fetch(endpoint, {
       headers: {
-        apikey: SUPABASE_KEY,
-        Authorization: `Bearer ${SUPABASE_KEY}`,
+        ...authHeaders(),
         'Range-Unit': 'items',
         Range: `${from}-${from + PAGE_SIZE - 1}`,
         Prefer: 'count=exact',
       },
     });
 
+    diag.httpStatus = res.status;
+
     if (!res.ok) {
       const body = await res.text().catch(() => '');
-      throw new Error(`Supabase returned ${res.status}. ${body.slice(0, 240)}`);
+      throw new Error(`Supabase returned ${res.status} while reading rows. ${body.slice(0, 240)}`);
     }
 
     const batch = await res.json();
     out.push(...batch);
+    diag.requests = (diag.requests || 0) + 1;
 
     const total = Number((res.headers.get('content-range') || '').split('/')[1]);
+    if (Number.isFinite(total)) diag.reportedTotal = total;
     if (batch.length < PAGE_SIZE) break;
     if (Number.isFinite(total) && out.length >= total) break;
     from += PAGE_SIZE;
   }
 
+  diag.rowsFetched = out.length;
   return out;
 }
 
@@ -241,6 +426,7 @@ const VIEWS = [
   { id: 'squad',           label: 'Squad-wise Summary', group: 'Summary' },
   { id: 'properties',      label: 'Properties',         group: 'Detail'  },
   { id: 'live-properties', label: 'Live Properties',    group: 'Detail', external: true },
+  { id: 'diagnostics',     label: 'Connection check',   group: 'Setup'   },
 ];
 
 const SUBTABS = {
@@ -255,13 +441,23 @@ const SUBTABS = {
     { id: 'valid',      label: 'Valid' },
   ],
   'live-properties': [{ id: 'all', label: 'All live' }],
+  diagnostics: [
+    { id: 'connection', label: 'Connection' },
+    { id: 'columns',    label: 'Columns' },
+    { id: 'values',     label: 'Status values' },
+    { id: 'raw',        label: 'Sample row' },
+  ],
 };
 
 const state = {
   user: null,
   rows: [],
+  raw: [],
   cols: {},
+  diag: {},
   loading: true,
+  refreshing: false,
+  loadedAt: null,
   error: null,
   view: 'overview',
   sub: 'snapshot',
@@ -670,6 +866,25 @@ function kpiCard(label, value, sub, accent) {
   ]);
 }
 
+function liveTabHref() {
+  return LIVE_PROPERTIES_URL || `${location.pathname}${urlFor('live-properties', defaultSub('live-properties'))}`;
+}
+
+/** Same card, but a link that opens the Live Properties tab in this browser. */
+function kpiLink(label, value, sub, accent) {
+  return el('a', {
+    class: `kpi kpi-link${accent ? ` accent-${accent}` : ''}`,
+    href: liveTabHref(),
+    target: LIVE_TAB_NAME,
+    rel: LIVE_PROPERTIES_URL ? 'noopener noreferrer' : null,
+    title: 'Opens the Live Properties tab in this browser',
+  }, [
+    el('div', { class: 'k-label' }, [label, el('span', { class: 'ext', text: '↗' })]),
+    el('div', { class: 'k-value', text: value }),
+    sub ? el('div', { class: 'k-sub', text: sub }) : null,
+  ]);
+}
+
 function pageHead(title, desc) {
   return el('div', { class: 'page-head' }, [
     el('h2', { text: title }),
@@ -690,13 +905,34 @@ function viewOverview(rows) {
   ]);
 
   if (state.sub === 'snapshot') {
+    const live    = rows.filter((r) => r.__live === true).length;
+    const notLive = rows.filter((r) => r.__live === false).length;
+    const unknown = rows.filter((r) => r.__live === null).length;
+    const livePct = total ? live * 100 / total : null;
+
+    frag.append(el('div', { class: 'panel' }, [
+      el('div', { class: 'panel-head' }, [
+        el('h3', { text: 'Property summary' }),
+        el('span', { class: 'hint right', text: unknown ? `${fmtInt(unknown)} with no live status` : 'From current_status and live/delist dates' }),
+      ]),
+      el('div', { class: 'panel-body' }, [
+        el('div', { class: 'kpi-grid', style: 'margin-bottom:0' }, [
+          kpiCard('Total properties', fmtInt(total), 'in scope', 'sky'),
+          kpiLink('Live properties', fmtInt(live), `${fmtPct(livePct)} of total`, 'good'),
+          kpiCard('Not live', fmtInt(notLive), 'delisted or paused', 'bad'),
+          kpiCard('Squads', fmtInt(new Set(rows.map((r) => r.__squad)).size), 'in scope'),
+          kpiCard('KAMs', fmtInt(new Set(rows.map((r) => r.__kam)).size), 'in scope'),
+        ]),
+      ]),
+    ]));
+
     frag.append(
+      el('div', { class: 'panel-head', style: 'padding-left:0; border:0' }, [el('h3', { text: 'Agreement summary' })]),
       el('div', { class: 'kpi-grid' }, [
-        kpiCard('Grand total', fmtInt(total), 'properties in scope', 'sky'),
+        kpiCard('Grand total', fmtInt(total), 'agreements counted', 'sky'),
         kpiCard('Valid', fmtInt(valid), fmtPct(total ? valid * 100 / total : null) + ' of total', 'good'),
         kpiCard('Needs action', fmtInt(needsAction), 'not signed, expired or expiring', 'bad'),
-        kpiCard('Squads', fmtInt(new Set(rows.map((r) => r.__squad)).size), 'in scope'),
-        kpiCard('KAMs', fmtInt(new Set(rows.map((r) => r.__kam)).size), 'in scope'),
+        kpiCard('Expiring soon', fmtInt(counts['To Expire'] || 0), `within ${EXPIRY_WINDOW_DAYS} days`, 'warn'),
       ]),
     );
 
@@ -825,8 +1061,8 @@ function viewProperties(rows) {
 }
 
 function viewLiveProperties(rows) {
-  const hasLiveCol = !!state.cols.live;
-  const shown = hasLiveCol ? rows.filter((r) => r.__live) : rows;
+  const hasLiveCol = !!(state.cols.liveStatus || state.cols.liveDate || state.cols.delistDate);
+  const shown = hasLiveCol ? rows.filter((r) => r.__live === true) : rows;
 
   const statuses = statusColumns(shown);
   const counts = Object.fromEntries(statuses.map((s) => [s, 0]));
@@ -852,6 +1088,222 @@ function viewLiveProperties(rows) {
   ]);
 }
 
+/* diagnostics ------------------------------------------------------------- */
+
+const FIELD_DOCS = [
+  ['squad',        'Squad-wise summary',      'squad',                     true],
+  ['kam',          'KAM-wise summary',        'poc',                       true],
+  ['signing',      'Pre-signature statuses',  'contract_signing_status',   true],
+  ['lifecycle',    'Valid / expiry statuses', 'contract_lifecycle_status', false],
+  ['endDate',      'Expiry fallback',         'agreement_end_date',        false],
+  ['property',     'Property names',          'vista_name',                false],
+  ['url',          'Property links',          'villa_details_link',        false],
+  ['agreementUrl', 'Agreement links',         'agreement_link',            false],
+  ['liveStatus',   'Live / not live',         'current_status',            false],
+  ['liveDate',     'Live date fallback',      'live_date',                 false],
+  ['delistDate',   'Delisted check',          'delist_date',               false],
+  ['city',         'City',                    'city',                      false],
+  ['code',         'Property ID',             'property_id',               false],
+  ['reason',       'Why not signed',          'reason_not_signed',         false],
+];
+
+function kv(label, value, tone) {
+  return el('tr', {}, [
+    el('td', { class: 'freeze', 'data-label': 'Field', style: 'text-align:left', text: label }),
+    el('td', { 'data-label': label, style: 'text-align:left' }, [
+      tone ? el('span', { class: 'pill', text: value, style: `background:${tone}; color:#1e1e1e` }) : String(value),
+    ]),
+  ]);
+}
+
+function diagnosticsText() {
+  const d = state.diag;
+  const lines = [
+    'VISTA TRACKER — CONNECTION CHECK',
+    `Project URL      : ${d.projectUrl || '(not set)'}`,
+    `Table in .env    : ${d.tableRequested || '(not set)'}`,
+    `Table actually used: ${d.tableUsed || '(none)'}${d.tableAutoCorrected ? '  <-- auto-corrected for case' : ''}`,
+    `HTTP status      : ${d.httpStatus ?? '(no response)'}`,
+    `Rows fetched     : ${d.rowsFetched ?? 0}${d.reportedTotal != null ? ` of ${d.reportedTotal} reported` : ''}`,
+    `Requests made    : ${d.requests ?? 0}`,
+    d.availableTables ? `Tables visible   : ${d.availableTables.join(', ')}` : null,
+    state.error ? `ERROR            : ${state.error}` : null,
+    '',
+    'COLUMN MAPPING',
+    ...FIELD_DOCS.map(([f, use]) => `  ${use.padEnd(22)} -> ${state.cols[f] || 'NOT FOUND'}`),
+    '',
+    `ALL COLUMNS IN TABLE (${(d.allColumns || []).length})`,
+    `  ${(d.allColumns || []).join(' | ') || '(none)'}`,
+    '',
+    'STATUS VALUES FOUND',
+    ...(d.statusMap || []).map((s) => `  "${s.raw}" -> ${s.bucket}  [via ${s.source || 'nothing matched'}]  (${s.count})`),
+  ];
+  return lines.filter((l) => l !== null).join('\n');
+}
+
+function viewDiagnostics() {
+  const d = state.diag;
+  const frag = el('div', {}, [
+    pageHead('Connection check', 'Exactly what the app asked Supabase for, what came back, and how each column was matched. If a tab is empty, the answer is on this page.'),
+  ]);
+
+  if (state.sub === 'connection') {
+    const rows = [
+      kv('Project URL', d.projectUrl || '(not set)'),
+      kv('Table name in .env', d.tableRequested || '(not set)'),
+      kv('Table actually read', d.tableUsed || '(none)', d.tableAutoCorrected ? '#fcd4a8' : null),
+      kv('Request URL', d.endpoint || '(never reached)'),
+      kv('HTTP status', String(d.httpStatus ?? 'no response'), d.httpStatus === 200 || d.httpStatus === 206 ? '#a8d5bd' : '#e9a0a7'),
+      kv('Rows fetched', `${fmtInt(d.rowsFetched || 0)}${d.reportedTotal != null ? ` (table reports ${fmtInt(d.reportedTotal)})` : ''}`),
+      kv('Paged requests', String(d.requests || 0)),
+    ];
+    if (d.availableTables) rows.push(kv('Tables this key can see', d.availableTables.join(', ') || '(none)'));
+
+    frag.append(el('div', { class: 'panel' }, [
+      el('div', { class: 'panel-head' }, [el('h3', { text: 'Where the data comes from' })]),
+      el('div', { class: 'table-wrap stacked-wrap' }, [
+        el('table', { class: 'grid stacked' }, [
+          el('thead', {}, [el('tr', {}, [
+            el('th', { scope: 'col', class: 'freeze', style: 'text-align:left', text: 'Setting' }),
+            el('th', { scope: 'col', style: 'text-align:left', text: 'Value' }),
+          ])]),
+          el('tbody', {}, rows),
+        ]),
+      ]),
+    ]));
+
+    if (d.tableAutoCorrected) {
+      frag.append(el('div', { class: 'panel' }, [
+        el('div', { class: 'panel-body' }, [
+          el('p', { style: 'margin:0', html: `Your <code>.env</code> says <code>${d.tableRequested}</code> but the real table is <code>${d.tableUsed}</code>. The app corrected this automatically — update <code>.env</code> to match and you save one round trip on every load.` }),
+        ]),
+      ]));
+    }
+
+    const copy = el('button', { type: 'button', class: 'reset-btn', text: 'Copy this report' });
+    copy.addEventListener('click', async () => {
+      const text = diagnosticsText();
+      try { await navigator.clipboard.writeText(text); copy.textContent = 'Copied'; }
+      catch { window.prompt('Copy the text below:', text); }
+      setTimeout(() => { copy.textContent = 'Copy this report'; }, 1800);
+    });
+
+    frag.append(el('div', { class: 'panel' }, [
+      el('div', { class: 'panel-head' }, [el('h3', { text: 'Send this if something still looks wrong' })]),
+      el('div', { class: 'panel-body' }, [
+        el('p', { style: 'margin:0 0 12px', text: 'This copies the whole report as plain text — table name, status code, column mapping and every status value found. It contains no keys or property data.' }),
+        copy,
+      ]),
+    ]));
+    return frag;
+  }
+
+  if (state.sub === 'columns') {
+    const body = FIELD_DOCS.map(([field, use, expected, required]) => {
+      const found = state.cols[field];
+      const sample = found && state.raw.length
+        ? clean(state.raw.find((r) => clean(r[found]))?.[found] ?? '')
+        : '';
+      return el('tr', {}, [
+        el('td', { class: 'freeze', 'data-label': 'Used for', style: 'text-align:left', text: use }),
+        el('td', { 'data-label': 'Expected', style: 'text-align:left', text: expected }),
+        el('td', { 'data-label': 'Column found', style: 'text-align:left' }, [
+          found
+            ? el('span', { class: 'pill', text: found, style: 'background:#a8d5bd; color:#1e1e1e' })
+            : el('span', { class: 'pill', text: required ? 'NOT FOUND — required' : 'not found — optional', style: `background:${required ? '#e9a0a7' : '#ebe6de'}; color:#1e1e1e` }),
+        ]),
+        el('td', { 'data-label': 'Sample value', style: 'text-align:left', text: sample || '—' }),
+      ]);
+    });
+
+    const used = new Set(Object.values(state.cols).filter(Boolean));
+    const spare = (d.allColumns || []).filter((c) => !used.has(c));
+
+    frag.append(el('div', { class: 'panel' }, [
+      el('div', { class: 'panel-head' }, [
+        el('h3', { text: 'How each column was matched' }),
+        el('span', { class: 'hint right', text: 'Matching ignores case, spaces and punctuation' }),
+      ]),
+      el('div', { class: 'table-wrap stacked-wrap' }, [
+        el('table', { class: 'grid stacked' }, [
+          el('thead', {}, [el('tr', {}, ['Used for', 'Expected heading', 'Column found', 'Sample value'].map((h, i) =>
+            el('th', { scope: 'col', class: i === 0 ? 'freeze' : '', style: 'text-align:left', text: h })))]),
+          el('tbody', {}, body),
+        ]),
+      ]),
+    ]));
+
+    frag.append(el('div', { class: 'panel' }, [
+      el('div', { class: 'panel-head' }, [
+        el('h3', { text: 'Other columns in the table' }),
+        el('span', { class: 'hint right', text: `${fmtInt(spare.length)} unused` }),
+      ]),
+      el('div', { class: 'panel-body' }, [
+        spare.length
+          ? el('div', { style: 'display:flex; flex-wrap:wrap; gap:6px' }, spare.map((c) =>
+              el('span', { class: 'chip' }, [el('span', { class: 'chip-val', text: c })])))
+          : el('p', { style: 'margin:0', text: 'Every column in the table is being used.' }),
+      ]),
+    ]));
+    return frag;
+  }
+
+  if (state.sub === 'values') {
+    const map = d.statusMap || [];
+    const bad = map.filter((s) => s.bucket === UNMAPPED);
+
+    frag.append(el('div', { class: 'panel' }, [
+      el('div', { class: 'panel-head' }, [
+        el('h3', { text: 'Every status value in the table, and where it lands' }),
+        el('span', { class: 'hint right', text: `${fmtInt(map.length)} distinct values` }),
+      ]),
+      el('div', { class: 'table-wrap stacked-wrap' }, [
+        el('table', { class: 'grid stacked' }, [
+          el('thead', {}, [el('tr', {}, [
+            el('th', { scope: 'col', class: 'freeze', style: 'text-align:left', text: 'Value in the table' }),
+            el('th', { scope: 'col', style: 'text-align:left', text: 'Counted as' }),
+            el('th', { scope: 'col', style: 'text-align:left', text: 'Decided by' }),
+            el('th', { scope: 'col', text: 'Rows' }),
+          ])]),
+          el('tbody', {}, map.length ? map.map((s) => el('tr', {}, [
+            el('td', { class: 'freeze', 'data-label': 'Value', style: 'text-align:left', text: s.raw || '(blank)' }),
+            el('td', { 'data-label': 'Counted as', style: 'text-align:left' }, [statusPill(s.bucket)]),
+            el('td', { 'data-label': 'Decided by', style: 'text-align:left', text: s.source || 'nothing matched' }),
+            el('td', { 'data-label': 'Rows', text: fmtInt(s.count) }),
+          ])) : [el('tr', {}, [el('td', { colspan: 4, class: 'freeze', text: 'No rows loaded.' })])]),
+        ]),
+      ]),
+    ]));
+
+    if (bad.length) {
+      frag.append(el('div', { class: 'panel' }, [
+        el('div', { class: 'panel-body' }, [
+          el('p', { style: 'margin:0', html: `${bad.length} value(s) did not match any of the seven MIS buckets and are being counted under <strong>Unmapped</strong>. Send me the exact spellings and I will add them to <code>normalizeStatus()</code>.` }),
+        ]),
+      ]));
+    }
+    return frag;
+  }
+
+  // raw sample
+  const sample = state.raw[0];
+  frag.append(el('div', { class: 'panel' }, [
+    el('div', { class: 'panel-head' }, [
+      el('h3', { text: 'First row exactly as Supabase returned it' }),
+      el('span', { class: 'hint right', text: 'Column names on the left are the real ones' }),
+    ]),
+    el('div', { class: 'panel-body' }, [
+      sample
+        ? el('pre', {
+            style: 'margin:0; overflow-x:auto; font-size:12px; line-height:1.6; background:var(--surface-2); padding:12px; border-radius:8px',
+            text: JSON.stringify(sample, null, 2),
+          })
+        : el('p', { style: 'margin:0', text: 'No rows came back, so there is nothing to show. Check the Connection tab.' }),
+    ]),
+  ]));
+  return frag;
+}
+
 /* 9 ------------------------------------------------------------------- chrome */
 
 function renderSidebar() {
@@ -864,21 +1316,25 @@ function renderSidebar() {
     kam: new Set(rows.map((r) => r.__kam)).size,
     squad: new Set(rows.map((r) => r.__squad)).size,
     properties: rows.length,
-    'live-properties': state.cols.live ? rows.filter((r) => r.__live).length : rows.length,
+    'live-properties': rows.filter((r) => r.__live !== false).length,
   };
 
-  for (const group of ['Summary', 'Detail']) {
+  for (const group of ['Summary', 'Detail', 'Setup']) {
     const g = el('div', { class: 'nav-group' }, [el('div', { class: 'nav-label', text: group })]);
 
     for (const v of VIEWS.filter((x) => x.group === group)) {
       if (v.external) {
-        const href = LIVE_PROPERTIES_URL || `${location.pathname}${urlFor(v.id, defaultSub(v.id))}`;
+        const external = !!LIVE_PROPERTIES_URL;
+        const href = external ? LIVE_PROPERTIES_URL : `${location.pathname}${urlFor(v.id, defaultSub(v.id))}`;
         g.append(el('a', {
           class: 'nav-item',
           href,
-          target: '_blank',
-          rel: 'noopener noreferrer',
-          title: 'Opens in a new browser tab',
+          // A *named* target opens a tab in this same browser window and reuses
+          // it on later clicks. rel=noopener is only added for third-party URLs;
+          // on our own origin it is what makes some browsers spawn a new window.
+          target: LIVE_TAB_NAME,
+          rel: external ? 'noopener noreferrer' : null,
+          title: 'Opens in another tab of this browser',
         }, [
           el('span', { class: 'dot' }),
           el('span', { class: 'label', text: v.label }),
@@ -895,7 +1351,7 @@ function renderSidebar() {
       }, [
         el('span', { class: 'dot' }),
         el('span', { class: 'label', text: v.label }),
-        el('span', { class: 'nav-count', text: fmtInt(countFor[v.id] ?? 0) }),
+        countFor[v.id] === undefined ? null : el('span', { class: 'nav-count', text: fmtInt(countFor[v.id]) }),
       ]);
       a.addEventListener('click', (e) => {
         if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return; // let the browser open a new tab
@@ -942,7 +1398,7 @@ function renderFilters() {
   const bar = $('#filter-bar');
   if (!bar) return;
 
-  if (state.loading || state.error) {
+  if (state.loading || state.error || !state.rows.length || state.view === 'diagnostics') {
     bar.replaceChildren();
     filterUI.built = false;
     filterUI.controls = {};
@@ -1102,26 +1558,52 @@ function renderView() {
   if (state.error) {
     const retry = el('button', { type: 'button', text: 'Try again' });
     retry.addEventListener('click', boot);
+    const details = el('button', { type: 'button', text: 'Connection check' });
+    details.addEventListener('click', () => go('diagnostics'));
     root.append(el('div', { class: 'state error' }, [
       el('h3', { text: 'Could not load the data' }),
       el('p', { text: state.error }),
-      el('p', { html: 'If the table loads but comes back empty, it is almost always Row Level Security — add a <code>SELECT</code> policy on the table in Supabase.' }),
-      retry,
+      el('p', { html: 'If the table is found but comes back empty, it is almost always Row Level Security — add a <code>SELECT</code> policy on the table in Supabase.' }),
+      el('div', { style: 'display:flex; gap:8px; flex-wrap:wrap; justify-content:center' }, [retry, details]),
     ]));
+    if (state.view === 'diagnostics') root.append(viewDiagnostics());
     return;
   }
 
   if (!state.rows.length) {
+    const details = el('button', { type: 'button', text: 'Connection check' });
+    details.addEventListener('click', () => go('diagnostics'));
     root.append(el('div', { class: 'state' }, [
       el('h3', { text: 'No rows came back' }),
-      el('p', { html: `The <code>${SUPABASE_TABLE}</code> table returned zero rows. Check that a <code>SELECT</code> policy exists under Supabase → Authentication → Policies.` }),
+      el('p', { html: `<code>${state.diag.tableUsed || SUPABASE_TABLE}</code> answered, but returned zero rows. That is almost always a missing <code>SELECT</code> policy under Supabase → Authentication → Policies.` }),
+      details,
     ]));
+    if (state.view === 'diagnostics') root.append(viewDiagnostics());
     return;
   }
 
   const rows = activeRows();
 
+  // A missing required column means the pivots would quietly read "(blank)"
+  const missing = [['squad', 'squad'], ['kam', 'poc'], ['signing', 'contract_signing_status']]
+    .filter(([f]) => !state.cols[f]);
+  if (missing.length && state.view !== 'diagnostics') {
+    const link = el('button', { type: 'button', class: 'reset-btn', text: 'Open Connection check' });
+    link.addEventListener('click', () => go('diagnostics'));
+    root.append(el('div', { class: 'panel', style: 'border-color:#e8c9c7; background:var(--bad-bg)' }, [
+      el('div', { class: 'panel-body' }, [
+        el('p', { style: 'margin:0 0 10px' }, [
+          `The table loaded, but no column matched ${missing.map(([, l]) => `“${l}”`).join(' or ')}. Those figures will read “(blank)” until the column is found.`,
+        ]),
+        link,
+      ]),
+    ]));
+  }
+
   switch (state.view) {
+    case 'diagnostics':
+      root.append(viewDiagnostics());
+      return;
     case 'kam':
       root.append(viewPivot(rows, '__kam', 'Owner Facing Account Manager', 'KAM-wise summary',
         'Agreement status by Owner Facing Account Manager, matching the MIS pivot.'));
@@ -1151,20 +1633,24 @@ function render() {
 /* drawer ------------------------------------------------------------------- */
 
 function openDrawer() {
-  $('#sidebar').classList.add('open');
-  $('#nav-toggle').setAttribute('aria-expanded', 'true');
+  $('#sidebar')?.classList.add('open');
+  $('#nav-toggle')?.setAttribute('aria-expanded', 'true');
   const scrim = $('#scrim');
-  scrim.hidden = false;
-  requestAnimationFrame(() => scrim.classList.add('show'));
+  if (scrim) {
+    scrim.hidden = false;
+    requestAnimationFrame(() => scrim.classList.add('show'));
+  }
   document.body.style.overflow = 'hidden';
 }
 
 function closeDrawer() {
-  $('#sidebar').classList.remove('open');
+  $('#sidebar')?.classList.remove('open');
   $('#nav-toggle')?.setAttribute('aria-expanded', 'false');
   const scrim = $('#scrim');
-  scrim.classList.remove('show');
-  setTimeout(() => { scrim.hidden = true; }, 200);
+  if (scrim) {
+    scrim.classList.remove('show');
+    setTimeout(() => { scrim.hidden = true; }, 200);
+  }
   document.body.style.overflow = '';
 }
 
@@ -1206,22 +1692,66 @@ function signOut() {
 
 /* 10 -------------------------------------------------------------------- boot */
 
-async function boot() {
-  state.loading = true;
+async function boot(isRefresh = false) {
+  if (state.refreshing) return;
+  state.refreshing = true;
+  paintRefresh();
+
+  // A refresh keeps the current tab and filters on screen while it reloads
+  state.loading = !isRefresh || !state.rows.length;
   state.error = null;
-  render();
+  state.diag = {};
+  if (state.loading) render();
 
   try {
-    const raw = await fetchAllRows();
+    const raw = await fetchAllRows(state.diag);
+    state.raw = raw;
     state.cols = resolveColumns(raw[0]);
     state.rows = normalizeRows(raw, state.cols);
+
+    // every column the table actually has — union, in case rows differ
+    const all = new Set();
+    for (const r of raw.slice(0, 50)) Object.keys(r).forEach((k) => all.add(k));
+    state.diag.allColumns = [...all];
+
+    // every distinct source-value combination and the bucket it produced
+    const seen = new Map();
+    for (const r of state.rows) {
+      const key = `${r.__statusRaw}||${r.__status}||${r.__source || 'derived'}`;
+      if (!seen.has(key)) seen.set(key, { raw: r.__statusRaw, bucket: r.__status, source: r.__source, count: 0 });
+      seen.get(key).count += 1;
+    }
+    state.diag.statusMap = [...seen.values()].sort((a, b) => b.count - a.count);
+
     state.error = null;
   } catch (err) {
     state.error = err.message || String(err);
     state.rows = [];
+    state.raw = [];
   } finally {
     state.loading = false;
+    state.refreshing = false;
+    state.loadedAt = new Date();
     render();
+    paintRefresh();
+  }
+}
+
+/** Topbar refresh button: spinner while loading, last-updated time when idle. */
+function paintRefresh() {
+  const btn = $('#refresh-btn');
+  const stamp = $('#last-updated');
+  if (!btn) return;
+  btn.classList.toggle('spinning', !!state.refreshing);
+  btn.disabled = !!state.refreshing;
+  btn.setAttribute('aria-busy', state.refreshing ? 'true' : 'false');
+  btn.title = state.refreshing ? 'Reloading from Supabase…' : 'Reload from Supabase';
+  if (stamp) {
+    stamp.textContent = state.refreshing
+      ? 'Refreshing…'
+      : state.loadedAt
+        ? `Updated ${state.loadedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+        : '';
   }
 }
 
@@ -1235,6 +1765,7 @@ function init() {
     $('#login-error')?.classList.remove('show');
   });
   $('#signout-btn')?.addEventListener('click', signOut);
+  $('#refresh-btn')?.addEventListener('click', () => boot(true));
 
   $('#nav-toggle')?.addEventListener('click', () => {
     $('#sidebar').classList.contains('open') ? closeDrawer() : openDrawer();

@@ -35,6 +35,13 @@
       <div class="brand-text"><div class="name">Vista Tracker</div><div class="tag">Live from Acq Master · auto-synced daily</div></div>
     </div>
     <div class="topbar-right">
+      <span id="last-updated" class="stamp"></span>
+      <button class="refresh" id="refresh-btn" type="button" aria-label="Refresh data" title="Reload from Supabase">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/>
+        </svg>
+        <span class="refresh-text">Refresh</span>
+      </button>
       <span id="who-label"></span>
       <button id="signout-btn" class="signout" type="button">Sign out</button>
     </div>
