@@ -2,8 +2,12 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<meta name="theme-color" content="#faf8f5" />
 <title>Vista Tracker</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Marcellus&display=swap" rel="stylesheet" />
 <link rel="stylesheet" href="/src/style.css" />
 </head>
 <body>
@@ -14,29 +18,34 @@
     <h1>Vista Tracker</h1>
     <div class="sub">Internal · Prototype</div>
     <p class="instruction">Sign in with your work email to continue.</p>
-    <input id="email-input" type="email" placeholder="you@stayvista.com" />
-    <div class="login-error" id="login-error">Enter a valid email to continue.</div>
-    <button onclick="handleLogin()">Continue</button>
+    <input id="email-input" type="email" autocomplete="email" inputmode="email" placeholder="you@stayvista.com" aria-describedby="login-error" />
+    <div class="login-error" id="login-error" role="alert">Enter a valid email to continue.</div>
+    <button id="login-btn" type="button">Continue</button>
     <div class="login-note">Prototype note: any email works here for now.<br>Real access control is added by the tech team using Supabase Auth.</div>
   </div>
 </div>
 
 <div id="app" class="hidden">
   <header class="topbar">
+    <button id="nav-toggle" class="nav-toggle" type="button" aria-label="Show sections" aria-controls="sidebar" aria-expanded="false">
+      <span></span><span></span><span></span>
+    </button>
     <div class="brand-block">
       <div class="brand-mark">VT</div>
       <div class="brand-text"><div class="name">Vista Tracker</div><div class="tag">Live from Acq Master · auto-synced daily</div></div>
     </div>
     <div class="topbar-right">
       <span id="who-label"></span>
-      <button class="signout" onclick="signOut()">Sign out</button>
+      <button id="signout-btn" class="signout" type="button">Sign out</button>
     </div>
   </header>
 
   <div class="app-body">
-    <aside class="sidebar" id="sidebar"></aside>
+    <aside class="sidebar" id="sidebar" aria-label="Sections"></aside>
+    <div class="scrim" id="scrim" hidden></div>
     <div class="main-area">
       <div class="tab-strip" id="tab-strip"></div>
+      <div class="filter-bar" id="filter-bar"></div>
       <main id="view-root"></main>
     </div>
   </div>

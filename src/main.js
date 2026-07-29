@@ -1,883 +1,1260 @@
-const SUPABASE_URL = "https://benzjvkbevombzjwwtqr.supabase.co";
-const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJlbnpqdmtiZXZvbWJ6and3dHFyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ3ODY3NjIsImV4cCI6MjEwMDM2Mjc2Mn0.E8ZxzUmT5xdOwmAd8Yg_i8lLkBXHM3vh8itV1WBZV8M";
-const TABLE_NAME = "agreement track";
+/* ==========================================================================
+   Vista Tracker — application logic
+   --------------------------------------------------------------------------
+   1  Config & constants
+   2  Small helpers
+   3  Column resolution + row normalisation
+   4  Data loading (paged, so >1000 rows come through)
+   5  State + URL routing
+   6  Filtering & aggregation
+   7  UI primitives (multi-select, tables, colour scale)
+   8  Views
+   9  Chrome (sidebar, tab strip, filter bar)
+   10 Boot
+   ========================================================================== */
 
-// Color palette assigned dynamically to whatever status values actually exist in this data
-const STATUS_PALETTE = [
-  { bg:'#e3f0e6', fg:'#2f6b3f', dot:'#3f7d5c' }, // green
-  { bg:'#f7e3e0', fg:'#a13f30', dot:'#a13f30' }, // red
-  { bg:'#f4ecd8', fg:'#8a6a1f', dot:'#b58a1f' }, // amber
-  { bg:'#e6e6f2', fg:'#4b4b8a', dot:'#4b4b8a' }, // indigo
-  { bg:'#e6f0f2', fg:'#2f6a78', dot:'#2f8a9a' }, // teal
-  { bg:'#f2e6f0', fg:'#8a2f6a', dot:'#8a2f6a' }, // magenta
+/* 1 ------------------------------------------------------- config & constants */
+
+const ENV = import.meta.env;
+
+const SUPABASE_URL   = (ENV.VITE_SUPABASE_URL || '').replace(/\/+$/, '');
+const SUPABASE_KEY   = ENV.VITE_SUPABASE_ANON_KEY || '';
+const SUPABASE_TABLE = ENV.VITE_SUPABASE_TABLE || 'agreement track';
+
+/* Optional. If set, the Live Properties nav item opens this URL instead of the
+   in-app Live Properties page. Either way it opens in a new browser tab. */
+const LIVE_PROPERTIES_URL = ENV.VITE_LIVE_PROPERTIES_URL || '';
+
+const PAGE_SIZE = 1000; // Supabase returns at most 1000 rows per request
+
+/* The seven MIS columns, in MIS order. "Grand Total" is derived. */
+const STATUS_ORDER = [
+  'Email Confirmation',
+  'Expired',
+  'Founder/Partner Approved',
+  'Not Signed',
+  'To Expire',
+  'Valid',
 ];
-const OTHER_STYLE = { bg:'#f1f1f1', fg:'#555', dot:'#999' };
-let STATUS_STYLE = {}; // built dynamically once data loads
-let KPI_ORDER = [];
-let KPI_LABELS = {};
 
-const RENEWAL_WINDOW_DAYS = 60;
-// ASSUMPTION: no "sent to owner without response" tracking column was present in the
-// columns this app already knew about, so this is detected dynamically from whatever
-// columns exist (see detectOwnerResponseColumns). 14 days is a placeholder threshold —
-// change it below if your team uses a different SLA.
-const NO_RESPONSE_THRESHOLD_DAYS = 14;
+const UNMAPPED = 'Unmapped';
 
-let allRows = [];
-let squadList = [];
-let pocList = []; // stand-in for "KAM" — this sheet's closest equivalent is POC
-let sidebarExpanded = { squads: true, pocs: false };
-let openTabs = ['ALL'];
-let activeTabId = 'ALL';
-let activeRow = null;
-let lastSyncedAt = null;
-let isRefreshing = false;
-let followUpDone = new Set();
+const STATUS_COLOR = {
+  'Email Confirmation':       '#9cccfb',
+  'Expired':                  '#b4433f',
+  'Founder/Partner Approved': '#c9b8e4',
+  'Not Signed':               '#e9a0a7',
+  'To Expire':                '#fcd4a8',
+  'Valid':                    '#2e7d5b',
+  [UNMAPPED]:                 '#d6cec2',
+};
 
-// dynamically detected column names for the "awaiting owner response" tracking —
-// null if this dataset doesn't have anything matching
-let SENT_DATE_KEY = null;
-let RESPONSE_KEY = null;
+const BLANK = '(blank)';
 
-let tabState = {};
-function getTabState(tabId){
-  if(!tabState[tabId]) tabState[tabId] = { search:'', detailPage:1, selectedSquads:new Set(), selectedPocs:new Set() };
-  return tabState[tabId];
-}
+/* 2 -------------------------------------------------------------- small helpers */
 
-function handleLogin(){
-  const email = document.getElementById('email-input').value.trim();
-  const err = document.getElementById('login-error');
-  if(!email.includes('@')){ err.style.display='block'; return; }
-  err.style.display='none';
-  document.getElementById('login-screen').classList.add('hidden');
-  document.getElementById('app').classList.remove('hidden');
-  document.getElementById('who-label').textContent = email;
-  boot();
-}
-function signOut(){
-  document.getElementById('app').classList.add('hidden');
-  document.getElementById('login-screen').classList.remove('hidden');
-  document.getElementById('email-input').value='';
-}
+const $  = (sel, root = document) => root.querySelector(sel);
 
-async function fetchAllRows(){
-  let all = [];
-  let from = 0;
-  const batchSize = 1000;
-  while(true){
-    const url = `${SUPABASE_URL}/rest/v1/${encodeURIComponent(TABLE_NAME)}?select=*`;
-    const res = await fetch(url, {
-      headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${SUPABASE_ANON_KEY}`, "Range": `${from}-${from+batchSize-1}` }
-    });
-    if(!res.ok){
-      const text = await res.text();
-      throw new Error(`Supabase returned status ${res.status}: ${text}`);
-    }
-    const batch = await res.json();
-    all = all.concat(batch);
-    if(batch.length < batchSize) break;
-    from += batchSize;
+/** Build an element. children may be nodes or strings (always set as text). */
+function el(tag, props = {}, children = []) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (v === null || v === undefined || v === false) continue;
+    if (k === 'class') node.className = v;
+    else if (k === 'text') node.textContent = v;
+    else if (k === 'html') node.innerHTML = v;
+    else if (k.startsWith('on') && typeof v === 'function') node.addEventListener(k.slice(2), v);
+    else if (k === 'dataset') Object.assign(node.dataset, v);
+    else node.setAttribute(k, v === true ? '' : String(v));
   }
-  return all;
-}
-
-async function boot(){
-  const root = document.getElementById('view-root');
-  root.innerHTML = `<div class="loading-note">Loading data from Supabase…</div>`;
-  try{
-    allRows = await fetchAllRows();
-    buildColumnIndex();
-    buildStatusStyles();
-    buildGroupLists();
-    detectOwnerResponseColumns();
-    lastSyncedAt = new Date();
-    renderSidebar();
-    renderTabStrip();
-
-    // If this tab was opened via "View Full Details" (?property=ID), jump straight
-    // to that property's record instead of showing the dashboard first.
-    const urlParams = new URLSearchParams(window.location.search);
-    const urlPropertyId = urlParams.get('property');
-    if(urlPropertyId){
-      const match = allRows.find(r => String(getPropertyId(r)) === urlPropertyId);
-      if(match) activeRow = match;
-    } else if(urlParams.get('view') === 'live'){
-      // Opened via the "Live Properties" card — land directly on that tab.
-      openTab(tabIdFor('STATUS','live'));
-    }
-
-    renderActiveTab();
-    updateSyncLabel();
-    // keep the dashboard fresh without a full page reload
-    setInterval(manualRefresh, 60000);
-  }catch(e){
-    root.innerHTML = `<div class="error-note">Could not reach Supabase: ${e.message}</div>`;
+  for (const c of [].concat(children)) {
+    if (c === null || c === undefined || c === false) continue;
+    node.append(c instanceof Node ? c : document.createTextNode(String(c)));
   }
+  return node;
 }
 
-async function manualRefresh(){
-  if(isRefreshing) return;
-  isRefreshing = true;
-  const btn = document.getElementById('refresh-btn');
-  if(btn){ btn.classList.add('spinning'); btn.disabled = true; }
-  try{
-    const fresh = await fetchAllRows();
-    if(fresh && fresh.length){
-      allRows = fresh;
-      buildColumnIndex();
-      buildStatusStyles();
-      buildGroupLists();
-      detectOwnerResponseColumns();
-      lastSyncedAt = new Date();
-      if(!activeRow){
-        renderSidebar();
-        renderTabStrip();
-        renderActiveTab();
-      }
+const norm = (s) => String(s ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+const clean = (s) => String(s ?? '').trim().replace(/\s+/g, ' ');
+
+const nf = new Intl.NumberFormat('en-IN');
+const fmtInt = (n) => nf.format(n);
+const fmtPct = (n) => (n === null || Number.isNaN(n) ? '—' : `${Math.round(n)}%`);
+
+function collator() {
+  return new Intl.Collator('en', { sensitivity: 'base', numeric: true });
+}
+const cmp = collator().compare;
+
+function isTruthy(v) {
+  const n = norm(v);
+  return ['live', 'yes', 'y', 'true', '1', 'active', 'onboarded', 'golive'].includes(n);
+}
+
+/* 3 ------------------------------ column resolution + row normalisation ------ */
+
+/**
+ * Column names in the sheet drift (spaces, casing, renames). Resolve each field
+ * we need by matching against a list of normalised candidates, so a rename in
+ * the Acq Master doesn't silently empty out a whole tab.
+ */
+function resolveColumns(sample) {
+  const keys = Object.keys(sample || {});
+  const index = keys.map((k) => ({ key: k, n: norm(k) }));
+
+  const pick = (tests) => {
+    for (const test of tests) {
+      const hit = index.find(test);
+      if (hit) return hit.key;
     }
-  }catch(e){
-    console.error('Refresh from Supabase failed:', e);
-  }finally{
-    isRefreshing = false;
-    const btn2 = document.getElementById('refresh-btn');
-    if(btn2){ btn2.classList.remove('spinning'); btn2.disabled = false; }
-    updateSyncLabel();
-  }
-}
-function updateSyncLabel(){
-  const label = document.getElementById('sync-label');
-  if(label) label.textContent = lastSyncedAt ? `Synced ${lastSyncedAt.toLocaleTimeString()}` : '';
-}
+    return null;
+  };
 
-// ---------- RESILIENT COLUMN LOOKUP ----------
-// Supabase/CSV imports sometimes rename columns (e.g. "Vista Name" -> "vista_name")
-// depending on how a table was created. Instead of hardcoding one exact spelling,
-// build a normalized index once per data load, and look fields up by trying several
-// likely names. This means renaming/re-importing a table won't silently break the
-// dashboard the way it did with "Squad"/"Current Status" showing as blank.
-let COLUMN_INDEX = {}; // normalized name -> actual key as it appears in the data
+  const has = (...parts) => (c) => parts.every((p) => c.n.includes(p));
+  const is  = (...names) => (c) => names.includes(c.n);
 
-function normalizeKey(k){
-  return k.toString().toLowerCase().replace(/[^a-z0-9]/g, '');
-}
-function buildColumnIndex(){
-  COLUMN_INDEX = {};
-  if(!allRows.length) return;
-  Object.keys(allRows[0]).forEach(k=>{
-    COLUMN_INDEX[normalizeKey(k)] = k;
-  });
-}
-// tries each candidate name (any casing/spacing/underscore style) and returns the
-// first one that actually exists in this row's data
-function getVal(row, candidates){
-  for(const c of candidates){
-    const actualKey = COLUMN_INDEX[normalizeKey(c)];
-    if(actualKey !== undefined && row[actualKey] !== undefined && row[actualKey] !== null && row[actualKey] !== ''){
-      return row[actualKey];
-    }
-  }
-  return null;
-}
-
-function fieldsFor(row){
   return {
-    name: getVal(row, ["Vista Name","Property Name","vista_name","property_name"]) || "Unnamed property",
-    // this sheet has no "Owner Facing Account Manager" column in some imports — POC is the closest stand-in for KAM
-    owner: (getVal(row, ["POC","Owner Facing Account Manager","poc"]) || "").toString().trim() || "Unassigned",
-    status: (getVal(row, ["Current Status","current_status","Property Current Status"]) || "").toString().trim() || "Unknown",
-    kickoff: getVal(row, ["Live date","Live Date","live_date"]) || "—",
-    endDateRaw: getVal(row, ["Agreement end date","Agreement End Date","agreement_end_date"]) || null,
-    contractStatus: getVal(row, ["Contract status","Contract Status","contract_status"]) || "—",
-    squad: (getVal(row, ["Squad","squad","New Squad Mapping"]) || "").toString().trim() || "Unassigned",
-    city: (getVal(row, ["City","city"]) || "").toString().trim() || "—",
-    sentToOwnerRaw: SENT_DATE_KEY ? row[SENT_DATE_KEY] : null,
-    ownerResponse: RESPONSE_KEY ? (row[RESPONSE_KEY] || "").toString().trim() : "",
+    kam: pick([
+      is('ownerfacingaccountmanager'),
+      has('ownerfacing', 'manager'),
+      has('account', 'manager'),
+      is('kam', 'kamname', 'accountmanager'),
+    ]),
+    squad: pick([
+      is('newsquadmapping'),
+      has('newsquad'),
+      has('squad', 'mapping'),
+      has('squad'),
+      is('cluster', 'region', 'location'),
+    ]),
+    status: pick([
+      is('agreementstatus'),
+      has('agreement', 'status'),
+      is('status'),
+      has('agreement'),
+    ]),
+    property: pick([
+      is('propertyname'),
+      has('property', 'name'),
+      is('villaname', 'listingname', 'vistaname'),
+      has('villa'),
+      is('name', 'title'),
+    ]),
+    url: pick([
+      has('property', 'link'),
+      has('listing', 'url'),
+      has('live', 'link'),
+      has('url'),
+      has('link'),
+      has('website'),
+    ]),
+    live: pick([
+      is('livestatus', 'islive', 'live'),
+      has('live', 'status'),
+      has('golive'),
+      has('live'),
+    ]),
+    code: pick([
+      is('propertycode', 'propertyid', 'vistacode', 'code', 'id'),
+      has('property', 'code'),
+    ]),
   };
 }
 
-// A stable identifier for a property, used to build the "?property=ID" link that
-// lets "View Full Details" open in a genuine new browser tab (not just a new panel
-// in the same tab) — the new tab re-loads the app and jumps straight to this record.
-function getPropertyId(row){
-  return getVal(row, ["Property ID","property_id","row_id"]) || "";
-}
-function openPropertyInNewTab(row){
-  const id = getPropertyId(row);
-  if(!id){ activeRow = row; renderActiveTab(); return; } // no stable id available — fall back to in-page view
-  const url = `${window.location.pathname}?property=${encodeURIComponent(id)}`;
-  window.open(url, '_blank');
-}
-// Proper "go back to the dashboard" reset — used by the Back button. (Directly
-// assigning to activeRow / calling renderActiveTab from an inline onclick doesn't
-// work reliably here since this app is built as an ES module, so those names aren't
-// available as bare globals in the page; routing through openTab(), which IS exposed
-// on window, fixes it.)
-function goBackHome(){
-  openTab('ALL');
+/**
+ * Map whatever the sheet says into the seven MIS buckets.
+ * Order matters: "Not Signed" is tested before "Signed", "To Expire" before
+ * "Expired", otherwise substrings swallow each other.
+ */
+function normalizeStatus(raw) {
+  const n = norm(raw);
+  if (!n) return UNMAPPED;
+  if (n.includes('emailconfirm') || n.includes('confirmationemail')) return 'Email Confirmation';
+  if (n.includes('founder') || n.includes('partnerapproved') || n.includes('partnerapproval')) return 'Founder/Partner Approved';
+  if (n.includes('notsigned') || n.includes('unsigned') || n.includes('yettosign') || n.includes('pendingsignature')) return 'Not Signed';
+  if (n.includes('toexpire') || n.includes('abouttoexpire') || n.includes('expiringsoon') || n.includes('nearingexpiry')) return 'To Expire';
+  if (n.includes('expired') || n.includes('expiry')) return 'Expired';
+  if (n.includes('valid') || n.includes('active') || n.includes('signed')) return 'Valid';
+  return UNMAPPED;
 }
 
-// Looks for a column that tracks "agreement sent to owner" and one that tracks the
-// owner's response, since column names vary and this app was never told the exact ones.
-function detectOwnerResponseColumns(){
-  SENT_DATE_KEY = null; RESPONSE_KEY = null;
-  if(!allRows.length) return;
-  const keys = Object.keys(allRows[0]);
-  SENT_DATE_KEY = keys.find(k => /sent/i.test(k) && /owner/i.test(k))
-    || keys.find(k => /sent/i.test(k) && /date/i.test(k))
-    || null;
-  RESPONSE_KEY = keys.find(k => /response/i.test(k)) || null;
+function normalizeRows(raw, cols) {
+  return raw.map((r, i) => ({
+    __i: i,
+    __kam:      clean(cols.kam      ? r[cols.kam]      : '') || BLANK,
+    __squad:    clean(cols.squad    ? r[cols.squad]    : '') || BLANK,
+    __statusRaw: clean(cols.status  ? r[cols.status]   : ''),
+    __status:   normalizeStatus(cols.status ? r[cols.status] : ''),
+    __property: clean(cols.property ? r[cols.property] : '') || '—',
+    __code:     clean(cols.code     ? r[cols.code]     : ''),
+    __url:      clean(cols.url      ? r[cols.url]      : ''),
+    __live:     cols.live ? isTruthy(r[cols.live]) : null,
+    __raw: r,
+  }));
 }
 
-function buildStatusStyles(){
-  const counts = {};
-  allRows.forEach(row=>{
-    const s = fieldsFor(row).status;
-    counts[s] = (counts[s]||0)+1;
-  });
-  const sorted = Object.entries(counts).sort((a,b)=>b[1]-a[1]);
-  const top = sorted.slice(0,6).map(e=>e[0]);
-  STATUS_STYLE = {};
-  top.forEach((s,i)=>{ STATUS_STYLE[s.toLowerCase()] = STATUS_PALETTE[i % STATUS_PALETTE.length]; });
-  KPI_ORDER = top.map(s=>s.toLowerCase());
-  KPI_LABELS = {};
-  top.forEach(s=>{ KPI_LABELS[s.toLowerCase()] = s; });
-}
-function statusKey(status){
-  const s = (status||'').toString().trim().toLowerCase();
-  return STATUS_STYLE[s] ? s : 'other';
-}
-function styleFor(key){ return STATUS_STYLE[key] || OTHER_STYLE; }
+/* 4 ------------------------------------------------------------- data loading */
 
-// Live/Delisted get a fixed semantic color regardless of palette rank; everything else
-// keeps its dynamically-assigned palette color.
-function semanticStyleFor(key){
-  const label = (KPI_LABELS[key]||'').toLowerCase();
-  if(label.includes('live')) return { dot:'#3f7d5c', fg:'#1f5c37' };
-  if(label.includes('delist')) return { dot:'#a13f30', fg:'#7a2318' };
-  const st = styleFor(key);
-  return { dot: st.dot, fg: st.fg };
-}
-function hexMix(hex, pct){
-  const h = hex.replace('#','');
-  const r = parseInt(h.substring(0,2),16), g = parseInt(h.substring(2,4),16), b = parseInt(h.substring(4,6),16);
-  const mr = Math.round(r + (255-r)*pct), mg = Math.round(g + (255-g)*pct), mb = Math.round(b + (255-b)*pct);
-  return `rgb(${mr},${mg},${mb})`;
-}
-
-function daysRemaining(endDateRaw){
-  if(!endDateRaw) return null;
-  const end = new Date(endDateRaw);
-  if(isNaN(end.getTime())) return null;
-  const today = new Date(); today.setHours(0,0,0,0);
-  end.setHours(0,0,0,0);
-  return Math.round((end - today) / 86400000);
-}
-function urgencyLevel(endDateRaw){
-  const d = daysRemaining(endDateRaw);
-  if(d === null) return null;
-  if(d < 0) return 'expired';   // agreement end date has already passed — distinct from "expiring soon"
-  if(d <= 7) return 'red';
-  if(d <= 30) return 'orange';
-  return null;
-}
-function daysSince(dateRaw){
-  if(!dateRaw) return null;
-  const d = new Date(dateRaw);
-  if(isNaN(d.getTime())) return null;
-  const today = new Date(); today.setHours(0,0,0,0); d.setHours(0,0,0,0);
-  return Math.round((today - d) / 86400000);
-}
-function isAwaitingResponse(f){
-  if(!SENT_DATE_KEY) return false;
-  const days = daysSince(f.sentToOwnerRaw);
-  if(days === null || days < NO_RESPONSE_THRESHOLD_DAYS) return false;
-  const resp = (f.ownerResponse||'').toLowerCase();
-  if(!resp) return true;
-  return /pending|no response|awaiting|not received|none/i.test(resp);
-}
-
-function buildGroupLists(){
-  const sq = {}, poc = {};
-  allRows.forEach(row=>{
-    const f = fieldsFor(row);
-    sq[f.squad] = (sq[f.squad]||0)+1;
-    poc[f.owner] = (poc[f.owner]||0)+1;
-  });
-  squadList = Object.entries(sq).sort((a,b)=>b[1]-a[1]).map(([name,count])=>({name,count}));
-  pocList = Object.entries(poc).sort((a,b)=>b[1]-a[1]).map(([name,count])=>({name,count}));
-}
-
-function tabIdFor(type,name){ return `${type}::${name}`; }
-function parseTab(tabId){
-  if(tabId==='ALL') return {type:'ALL', name:'All Properties'};
-  const [type,...rest] = tabId.split('::');
-  return {type, name: rest.join('::')};
-}
-
-function renderSidebar(){
-  const sb = document.getElementById('sidebar');
-  sb.innerHTML = `
-    <div class="sidebar-title">Overview</div>
-    <div class="sidebar-item ${activeTabId==='ALL'?'active':''}" onclick="openTab('ALL')">
-      <span>All Properties</span><span class="sidebar-count">${allRows.length}</span>
-    </div>
-    <div class="sidebar-divider"></div>
-
-    <div class="sidebar-section-header" onclick="toggleSection('squads')">
-      <span>Squad</span><span class="sidebar-caret">${sidebarExpanded.squads?'▾':'▸'}</span>
-    </div>
-    ${sidebarExpanded.squads ? `<div class="sidebar-sublist">${squadList.map(s=>`
-      <div class="sidebar-item ${activeTabId===tabIdFor('SQUAD',s.name)?'active':''}" onclick="openTab('${tabIdFor('SQUAD',s.name).replace(/'/g,"\\'")}')">
-        <span>${escapeHtml(s.name)}</span><span class="sidebar-count">${s.count}</span>
-      </div>`).join('')}</div>` : ''}
-
-    <div class="sidebar-divider"></div>
-
-    <div class="sidebar-section-header" onclick="toggleSection('pocs')">
-      <span>POC (KAM)</span><span class="sidebar-caret">${sidebarExpanded.pocs?'▾':'▸'}</span>
-    </div>
-    ${sidebarExpanded.pocs ? `<div class="sidebar-sublist">${pocList.map(k=>`
-      <div class="sidebar-item ${activeTabId===tabIdFor('POC',k.name)?'active':''}" onclick="openTab('${tabIdFor('POC',k.name).replace(/'/g,"\\'")}')">
-        <span>${escapeHtml(k.name)}</span><span class="sidebar-count">${k.count}</span>
-      </div>`).join('')}</div>` : ''}
-  `;
-}
-function toggleSection(key){
-  sidebarExpanded[key] = !sidebarExpanded[key];
-  renderSidebar();
-}
-
-function openTab(tabId){
-  if(!openTabs.includes(tabId)) openTabs.push(tabId);
-  activeTabId = tabId;
-  activeRow = null;
-  renderSidebar();
-  renderTabStrip();
-  renderActiveTab();
-}
-function closeTab(tabId, evt){
-  evt.stopPropagation();
-  if(tabId === 'ALL') return;
-  openTabs = openTabs.filter(t=>t!==tabId);
-  delete tabState[tabId];
-  if(activeTabId === tabId) activeTabId = 'ALL';
-  renderSidebar();
-  renderTabStrip();
-  renderActiveTab();
-}
-function renderTabStrip(){
-  const strip = document.getElementById('tab-strip');
-  strip.innerHTML = openTabs.map(t=>{
-    const p = parseTab(t);
-    const icon = t==='ALL' ? '🏠' : p.type==='SQUAD' ? '📍' : p.type==='POC' ? '🧑' : p.type==='STATUS' ? '📊' : p.type==='URGENT' ? '⚠' : '📄';
-    const label = `${icon} ${escapeHtml(tabDisplayName(p))}`;
-    return `
-    <div class="browser-tab ${activeTabId===t?'active':''}" onclick="openTab('${t.replace(/'/g,"\\'")}')">
-      <span>${label}</span>
-      ${t!=='ALL' ? `<span class="close-x" onclick="closeTab('${t.replace(/'/g,"\\'")}', event)">✕</span>` : ''}
-    </div>`;
-  }).join('');
-}
-
-function rowsForTab(tabId){
-  if(tabId==='ALL') return allRows;
-  const p = parseTab(tabId);
-  if(p.type==='SQUAD') return allRows.filter(r=>fieldsFor(r).squad === p.name);
-  if(p.type==='POC') return allRows.filter(r=>fieldsFor(r).owner === p.name);
-  if(p.type==='STATUS') return p.name==='all' ? allRows : allRows.filter(r=>statusKey(fieldsFor(r).status) === p.name);
-  if(p.type==='URGENT'){
-    if(p.name==='soon') return allRows.filter(r=>{ const lvl=urgencyLevel(fieldsFor(r).endDateRaw); return lvl==='red'||lvl==='orange'; });
-    return allRows.filter(r=>urgencyLevel(fieldsFor(r).endDateRaw) === p.name);
+/** Fetch every row, 1000 at a time. Without this the tabs silently cap at 1000. */
+async function fetchAllRows() {
+  if (!SUPABASE_URL || !SUPABASE_KEY) {
+    throw new Error('Missing VITE_SUPABASE_URL or VITE_SUPABASE_ANON_KEY. Check your .env file (or Vercel environment variables) and redeploy.');
   }
-  if(p.type==='CONTRACT') return allRows.filter(r=>contractCategoryFor(fieldsFor(r)) === p.name);
-  // Agreement-status cards clicked from inside the Live Properties tab — always scoped
-  // to Live properties specifically, matching what the card counted.
-  if(p.type==='LIVEAGREEMENT'){
-    const liveRows = allRows.filter(r=>statusKey(fieldsFor(r).status)==='live');
-    if(p.name==='expired') return liveRows.filter(r=>urgencyLevel(fieldsFor(r).endDateRaw)==='expired');
-    if(p.name==='founder') return liveRows.filter(r=>isFounderPartnerApproved(r));
-    if(p.name==='notsigned') return liveRows.filter(r=>contractCategoryFor(fieldsFor(r))==='pending');
-    return liveRows;
-  }
-  return allRows;
-}
 
-// Friendly display name for any tab type, used in headers/tab-strip labels
-function tabDisplayName(p){
-  if(p.type==='ALL') return 'All Properties';
-  if(p.type==='STATUS') return p.name==='all' ? 'All Properties' : (KPI_LABELS[p.name] || p.name);
-  if(p.type==='URGENT'){
-    if(p.name==='red') return 'Expiring within 7 days';
-    if(p.name==='orange') return 'Expiring within 30 days';
-    if(p.name==='soon') return 'Expiring soon (≤30 days)';
-    if(p.name==='expired') return 'Expired agreements';
-  }
-  if(p.type==='CONTRACT') return p.name==='completed' ? 'Agreement Completed' : 'Pending / Not Signed';
-  if(p.type==='LIVEAGREEMENT'){
-    if(p.name==='expired') return 'Live · Expired Agreements';
-    if(p.name==='founder') return 'Live · Founder/Partner Approved';
-    if(p.name==='notsigned') return 'Live · Not Signed';
-  }
-  return p.name;
-}
+  const endpoint = `${SUPABASE_URL}/rest/v1/${encodeURIComponent(SUPABASE_TABLE)}?select=*`;
+  const out = [];
+  let from = 0;
 
-// Shared category logic — used by both the Agreement Summary cards and the CONTRACT
-// tab type they link to, so clicking a card always shows exactly what it counted.
-function contractCategoryFor(f){
-  const cs = (f.contractStatus||'').toString().toLowerCase();
-  if(cs.includes('not signed') || cs.includes('pending')) return 'pending';
-  if(cs.includes('signed')) return 'completed';
-  return 'other';
-}
-
-// Checks whichever column tracks exception sign-off, under any of the names it might
-// have in this table, and looks for "Founder" or "Partner" in the value. If this data
-// hasn't been synced with that column yet, this correctly (and honestly) returns false
-// for everything rather than guessing — the card will show 0 until that field exists.
-const FOUNDER_APPROVAL_CANDIDATES = [
-  "If Yes, exceptions approved by (Central)",
-  "Exceptions approved by",
-  "Exception Approved By",
-  "Approved By",
-  "Founder Approval",
-  "Partner Approval",
-  "Founder/Partner Approved"
-];
-function isFounderPartnerApproved(row){
-  const val = getVal(row, FOUNDER_APPROVAL_CANDIDATES);
-  return !!val && /founder|partner/i.test(String(val));
-}
-
-/* ---------- LEADERBOARD DATA (used by Top 5 Squads strip) ---------- */
-function computeLeaderboard(groupField){
-  const groups = {};
-  allRows.forEach(row=>{
-    const f = fieldsFor(row);
-    const key = f[groupField];
-    if(!groups[key]) groups[key] = [];
-    groups[key].push(row);
-  });
-  const topStatus = KPI_ORDER[0]; // treat the single most common status as "healthy" reference
-  return Object.entries(groups).map(([name, rows])=>{
-    const total = rows.length;
-    let healthy=0, churnLike=0, renewal=0;
-    rows.forEach(row=>{
-      const f = fieldsFor(row);
-      const sk = statusKey(f.status);
-      if(sk===topStatus) healthy++;
-      else churnLike++;
-      const d = daysRemaining(f.endDateRaw);
-      if(d !== null && d <= RENEWAL_WINDOW_DAYS) renewal++;
+  for (let guard = 0; guard < 60; guard++) {
+    const res = await fetch(endpoint, {
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${SUPABASE_KEY}`,
+        'Range-Unit': 'items',
+        Range: `${from}-${from + PAGE_SIZE - 1}`,
+        Prefer: 'count=exact',
+      },
     });
-    const churnRate = total ? Math.round((churnLike/total)*1000)/10 : 0;
-    return { name, total, healthy, churnLike, churnRate, renewal };
-  });
-}
-function topSquadStripsHtml(){
-  const rows = computeLeaderboard('squad').sort((a,b)=>b.total-a.total).slice(0,5);
-  const maxTotal = Math.max(...rows.map(r=>r.total), 1);
-  const healthyLabel = KPI_LABELS[KPI_ORDER[0]] || 'Healthy';
-  return `
-    <div class="section-card">
-      <div class="section-title">Top 5 Squads</div>
-      <div class="section-desc">Ranked by total properties · ${escapeHtml(healthyLabel)} count and churn rate shown for context.</div>
-      <div class="squad-strips">
-        ${rows.map(r=>`
-          <div class="squad-strip" onclick="openTab('${tabIdFor('SQUAD', r.name).replace(/'/g,"\\'")}')">
-            <div class="squad-strip-top">
-              <span class="squad-strip-name">${escapeHtml(r.name)}</span>
-              <span class="squad-strip-total">${r.total}</span>
-            </div>
-            <div class="squad-strip-bar"><div class="squad-strip-fill" style="width:${(r.total/maxTotal)*100}%"></div></div>
-            <div class="squad-strip-meta">
-              <span>${escapeHtml(healthyLabel)}: ${r.healthy}</span>
-              <span class="lb-badge ${r.churnRate<=15?'good':r.churnRate<=35?'warn':'bad'}">${r.churnRate}% churn</span>
-            </div>
-          </div>`).join('')}
-      </div>
-    </div>`;
-}
 
-/* ---------- COMPACT LEADERBOARDS ---------- */
-function csvEscape(v){
-  const s = (v===null||v===undefined) ? '' : String(v);
-  return /[",\n]/.test(s) ? '"'+s.replace(/"/g,'""')+'"' : s;
-}
-function downloadReportCsv(){
-  const headers = ['Property','Squad','POC','Status','Live Date','Contract Status','Agreement End Date','Days Remaining','City'];
-  const lines = [headers.join(',')];
-  allRows.forEach(row=>{
-    const f = fieldsFor(row);
-    const d = daysRemaining(f.endDateRaw);
-    lines.push([f.name,f.squad,f.owner,f.status,f.kickoff,f.contractStatus,f.endDateRaw||'',d===null?'':d,f.city].map(csvEscape).join(','));
-  });
-  const blob = new Blob([lines.join('\n')], {type:'text/csv;charset=utf-8;'});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url; a.download = `vista-mis-report-${new Date().toISOString().slice(0,10)}.csv`;
-  document.body.appendChild(a); a.click(); document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-}
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`Supabase returned ${res.status}. ${body.slice(0, 240)}`);
+    }
 
-/* ---------- LINK HANDLING ---------- */
-// Treats any string starting with http(s):// as a link, wherever it appears —
-// used both in the expanded detail table and the per-property full-detail view.
-function isUrlValue(val){
-  return typeof val === 'string' && /^https?:\/\//i.test(val.trim());
-}
-function linkifyCell(val){
-  if(val === null || val === undefined || val === '') return '<span style="color:#bbb">—</span>';
-  if(isUrlValue(val)) return `<a href="${escapeHtml(val.trim())}" target="_blank" rel="noopener noreferrer" class="cell-link">Open ↗</a>`;
-  return escapeHtml(String(val));
-}
-// Looks across a raw Supabase row for the first useful document/reference link,
-// used as a quick "Docs" shortcut in the expanded table (full list of every link
-// still shows correctly on the per-property "View Full Details" page).
-const DOC_LINK_CANDIDATES = ["Agreement Link","Villa details Link","Google Link","Projection Link","Handover checklist link","New agreement link","Link for the agreement"];
-function primaryDocLink(row){
-  for(const c of DOC_LINK_CANDIDATES){
-    const v = getVal(row, [c]);
-    if(isUrlValue(v)) return v;
+    const batch = await res.json();
+    out.push(...batch);
+
+    const total = Number((res.headers.get('content-range') || '').split('/')[1]);
+    if (batch.length < PAGE_SIZE) break;
+    if (Number.isFinite(total) && out.length >= total) break;
+    from += PAGE_SIZE;
   }
-  // fall back to scanning every field for anything URL-shaped
-  for(const k of Object.keys(row)){
-    if(isUrlValue(row[k])) return row[k];
+
+  return out;
+}
+
+/* 5 ------------------------------------------------------- state + routing --- */
+
+const VIEWS = [
+  { id: 'overview',        label: 'Overview',           group: 'Summary' },
+  { id: 'kam',             label: 'KAM-wise Summary',   group: 'Summary' },
+  { id: 'squad',           label: 'Squad-wise Summary', group: 'Summary' },
+  { id: 'properties',      label: 'Properties',         group: 'Detail'  },
+  { id: 'live-properties', label: 'Live Properties',    group: 'Detail', external: true },
+];
+
+const SUBTABS = {
+  overview:        [{ id: 'snapshot', label: 'Snapshot' }, { id: 'detail', label: 'Status detail' }],
+  kam:             [{ id: 'counts', label: 'Counts' }, { id: 'ranking', label: 'Valid % ranking' }],
+  squad:           [{ id: 'counts', label: 'Counts' }, { id: 'ranking', label: 'Valid % ranking' }],
+  properties:      [
+    { id: 'all',        label: 'All' },
+    { id: 'notsigned',  label: 'Not signed' },
+    { id: 'expired',    label: 'Expired' },
+    { id: 'toexpire',   label: 'To expire' },
+    { id: 'valid',      label: 'Valid' },
+  ],
+  'live-properties': [{ id: 'all', label: 'All live' }],
+};
+
+const state = {
+  user: null,
+  rows: [],
+  cols: {},
+  loading: true,
+  error: null,
+  view: 'overview',
+  sub: 'snapshot',
+  filters: { squads: [], kams: [], statuses: [] },
+  search: '',
+  sort: {}, // per view: { key, dir }
+};
+
+const validView = (v) => VIEWS.some((x) => x.id === v) ? v : 'overview';
+
+function defaultSub(view) {
+  return (SUBTABS[view] || [{ id: 'all' }])[0].id;
+}
+
+function readUrl() {
+  const p = new URLSearchParams(location.search);
+  state.view = validView(p.get('view') || 'overview');
+  const subs = SUBTABS[state.view] || [];
+  const sub = p.get('tab');
+  state.sub = subs.some((s) => s.id === sub) ? sub : defaultSub(state.view);
+  const split = (v) => (v ? v.split('~').map(clean).filter(Boolean) : []);
+  state.filters.squads   = split(p.get('squad'));
+  state.filters.kams     = split(p.get('kam'));
+  state.filters.statuses = split(p.get('status'));
+  state.search = p.get('q') || '';
+}
+
+function urlFor(view, sub) {
+  const p = new URLSearchParams();
+  if (view && view !== 'overview') p.set('view', view);
+  const s = sub || (view === state.view ? state.sub : defaultSub(view));
+  if (s && s !== defaultSub(view)) p.set('tab', s);
+  if (state.filters.squads.length)   p.set('squad',  state.filters.squads.join('~'));
+  if (state.filters.kams.length)     p.set('kam',    state.filters.kams.join('~'));
+  if (state.filters.statuses.length) p.set('status', state.filters.statuses.join('~'));
+  if (state.search) p.set('q', state.search);
+  const qs = p.toString();
+  return qs ? `?${qs}` : location.pathname;
+}
+
+function syncUrl() {
+  history.replaceState(null, '', urlFor(state.view, state.sub));
+}
+
+function go(view, sub) {
+  state.view = validView(view);
+  state.sub = sub || defaultSub(state.view);
+  closeDrawer();
+  syncUrl();
+  render();
+  window.scrollTo({ top: 0, behavior: 'auto' });
+}
+
+/* 6 ------------------------------------------------- filtering & aggregation - */
+
+function matchesSearch(r, q) {
+  if (!q) return true;
+  const needle = q.toLowerCase();
+  return [r.__property, r.__kam, r.__squad, r.__status, r.__code]
+    .some((v) => String(v).toLowerCase().includes(needle));
+}
+
+/** Rows matching every filter except `skip` — used for cross-filtered counts. */
+function filterRows(skip = null) {
+  const { squads, kams, statuses } = state.filters;
+  return state.rows.filter((r) =>
+    (skip === 'squad'  || !squads.length   || squads.includes(r.__squad)) &&
+    (skip === 'kam'    || !kams.length     || kams.includes(r.__kam)) &&
+    (skip === 'status' || !statuses.length || statuses.includes(r.__status)) &&
+    (skip === 'search' || matchesSearch(r, state.search))
+  );
+}
+
+function activeRows() { return filterRows(null); }
+
+function hasAnyFilter() {
+  const f = state.filters;
+  return !!(f.squads.length || f.kams.length || f.statuses.length || state.search);
+}
+
+/** All statuses actually present, in MIS order, plus Unmapped only if it occurs. */
+function statusColumns(rows) {
+  const seen = new Set(rows.map((r) => r.__status));
+  const cols = STATUS_ORDER.slice();
+  if (seen.has(UNMAPPED)) cols.push(UNMAPPED);
+  return cols;
+}
+
+/** Build the MIS pivot: one row per key, one count per status, plus totals. */
+function buildPivot(rows, field, statuses) {
+  const map = new Map();
+  for (const r of rows) {
+    const key = r[field] || BLANK;
+    let e = map.get(key);
+    if (!e) {
+      e = { key, total: 0, counts: Object.fromEntries(statuses.map((s) => [s, 0])) };
+      map.set(key, e);
+    }
+    if (e.counts[r.__status] === undefined) e.counts[r.__status] = 0;
+    e.counts[r.__status] += 1;
+    e.total += 1;
   }
-  return null;
+
+  const list = [...map.values()].map((e) => ({
+    ...e,
+    validPct: e.total ? (e.counts['Valid'] || 0) * 100 / e.total : null,
+  }));
+  list.sort((a, b) => cmp(a.key, b.key));
+
+  const grand = { key: 'Grand Total', total: 0, counts: Object.fromEntries(statuses.map((s) => [s, 0])) };
+  for (const e of list) {
+    grand.total += e.total;
+    for (const s of statuses) grand.counts[s] += e.counts[s] || 0;
+  }
+  grand.validPct = grand.total ? (grand.counts['Valid'] || 0) * 100 / grand.total : null;
+
+  return { list, grand, statuses };
 }
 
-/* ---------- AGREEMENT SUMMARY (Completed / Pending / Expiring / Expired) ---------- */
-function agreementSummaryHtml(rows, clickable){
-  let completed=0, pending=0, expiringSoon=0, expired=0;
-  rows.forEach(row=>{
-    const f = fieldsFor(row);
-    const cat = contractCategoryFor(f);
-    const lvl = urgencyLevel(f.endDateRaw);
-    if(cat==='pending') pending++;
-    if(cat==='completed') completed++;
-    if(lvl==='red' || lvl==='orange') expiringSoon++;
-    if(lvl==='expired') expired++;
-  });
-  const cards = [
-    {label:'Agreement Completed', value:completed, tone:'good', nav: tabIdFor('CONTRACT','completed')},
-    {label:'Pending / Not Signed', value:pending, tone:'watch', nav: tabIdFor('CONTRACT','pending')},
-    {label:'Expiring Soon (≤30d)', value:expiringSoon, tone:'warn', nav: tabIdFor('URGENT','soon')},
-    {label:'Expired', value:expired, tone:'bad', nav: tabIdFor('URGENT','expired')},
+function uniqueValues(field, skip) {
+  const rows = filterRows(skip);
+  const counts = new Map();
+  for (const r of rows) counts.set(r[field], (counts.get(r[field]) || 0) + 1);
+  // every option stays listed even at zero, so a selection is never invisible
+  for (const r of state.rows) if (!counts.has(r[field])) counts.set(r[field], 0);
+  return [...counts.entries()]
+    .map(([value, count]) => ({ value, count }))
+    .sort((a, b) => cmp(a.value, b.value));
+}
+
+/* 7 ----------------------------------------------------------- UI primitives - */
+
+/** Excel-style 3-colour scale (red → yellow → green) for the Valid % column. */
+function makeScale(values) {
+  const nums = values.filter((v) => typeof v === 'number' && !Number.isNaN(v)).sort((a, b) => a - b);
+  if (!nums.length) return () => '';
+  const min = nums[0];
+  const max = nums[nums.length - 1];
+  const mid = nums[Math.floor(nums.length / 2)];
+  const stops = [
+    { at: min, rgb: [248, 105, 107] },
+    { at: mid, rgb: [255, 235, 132] },
+    { at: max, rgb: [ 99, 190, 123] },
   ];
-  const toneColor = {good:'#3f7d5c', watch:'#8a6a1f', warn:'#c07a1f', bad:'#a13f30'};
-  return `
-    <div class="section-card">
-      <div class="section-title">Agreement Summary</div>
-      <div class="section-desc">${clickable ? 'Click a card to see the full list.' : 'For this view specifically.'}</div>
-      <div class="kpi-row">
-        ${cards.map(c=>`
-          <div class="kpi-card" style="${clickable?'':'cursor:default;'}border-color:${toneColor[c.tone]}22;" ${clickable ? `onclick="openTab('${c.nav}')"` : ''}>
-            <div class="kpi-number" style="color:${toneColor[c.tone]}">${c.value}</div>
-            <div class="kpi-label">${escapeHtml(c.label)}</div>
-          </div>`).join('')}
-      </div>
-    </div>`;
+  return (v) => {
+    if (typeof v !== 'number' || Number.isNaN(v)) return '';
+    if (max === min) return 'rgb(99,190,123)';
+    const i = v <= mid ? 0 : 1;
+    const a = stops[i];
+    const b = stops[i + 1];
+    const span = b.at - a.at;
+    const t = span === 0 ? 1 : Math.min(1, Math.max(0, (v - a.at) / span));
+    const c = a.rgb.map((ch, k) => Math.round(ch + (b.rgb[k] - ch) * t));
+    return `rgb(${c.join(',')})`;
+  };
 }
 
-/* ---------- EXPANDED DETAIL PAGE (used for Status / Squad / POC / Urgency clicks) ---------- */
-const DETAIL_PAGE_SIZE = 50;
-function mainDashboardCardsHtml(totalCount, liveCount){
-  return `
-    <div class="kpi-row" style="grid-template-columns:repeat(auto-fit,minmax(220px,1fr));">
-      <div class="kpi-card kpi-total" style="cursor:default;">
-        <div class="kpi-number">${totalCount}</div><div class="kpi-label">Total Properties</div>
-      </div>
-      <div class="kpi-card" style="background:linear-gradient(135deg, ${hexMix('#3f7d5c',0.82)}, ${hexMix('#3f7d5c',0.55)});border-color:#3f7d5c;" onclick="openLivePropertiesNewTab()" title="Opens in a new tab">
-        <div class="kpi-number" style="color:#1f5c37">${liveCount}</div><div class="kpi-label" style="color:#1f5c37">Live Properties ↗</div>
-      </div>
-    </div>`;
-}
-function openLivePropertiesNewTab(){
-  window.open(`${window.location.pathname}?view=live`, '_blank');
-}
+/**
+ * Multi-select dropdown: search, select-all/clear, live counts, and a trigger
+ * that always shows what's currently chosen.
+ */
+function multiSelect({ key, label, options, selected, onChange }) {
+  const wrap = el('div', { class: 'ms' });
+  const panelId = `ms-${key}-panel`;
 
-/* ---------- LIVE PROPERTIES: Agreement Summary (Expired / Founder-Partner Approved / Not Signed) ---------- */
-function liveAgreementSummaryHtml(rows, clickable){
-  let expired=0, founder=0, notSigned=0;
-  rows.forEach(row=>{
-    const f = fieldsFor(row);
-    if(urgencyLevel(f.endDateRaw)==='expired') expired++;
-    if(isFounderPartnerApproved(row)) founder++;
-    if(contractCategoryFor(f)==='pending') notSigned++;
+  const valueSpan = el('span', { class: 'ms-value' });
+  const badge = el('span', { class: 'ms-badge' });
+  const trigger = el('button', {
+    type: 'button',
+    class: 'ms-trigger',
+    'aria-haspopup': 'listbox',
+    'aria-expanded': 'false',
+    'aria-controls': panelId,
+  }, [
+    el('span', { class: 'ms-key', text: label }),
+    valueSpan,
+    badge,
+    el('span', { class: 'ms-caret', text: '▾' }),
+  ]);
+
+  function paintTrigger() {
+    const n = selected.length;
+    wrap.classList.toggle('has-selection', n > 0);
+    badge.style.display = n ? '' : 'none';
+    badge.textContent = String(n);
+    if (n === 0)      valueSpan.textContent = 'All';
+    else if (n === 1) valueSpan.textContent = selected[0];
+    else if (n === 2) valueSpan.textContent = selected.join(', ');
+    else              valueSpan.textContent = `${selected[0]} +${n - 1} more`;
+    trigger.title = n ? `${label}: ${selected.join(', ')}` : `${label}: all`;
+  }
+
+  const search = el('input', { class: 'ms-search', type: 'search', placeholder: `Search ${label.toLowerCase()}…`, 'aria-label': `Search ${label}` });
+  const countLabel = el('span', { class: 'ms-count' });
+  const list = el('div', { class: 'ms-list', role: 'listbox', 'aria-multiselectable': 'true' });
+
+  const selectAll = el('button', { type: 'button', text: 'Select all' });
+  const clearAll  = el('button', { type: 'button', text: 'Clear' });
+
+  const panel = el('div', { class: 'ms-panel', id: panelId, hidden: true }, [
+    search,
+    el('div', { class: 'ms-actions' }, [selectAll, clearAll, countLabel]),
+    list,
+  ]);
+
+  function paintList() {
+    const q = search.value.trim().toLowerCase();
+    const shown = options.filter((o) => !q || o.value.toLowerCase().includes(q));
+    list.replaceChildren();
+
+    if (!shown.length) {
+      list.append(el('div', { class: 'ms-empty', text: 'No matches' }));
+    } else {
+      for (const o of shown) {
+        const box = el('input', { type: 'checkbox', checked: selected.includes(o.value) });
+        box.addEventListener('change', () => {
+          if (box.checked) { if (!selected.includes(o.value)) selected.push(o.value); }
+          else selected.splice(selected.indexOf(o.value), 1);
+          paintTrigger();
+          countLabel.textContent = `${selected.length} selected`;
+          onChange(selected.slice());
+        });
+        list.append(el('label', { class: 'ms-opt', role: 'option', 'aria-selected': selected.includes(o.value) }, [
+          box,
+          el('span', { class: 'opt-label', text: o.value, title: o.value }),
+          el('span', { class: 'opt-count', text: fmtInt(o.count) }),
+        ]));
+      }
+    }
+    countLabel.textContent = `${selected.length} selected`;
+  }
+
+  selectAll.addEventListener('click', () => {
+    const q = search.value.trim().toLowerCase();
+    const pool = options.filter((o) => !q || o.value.toLowerCase().includes(q)).map((o) => o.value);
+    selected = [...new Set([...selected, ...pool])];
+    paintTrigger(); paintList(); onChange(selected.slice());
   });
-  const cards = [
-    {label:'Expired', value:expired, color:'#a13f30', nav: tabIdFor('LIVEAGREEMENT','expired')},
-    {label:'Founder Approved / Partner Approved', value:founder, color:'#8a6a1f', nav: tabIdFor('LIVEAGREEMENT','founder')},
-    {label:'Not Signed', value:notSigned, color:'#c07a1f', nav: tabIdFor('LIVEAGREEMENT','notsigned')},
-  ];
-  return `
-    <div class="section-card">
-      <div class="section-title">Agreement Summary</div>
-      <div class="section-desc">${clickable ? 'Click a card to see the full list.' : ''} Fetched live from Supabase — counts reflect Live properties only.</div>
-      <div class="kpi-row" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr));">
-        ${cards.map(c=>`
-          <div class="kpi-card" style="${clickable?'':'cursor:default;'}border-color:${c.color}22;" ${clickable ? `onclick="openTab('${c.nav}')"` : ''}>
-            <div class="kpi-number" style="color:${c.color}">${c.value}</div>
-            <div class="kpi-label">${escapeHtml(c.label)}</div>
-          </div>`).join('')}
-      </div>
-    </div>`;
+
+  clearAll.addEventListener('click', () => {
+    selected = [];
+    paintTrigger(); paintList(); onChange(selected.slice());
+  });
+
+  search.addEventListener('input', paintList);
+  search.addEventListener('keydown', (e) => { if (e.key === 'Escape') { e.stopPropagation(); close(); } });
+
+  function open() {
+    document.querySelectorAll('.ms.open').forEach((m) => m !== wrap && m._close?.());
+    wrap.classList.add('open');
+    panel.hidden = false;
+    trigger.setAttribute('aria-expanded', 'true');
+    // keep the panel on-screen on narrow viewports
+    const room = window.innerWidth - wrap.getBoundingClientRect().left;
+    panel.classList.toggle('flip-right', room < 280 && window.innerWidth > 760);
+    paintList();
+    search.focus();
+  }
+  function close() {
+    wrap.classList.remove('open');
+    panel.hidden = true;
+    trigger.setAttribute('aria-expanded', 'false');
+    search.value = '';
+  }
+  wrap._close = close;
+
+  trigger.addEventListener('click', () => (panel.hidden ? open() : close()));
+  wrap.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !panel.hidden) { close(); trigger.focus(); } });
+
+  /* Refresh options/selection without rebuilding the node, so the panel can
+     stay open while several values are ticked. */
+  wrap._sync = (nextOptions, nextSelected) => {
+    options = nextOptions;
+    selected = nextSelected.slice();
+    paintTrigger();
+    if (!panel.hidden) paintList();
+  };
+
+  paintTrigger();
+  wrap.append(trigger, panel);
+  return wrap;
 }
 
-/* ---------- MULTI-SELECT SQUAD / KAM FILTER DROPDOWNS ---------- */
-function multiselectFilterHtml(kind){
-  const state = getTabState(activeTabId);
-  const list = kind==='squad' ? squadList : pocList;
-  const selected = kind==='squad' ? state.selectedSquads : state.selectedPocs;
-  const label = kind==='squad' ? 'Squad' : 'KAM';
-  const isOpen = state.openFilterPanel === kind;
-  return `
-    <div class="filter-dropdown">
-      <button class="filter-dropdown-btn" onclick="toggleFilterPanel('${kind}')">${label}${selected.size ? ` (${selected.size})` : ''} ▾</button>
-      <div class="filter-dropdown-panel ${isOpen ? '' : 'hidden'}">
-        <div class="filter-dropdown-actions">
-          <span onclick="selectAllFilter('${kind}')">Select all</span>
-          <span onclick="clearFilter('${kind}')">Clear</span>
-        </div>
-        ${list.map(item=>`
-          <label><input type="checkbox" ${selected.has(item.name)?'checked':''} onchange="toggleFilterValue('${kind}', ${JSON.stringify(item.name)})"> ${escapeHtml(item.name)} <span class="filter-count">${item.count}</span></label>
-        `).join('')}
-      </div>
-    </div>`;
-}
-function toggleFilterPanel(kind){
-  const state = getTabState(activeTabId);
-  state.openFilterPanel = state.openFilterPanel === kind ? null : kind;
-  renderActiveTab();
-}
-function toggleFilterValue(kind, name){
-  const state = getTabState(activeTabId);
-  const set = kind==='squad' ? state.selectedSquads : state.selectedPocs;
-  if(set.has(name)) set.delete(name); else set.add(name);
-  state.detailPage = 1;
-  renderActiveTab();
-}
-function selectAllFilter(kind){
-  const state = getTabState(activeTabId);
-  const list = kind==='squad' ? squadList : pocList;
-  const set = kind==='squad' ? state.selectedSquads : state.selectedPocs;
-  list.forEach(item=>set.add(item.name));
-  state.detailPage = 1;
-  renderActiveTab();
-}
-function clearFilter(kind){
-  const state = getTabState(activeTabId);
-  const set = kind==='squad' ? state.selectedSquads : state.selectedPocs;
-  set.clear();
-  state.detailPage = 1;
-  renderActiveTab();
-}
-// close any open filter dropdown when clicking elsewhere on the page
-document.addEventListener('click', (e)=>{
-  if(e.target.closest('.filter-dropdown')) return;
-  const state = getTabState(activeTabId);
-  if(state.openFilterPanel){ state.openFilterPanel = null; renderActiveTab(); }
+document.addEventListener('click', (e) => {
+  document.querySelectorAll('.ms.open').forEach((m) => { if (!m.contains(e.target)) m._close?.(); });
 });
 
-/* ---------- SHARED PROPERTIES TABLE (used by All Properties, Live Properties, and every drill-down page) ---------- */
-function detailPageShellHtml(showFilters, searchInHeader){
-  return `
-    <div class="section-card">
-      <div class="section-title" id="detail-count-title">Properties</div>
-      <div class="section-desc">Click any row to view its full record. Links open in a new tab.</div>
-      ${searchInHeader ? '' : `<div class="search-row"><input id="search-box" placeholder="Search by property, squad, POC, or city…" /></div>`}
-      ${showFilters ? `<div class="filter-row">${multiselectFilterHtml('squad')}${multiselectFilterHtml('poc')}</div>` : ''}
-      <div id="detail-result-area"></div>
-    </div>`;
-}
-function renderDetailResultArea(rows){
-  const state = getTabState(activeTabId);
-  const filtered = rows.filter(row=>{
-    const f = fieldsFor(row);
-    if(state.search){
-      const matchesSearch = f.name.toLowerCase().includes(state.search) || f.owner.toLowerCase().includes(state.search) || f.squad.toLowerCase().includes(state.search) || f.city.toLowerCase().includes(state.search);
-      if(!matchesSearch) return false;
-    }
-    if(state.selectedSquads && state.selectedSquads.size > 0 && !state.selectedSquads.has(f.squad)) return false;
-    if(state.selectedPocs && state.selectedPocs.size > 0 && !state.selectedPocs.has(f.owner)) return false;
-    return true;
+/** Sortable, frozen-first-column pivot table shared by the KAM and Squad tabs. */
+function pivotTable(pivot, labelHeader) {
+  const sort = state.sort[state.view] || { key: '__label', dir: 'asc' };
+  const cols = [
+    { key: '__label', label: labelHeader, freeze: true },
+    ...pivot.statuses.map((s) => ({ key: s, label: s })),
+    { key: '__total', label: 'Grand Total' },
+    { key: '__pct',   label: 'Agreement Valid %' },
+  ];
+
+  const rows = pivot.list.slice().sort((a, b) => {
+    const dir = sort.dir === 'desc' ? -1 : 1;
+    if (sort.key === '__label') return dir * cmp(a.key, b.key);
+    const av = sort.key === '__total' ? a.total : sort.key === '__pct' ? (a.validPct ?? -1) : (a.counts[sort.key] || 0);
+    const bv = sort.key === '__total' ? b.total : sort.key === '__pct' ? (b.validPct ?? -1) : (b.counts[sort.key] || 0);
+    return av === bv ? cmp(a.key, b.key) : dir * (av - bv);
   });
-  window.__detailFilteredRows = filtered;
 
-  const titleEl = document.getElementById('detail-count-title');
-  if(titleEl) titleEl.textContent = `Properties (${filtered.length})`;
+  const scale = makeScale(rows.map((r) => r.validPct));
 
-  const page = state.detailPage || 1;
-  const totalPages = Math.max(1, Math.ceil(filtered.length / DETAIL_PAGE_SIZE));
-  const clampedPage = Math.min(page, totalPages);
-  const pageRows = filtered.slice((clampedPage-1)*DETAIL_PAGE_SIZE, clampedPage*DETAIL_PAGE_SIZE);
-
-  const tableRows = pageRows.map((row, i)=>{
-    const f = fieldsFor(row);
-    const st = styleFor(statusKey(f.status));
-    const lvl = urgencyLevel(f.endDateRaw);
-    const d = daysRemaining(f.endDateRaw);
-    const doc = primaryDocLink(row);
-    const globalIdx = (clampedPage-1)*DETAIL_PAGE_SIZE + i;
-    return `
-      <tr onclick="openDetailRowByIndex(${globalIdx})">
-        <td>${escapeHtml(f.name)}</td>
-        <td>${escapeHtml(f.squad)}</td>
-        <td>${escapeHtml(f.owner)}</td>
-        <td><span class="pill" style="background:${st.bg};color:${st.fg}">${escapeHtml(f.status)}</span></td>
-        <td>${escapeHtml(f.kickoff)}</td>
-        <td>${escapeHtml(f.contractStatus)}</td>
-        <td>${f.endDateRaw ? escapeHtml(f.endDateRaw) + (lvl==='expired' ? ' (expired)' : lvl ? ` (${d}d)` : '') : '—'}</td>
-        <td>${escapeHtml(f.city)}</td>
-        <td onclick="event.stopPropagation()">${doc ? `<a href="${escapeHtml(doc)}" target="_blank" rel="noopener noreferrer" class="cell-link">Docs ↗</a>` : '—'}</td>
-        <td onclick="event.stopPropagation()"><button class="view-details-btn" onclick="openDetailRowByIndexNewTab(${globalIdx})">View Full Details ↗</button></td>
-      </tr>`;
-  }).join('');
-
-  const area = document.getElementById('detail-result-area');
-  if(!area) return;
-  area.innerHTML = `
-    <div class="detail-table-wrap">
-      <table class="detail-table">
-        <thead>
-          <tr>
-            <th>Property</th><th>Squad</th><th>POC</th><th>Status</th><th>Live Date</th>
-            <th>Contract Status</th><th>Agreement End</th><th>City</th><th>Docs</th><th></th>
-          </tr>
-        </thead>
-        <tbody>${tableRows || `<tr><td colspan="10" style="text-align:center;color:#999;padding:30px;">No properties match this search/filter.</td></tr>`}</tbody>
-      </table>
-    </div>
-    ${filtered.length > DETAIL_PAGE_SIZE ? `
-      <div class="pagination">
-        <button ${clampedPage<=1?'disabled':''} onclick="goDetailPage(${clampedPage-1})">← Prev</button>
-        <span>Page ${clampedPage} of ${totalPages}</span>
-        <button ${clampedPage>=totalPages?'disabled':''} onclick="goDetailPage(${clampedPage+1})">Next →</button>
-      </div>` : ''}
-  `;
-}
-function goDetailPage(n){ getTabState(activeTabId).detailPage = n; renderDetailResultArea(rowsForTab(activeTabId)); }
-function openDetailRowByIndex(idx){
-  const filtered = window.__detailFilteredRows || [];
-  activeRow = filtered[idx];
-  renderActiveTab();
-}
-function openDetailRowByIndexNewTab(idx){
-  const filtered = window.__detailFilteredRows || [];
-  const row = filtered[idx];
-  if(row) openPropertyInNewTab(row);
-}
-
-/* ---------- MAIN RENDER ---------- */
-function renderActiveTab(){
-  if(activeRow){ renderRowDetail(); return; }
-
-  const p = parseTab(activeTabId);
-  const rows = rowsForTab(activeTabId);
-  const state = getTabState(activeTabId);
-  const root = document.getElementById('view-root');
-
-  // "All Properties" and "Live Properties" share the simplified header-with-search
-  // layout and the Squad/KAM multi-select filters; every other drill-down page keeps
-  // the previous title+description+Export header with its own search row.
-  const isMainOrLive = p.type === 'ALL' || (p.type === 'STATUS' && p.name === 'live');
-
-  const headerHtml = isMainOrLive ? `
-    <div class="view-header">
-      <div><h2>${escapeHtml(tabDisplayName(p))}</h2></div>
-      <div class="search-row" style="margin:0;max-width:360px;flex:1;min-width:220px;">
-        <input id="search-box" placeholder="Search properties, squad, or POC…" />
-      </div>
-    </div>` : `
-    <div class="view-header">
-      <div><h2>${escapeHtml(tabDisplayName(p))}</h2><p class="desc">${p.type==='SQUAD' ? 'Squad-level view' : p.type==='POC' ? 'POC-level view' : 'Filtered view'} · live from Supabase</p></div>
-      <button class="btn" onclick="downloadReportCsv()">↓ Export</button>
-    </div>`;
-
-  let cardsHtml;
-  if(p.type === 'ALL'){
-    const liveCount = allRows.filter(r=>statusKey(fieldsFor(r).status)==='live').length;
-    cardsHtml = mainDashboardCardsHtml(allRows.length, liveCount);
-  } else if(p.type === 'STATUS' && p.name === 'live'){
-    cardsHtml = liveAgreementSummaryHtml(rows, true);
-  } else {
-    // every other drill-down page keeps the original per-status count row + agreement summary
-    const counts = {};
-    rows.forEach(r=>{ const k = statusKey(fieldsFor(r).status); counts[k]=(counts[k]||0)+1; });
-    const statusRow = `
-      <div class="kpi-row">
-        <div class="kpi-card kpi-total" style="cursor:default;"><div class="kpi-number">${rows.length}</div><div class="kpi-label">Total</div></div>
-        ${KPI_ORDER.map(k=>{
-          const sem = semanticStyleFor(k);
-          return `<div class="kpi-card" style="cursor:default;background:linear-gradient(135deg, ${hexMix(sem.dot,0.82)}, ${hexMix(sem.dot,0.55)});border-color:${sem.dot};">
-            <div class="kpi-number" style="color:${sem.fg}">${counts[k]||0}</div><div class="kpi-label" style="color:${sem.fg}">${escapeHtml(KPI_LABELS[k])}</div>
-          </div>`;
-        }).join('')}
-      </div>`;
-    cardsHtml = statusRow + agreementSummaryHtml(rows, false);
-  }
-
-  const healthHtml = `<div class="health-strip"><span class="health-dot"></span> Auto-synced from Supabase${lastSyncedAt ? ` · last synced ${lastSyncedAt.toLocaleTimeString()}` : ''}.</div>`;
-  const bottomExtra = p.type === 'ALL' ? topSquadStripsHtml() : '';
-
-  root.innerHTML = `
-    ${headerHtml}
-    ${healthHtml}
-    ${cardsHtml}
-    ${detailPageShellHtml(isMainOrLive, isMainOrLive)}
-    ${bottomExtra}
-  `;
-
-  const searchBox = document.getElementById('search-box');
-  if(searchBox){
-    searchBox.value = state.search;
-    searchBox.addEventListener('input', (e)=>{
-      state.search = e.target.value.toLowerCase();
-      state.detailPage = 1;
-      renderDetailResultArea(rows);
+  const headCells = cols.map((c) => {
+    const active = sort.key === c.key;
+    const th = el('th', {
+      scope: 'col',
+      class: `sortable${c.freeze ? ' freeze' : ''}`,
+      'aria-sort': active ? (sort.dir === 'asc' ? 'ascending' : 'descending') : 'none',
+      title: `Sort by ${c.label}`,
+    }, [c.label, el('span', { class: 'sort-arrow', text: active ? (sort.dir === 'asc' ? '▲' : '▼') : '⇅' })]);
+    th.addEventListener('click', () => {
+      const same = sort.key === c.key;
+      // names read best A→Z first; numbers read best biggest-first
+      const firstDir = c.key === '__label' ? 'asc' : 'desc';
+      state.sort[state.view] = { key: c.key, dir: same ? (sort.dir === 'asc' ? 'desc' : 'asc') : firstDir };
+      renderView();
     });
+    return th;
+  });
+
+  const body = rows.map((r) => el('tr', {}, [
+    el('td', { class: 'freeze', 'data-label': labelHeader, text: r.key }),
+    ...pivot.statuses.map((s) => {
+      const v = r.counts[s] || 0;
+      return el('td', { class: v ? '' : 'zero', 'data-label': s, text: v ? fmtInt(v) : '–' });
+    }),
+    el('td', { 'data-label': 'Grand Total', text: fmtInt(r.total) }),
+    (() => {
+      const td = el('td', { class: 'pct-cell', 'data-label': 'Agreement Valid %', text: fmtPct(r.validPct) });
+      td.style.background = scale(r.validPct);
+      return td;
+    })(),
+  ]));
+
+  const foot = el('tr', {}, [
+    el('td', { class: 'freeze', text: 'Grand Total' }),
+    ...pivot.statuses.map((s) => el('td', { text: pivot.grand.counts[s] ? fmtInt(pivot.grand.counts[s]) : '–' })),
+    el('td', { text: fmtInt(pivot.grand.total) }),
+    el('td', { class: 'pct-cell', text: fmtPct(pivot.grand.validPct) }),
+  ]);
+
+  const table = el('table', { class: 'grid' }, [
+    el('thead', {}, [el('tr', {}, headCells)]),
+    el('tbody', {}, body.length ? body : [el('tr', {}, [el('td', { colspan: cols.length, class: 'freeze', text: 'No rows match the current filters.' })])]),
+    el('tfoot', {}, [foot]),
+  ]);
+
+  return el('div', { class: 'table-wrap' }, [table]);
+}
+
+function statusPill(status) {
+  const c = STATUS_COLOR[status] || '#d6cec2';
+  const dark = ['Valid', 'Expired'].includes(status);
+  return el('span', {
+    class: 'pill',
+    text: status,
+    style: `background:${c}; color:${dark ? '#fff' : '#1e1e1e'}`,
+  });
+}
+
+/** Row-level property table. Restacks into cards under 540px via data-label. */
+function propertyTable(rows) {
+  const head = ['Property', 'Squad', 'KAM', 'Agreement status', 'Link'];
+  const capped = rows.slice(0, 500);
+
+  const body = capped.map((r) => el('tr', {}, [
+    el('td', { class: 'freeze', 'data-label': 'Property' }, [
+      r.__url
+        ? el('a', { class: 'link-out', href: r.__url, target: '_blank', rel: 'noopener noreferrer' }, [r.__property, el('span', { class: 'ext', text: '↗' })])
+        : r.__property,
+    ]),
+    el('td', { 'data-label': 'Squad', style: 'text-align:left', text: r.__squad }),
+    el('td', { 'data-label': 'KAM', style: 'text-align:left', text: r.__kam }),
+    el('td', { 'data-label': 'Agreement status', style: 'text-align:left' }, [statusPill(r.__status)]),
+    el('td', { 'data-label': 'Link', style: 'text-align:left' }, [
+      r.__url
+        ? el('a', { class: 'link-out', href: r.__url, target: '_blank', rel: 'noopener noreferrer' }, ['Open', el('span', { class: 'ext', text: '↗' })])
+        : el('span', { class: 'zero', text: '–' }),
+    ]),
+  ]));
+
+  const table = el('table', { class: 'grid stacked' }, [
+    el('thead', {}, [el('tr', {}, head.map((h, i) => el('th', { scope: 'col', class: i === 0 ? 'freeze' : '', style: i ? 'text-align:left' : '', text: h })))]),
+    el('tbody', {}, body.length ? body : [el('tr', {}, [el('td', { colspan: head.length, class: 'freeze', text: 'No properties match the current filters.' })])]),
+  ]);
+
+  const wrap = el('div', { class: 'table-wrap stacked-wrap' }, [table]);
+  if (rows.length > capped.length) {
+    return el('div', {}, [wrap, el('div', { class: 'scroll-hint', style: 'display:block', text: `Showing the first ${fmtInt(capped.length)} of ${fmtInt(rows.length)} properties — narrow the filters to see the rest.` })]);
   }
-  renderDetailResultArea(rows);
+  return wrap;
 }
 
-function renderRowDetail(){
-  const root = document.getElementById('view-root');
-  const f = fieldsFor(activeRow);
-  const rowsHtml = Object.entries(activeRow).map(([key,val])=>`
-    <div class="detail-row"><div class="label">${escapeHtml(key)}</div><div class="val">${linkifyCell(val)}</div></div>
-  `).join('');
-  root.innerHTML = `
-    <div class="detail-toolbar">
-      <button class="back-link" onclick="goBackHome()">← Back to All Properties</button>
-      <button class="btn" onclick="openPropertyInNewTabCurrent()">Open in new tab ↗</button>
-    </div>
-    <div class="view-header"><div><h2>${escapeHtml(f.name)}</h2><p class="desc">Full record from Supabase</p></div></div>
-    <div class="detail-list">${rowsHtml}</div>
-  `;
-}
-function openPropertyInNewTabCurrent(){ if(activeRow) openPropertyInNewTab(activeRow); }
+/* 8 -------------------------------------------------------------------- views */
 
-function escapeHtml(str){
-  return String(str).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+function kpiCard(label, value, sub, accent) {
+  return el('div', { class: `kpi${accent ? ` accent-${accent}` : ''}` }, [
+    el('div', { class: 'k-label', text: label }),
+    el('div', { class: 'k-value', text: value }),
+    sub ? el('div', { class: 'k-sub', text: sub }) : null,
+  ]);
 }
 
-// Expose functions used via inline onclick/onchange attributes to the global scope,
-// since Vite builds this as an ES module (scoped by default, not global like a plain <script> tag).
+function pageHead(title, desc) {
+  return el('div', { class: 'page-head' }, [
+    el('h2', { text: title }),
+    desc ? el('p', { text: desc }) : null,
+  ]);
+}
+
+function viewOverview(rows) {
+  const statuses = statusColumns(rows);
+  const counts = Object.fromEntries(statuses.map((s) => [s, 0]));
+  for (const r of rows) counts[r.__status] = (counts[r.__status] || 0) + 1;
+  const total = rows.length;
+  const valid = counts['Valid'] || 0;
+  const needsAction = (counts['Not Signed'] || 0) + (counts['Expired'] || 0) + (counts['To Expire'] || 0);
+
+  const frag = el('div', {}, [
+    pageHead('Agreement summary', 'The same seven buckets as the Acq Master MIS, recalculated live from Supabase. Every filter above applies to all tabs.'),
+  ]);
+
+  if (state.sub === 'snapshot') {
+    frag.append(
+      el('div', { class: 'kpi-grid' }, [
+        kpiCard('Grand total', fmtInt(total), 'properties in scope', 'sky'),
+        kpiCard('Valid', fmtInt(valid), fmtPct(total ? valid * 100 / total : null) + ' of total', 'good'),
+        kpiCard('Needs action', fmtInt(needsAction), 'not signed, expired or expiring', 'bad'),
+        kpiCard('Squads', fmtInt(new Set(rows.map((r) => r.__squad)).size), 'in scope'),
+        kpiCard('KAMs', fmtInt(new Set(rows.map((r) => r.__kam)).size), 'in scope'),
+      ]),
+    );
+
+    const bar = el('div', { class: 'dist-bar' });
+    const legend = el('div', { class: 'dist-legend' });
+    for (const s of statuses) {
+      const n = counts[s] || 0;
+      if (!n) continue;
+      const pct = n * 100 / total;
+      bar.append(el('div', { class: 'dist-seg', style: `width:${pct}%; background:${STATUS_COLOR[s]}`, title: `${s}: ${fmtInt(n)}` }));
+      legend.append(el('div', { class: 'item' }, [
+        el('span', { class: 'swatch', style: `background:${STATUS_COLOR[s]}` }),
+        el('span', { text: s }),
+        el('span', { class: 'n', text: fmtInt(n) }),
+        el('span', { class: 'pct', text: `(${fmtPct(pct)})` }),
+      ]));
+    }
+
+    frag.append(el('div', { class: 'panel' }, [
+      el('div', { class: 'panel-head' }, [
+        el('h3', { text: 'Agreement status split' }),
+        el('span', { class: 'hint right', text: `${fmtInt(total)} properties` }),
+      ]),
+      el('div', { class: 'panel-body' }, [bar, legend]),
+    ]));
+  } else {
+    const table = el('table', { class: 'grid stacked' }, [
+      el('thead', {}, [el('tr', {}, [
+        el('th', { scope: 'col', class: 'freeze', text: 'Agreement status' }),
+        el('th', { scope: 'col', text: 'Properties' }),
+        el('th', { scope: 'col', text: 'Share of total' }),
+      ])]),
+      el('tbody', {}, statuses.map((s) => el('tr', {}, [
+        el('td', { class: 'freeze', 'data-label': 'Status' }, [statusPill(s)]),
+        el('td', { 'data-label': 'Properties', text: fmtInt(counts[s] || 0) }),
+        el('td', { 'data-label': 'Share', text: fmtPct(total ? (counts[s] || 0) * 100 / total : null) }),
+      ]))),
+      el('tfoot', {}, [el('tr', {}, [
+        el('td', { class: 'freeze', text: 'Grand Total' }),
+        el('td', { text: fmtInt(total) }),
+        el('td', { text: '100%' }),
+      ])]),
+    ]);
+
+    frag.append(el('div', { class: 'panel' }, [
+      el('div', { class: 'panel-head' }, [el('h3', { text: 'Status detail' })]),
+      el('div', { class: 'table-wrap stacked-wrap' }, [table]),
+    ]));
+  }
+
+  return frag;
+}
+
+function viewPivot(rows, field, labelHeader, title, desc) {
+  const statuses = statusColumns(rows);
+  const pivot = buildPivot(rows, field, statuses);
+  const frag = el('div', {}, [pageHead(title, desc)]);
+
+  if (state.sub === 'ranking') {
+    const ranked = pivot.list.slice().sort((a, b) => (b.validPct ?? -1) - (a.validPct ?? -1) || cmp(a.key, b.key));
+    const scale = makeScale(ranked.map((r) => r.validPct));
+    const body = ranked.map((r, i) => el('tr', {}, [
+      el('td', { class: 'freeze', 'data-label': labelHeader, text: `${i + 1}. ${r.key}` }),
+      el('td', { 'data-label': 'Valid', text: fmtInt(r.counts['Valid'] || 0) }),
+      el('td', { 'data-label': 'Grand Total', text: fmtInt(r.total) }),
+      (() => {
+        const td = el('td', { class: 'pct-cell', 'data-label': 'Agreement Valid %', text: fmtPct(r.validPct) });
+        td.style.background = scale(r.validPct);
+        return td;
+      })(),
+    ]));
+
+    frag.append(el('div', { class: 'panel' }, [
+      el('div', { class: 'panel-head' }, [
+        el('h3', { text: 'Ranked by agreement validity' }),
+        el('span', { class: 'hint right', text: 'Highest valid share first' }),
+      ]),
+      el('div', { class: 'table-wrap stacked-wrap' }, [
+        el('table', { class: 'grid stacked' }, [
+          el('thead', {}, [el('tr', {}, [
+            el('th', { scope: 'col', class: 'freeze', text: labelHeader }),
+            el('th', { scope: 'col', text: 'Valid' }),
+            el('th', { scope: 'col', text: 'Grand Total' }),
+            el('th', { scope: 'col', text: 'Agreement Valid %' }),
+          ])]),
+          el('tbody', {}, body.length ? body : [el('tr', {}, [el('td', { colspan: 4, class: 'freeze', text: 'No rows match the current filters.' })])]),
+        ]),
+      ]),
+    ]));
+    return frag;
+  }
+
+  frag.append(el('div', { class: 'panel' }, [
+    el('div', { class: 'panel-head' }, [
+      el('h3', { text: `${labelHeader} × agreement status` }),
+      el('span', { class: 'hint', text: 'Tap a column heading to sort' }),
+      el('span', { class: 'hint right', text: `${fmtInt(pivot.list.length)} rows · ${fmtInt(pivot.grand.total)} properties` }),
+    ]),
+    pivotTable(pivot, labelHeader),
+    el('div', { class: 'scroll-hint', text: 'Swipe the table sideways to see every status column.' }),
+  ]));
+
+  return frag;
+}
+
+function viewProperties(rows) {
+  const bySub = {
+    notsigned: 'Not Signed',
+    expired:   'Expired',
+    toexpire:  'To Expire',
+    valid:     'Valid',
+  }[state.sub];
+
+  const shown = bySub ? rows.filter((r) => r.__status === bySub) : rows;
+
+  return el('div', {}, [
+    pageHead('Properties', 'Every row behind the summaries. Property links open in a new browser tab.'),
+    el('div', { class: 'panel' }, [
+      el('div', { class: 'panel-head' }, [
+        el('h3', { text: bySub ? `${bySub} agreements` : 'All properties' }),
+        el('span', { class: 'hint right', text: `${fmtInt(shown.length)} properties` }),
+      ]),
+      propertyTable(shown),
+    ]),
+  ]);
+}
+
+function viewLiveProperties(rows) {
+  const hasLiveCol = !!state.cols.live;
+  const shown = hasLiveCol ? rows.filter((r) => r.__live) : rows;
+
+  const statuses = statusColumns(shown);
+  const counts = Object.fromEntries(statuses.map((s) => [s, 0]));
+  for (const r of shown) counts[r.__status] = (counts[r.__status] || 0) + 1;
+
+  return el('div', {}, [
+    pageHead('Live properties', hasLiveCol
+      ? 'Properties currently live, with their agreement status. Filters carry over from the tab you opened this from.'
+      : 'No live/not-live column was found in the table, so every property is listed. Add one to the Acq Master and it will filter here automatically.'),
+    el('div', { class: 'kpi-grid' }, [
+      kpiCard('Live properties', fmtInt(shown.length), 'in scope', 'sky'),
+      kpiCard('Valid', fmtInt(counts['Valid'] || 0), fmtPct(shown.length ? (counts['Valid'] || 0) * 100 / shown.length : null) + ' of live', 'good'),
+      kpiCard('Not signed', fmtInt(counts['Not Signed'] || 0), 'need chasing', 'bad'),
+      kpiCard('Expiring', fmtInt(counts['To Expire'] || 0), 'renew before expiry', 'warn'),
+    ]),
+    el('div', { class: 'panel' }, [
+      el('div', { class: 'panel-head' }, [
+        el('h3', { text: 'Live property list' }),
+        el('span', { class: 'hint right', text: `${fmtInt(shown.length)} properties` }),
+      ]),
+      propertyTable(shown),
+    ]),
+  ]);
+}
+
+/* 9 ------------------------------------------------------------------- chrome */
+
+function renderSidebar() {
+  const nav = $('#sidebar');
+  nav.replaceChildren();
+
+  const rows = activeRows();
+  const countFor = {
+    overview: rows.length,
+    kam: new Set(rows.map((r) => r.__kam)).size,
+    squad: new Set(rows.map((r) => r.__squad)).size,
+    properties: rows.length,
+    'live-properties': state.cols.live ? rows.filter((r) => r.__live).length : rows.length,
+  };
+
+  for (const group of ['Summary', 'Detail']) {
+    const g = el('div', { class: 'nav-group' }, [el('div', { class: 'nav-label', text: group })]);
+
+    for (const v of VIEWS.filter((x) => x.group === group)) {
+      if (v.external) {
+        const href = LIVE_PROPERTIES_URL || `${location.pathname}${urlFor(v.id, defaultSub(v.id))}`;
+        g.append(el('a', {
+          class: 'nav-item',
+          href,
+          target: '_blank',
+          rel: 'noopener noreferrer',
+          title: 'Opens in a new browser tab',
+        }, [
+          el('span', { class: 'dot' }),
+          el('span', { class: 'label', text: v.label }),
+          el('span', { class: 'nav-count', text: fmtInt(countFor[v.id] ?? 0) }),
+          el('span', { class: 'ext', text: '↗' }),
+        ]));
+        continue;
+      }
+
+      const a = el('a', {
+        class: 'nav-item',
+        href: urlFor(v.id, defaultSub(v.id)),
+        'aria-current': state.view === v.id ? 'page' : null,
+      }, [
+        el('span', { class: 'dot' }),
+        el('span', { class: 'label', text: v.label }),
+        el('span', { class: 'nav-count', text: fmtInt(countFor[v.id] ?? 0) }),
+      ]);
+      a.addEventListener('click', (e) => {
+        if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return; // let the browser open a new tab
+        e.preventDefault();
+        go(v.id);
+      });
+      g.append(a);
+    }
+    nav.append(g);
+  }
+}
+
+function renderTabs() {
+  const strip = $('#tab-strip');
+  strip.replaceChildren();
+  const subs = SUBTABS[state.view] || [];
+  if (subs.length < 2) return;
+
+  for (const s of subs) {
+    const b = el('button', {
+      type: 'button',
+      class: 'tab',
+      role: 'tab',
+      'aria-selected': state.sub === s.id ? 'true' : 'false',
+      text: s.label,
+    });
+    b.addEventListener('click', () => { state.sub = s.id; syncUrl(); renderTabs(); renderView(); });
+    strip.append(b);
+  }
+  strip.setAttribute('role', 'tablist');
+}
+
+/* The three dropdowns are built once and kept mounted. Rebuilding them on every
+   change closed the panel after a single tick, which made multi-select useless. */
+const filterUI = { built: false, controls: {}, note: null, reset: null };
+
+const FILTER_FIELDS = {
+  squads:   { field: '__squad',  skip: 'squad',  key: 'squad',  label: 'Squad'  },
+  kams:     { field: '__kam',    skip: 'kam',    key: 'kam',    label: 'KAM'    },
+  statuses: { field: '__status', skip: 'status', key: 'status', label: 'Status' },
+};
+
+function renderFilters() {
+  const bar = $('#filter-bar');
+  if (!bar) return;
+
+  if (state.loading || state.error) {
+    bar.replaceChildren();
+    filterUI.built = false;
+    filterUI.controls = {};
+    return;
+  }
+  if (filterUI.built && bar.firstChild) { updateFilters(); return; }
+
+  bar.replaceChildren();
+  const row = el('div', { class: 'filter-row' });
+
+  for (const [stateKey, cfg] of Object.entries(FILTER_FIELDS)) {
+    const ms = multiSelect({
+      key: cfg.key,
+      label: cfg.label,
+      options: uniqueValues(cfg.field, cfg.skip),
+      selected: state.filters[stateKey].slice(),
+      onChange: (vals) => { state.filters[stateKey] = vals; onFiltersChanged(); },
+    });
+    filterUI.controls[stateKey] = ms;
+    row.append(ms);
+  }
+
+  const search = el('input', {
+    class: 'filter-search',
+    type: 'search',
+    placeholder: 'Search property, KAM or squad…',
+    'aria-label': 'Search',
+    value: state.search,
+  });
+  let t;
+  search.addEventListener('input', () => {
+    clearTimeout(t);
+    t = setTimeout(() => {
+      state.search = search.value.trim();
+      onFiltersChanged();
+    }, 180);
+  });
+  row.append(search);
+
+  const reset = el('button', { type: 'button', class: 'reset-btn', text: 'Reset filters', disabled: !hasAnyFilter() });
+  reset.addEventListener('click', () => {
+    state.filters = { squads: [], kams: [], statuses: [] };
+    state.search = '';
+    onFiltersChanged();
+  });
+  row.append(reset);
+
+  const note = el('span', { class: 'result-note' });
+  row.append(note);
+
+  filterUI.search = search;
+  filterUI.reset = reset;
+  filterUI.note = note;
+  filterUI.built = true;
+
+  bar.append(row, el('div', { class: 'active-filters', id: 'active-filters' }));
+  updateFilters();
+}
+
+/** Refresh what the mounted filter bar shows, without replacing its nodes. */
+function updateFilters() {
+  if (!filterUI.built) return;
+
+  for (const [stateKey, cfg] of Object.entries(FILTER_FIELDS)) {
+    filterUI.controls[stateKey]?._sync(
+      uniqueValues(cfg.field, cfg.skip),
+      state.filters[stateKey],
+    );
+  }
+
+  if (filterUI.search
+      && document.activeElement !== filterUI.search
+      && filterUI.search.value !== state.search) {
+    filterUI.search.value = state.search;
+  }
+  if (filterUI.reset) filterUI.reset.disabled = !hasAnyFilter();
+  if (filterUI.note) {
+    const shown = activeRows().length;
+    filterUI.note.textContent = hasAnyFilter()
+      ? `${fmtInt(shown)} of ${fmtInt(state.rows.length)} properties`
+      : `${fmtInt(state.rows.length)} properties`;
+  }
+
+  renderActiveFilters();
+}
+
+/** The visible readout of what's selected — chips, each individually removable. */
+function renderActiveFilters() {
+  const box = $('#active-filters');
+  if (!box) return;
+  box.replaceChildren();
+  if (!hasAnyFilter()) return;
+
+  box.append(el('span', { class: 'af-title', text: 'Filtering by' }));
+
+  const addChips = (list, key, keyLabel, cls) => {
+    list.forEach((v) => {
+      const x = el('button', { class: 'chip-x', type: 'button', 'aria-label': `Remove ${keyLabel} ${v}`, text: '×' });
+      x.addEventListener('click', () => {
+        state.filters[key] = state.filters[key].filter((s) => s !== v);
+        onFiltersChanged();
+      });
+      box.append(el('span', { class: `chip ${cls}`, title: `${keyLabel}: ${v}` }, [
+        el('span', { class: 'chip-key', text: keyLabel }),
+        el('span', { class: 'chip-val', text: v }),
+        x,
+      ]));
+    });
+  };
+
+  addChips(state.filters.squads,   'squads',   'Squad',  'chip-squad');
+  addChips(state.filters.kams,     'kams',     'KAM',    'chip-kam');
+  addChips(state.filters.statuses, 'statuses', 'Status', 'chip-status');
+
+  if (state.search) {
+    const x = el('button', { class: 'chip-x', type: 'button', 'aria-label': 'Clear search', text: '×' });
+    x.addEventListener('click', () => { state.search = ''; onFiltersChanged(); });
+    box.append(el('span', { class: 'chip chip-search' }, [
+      el('span', { class: 'chip-key', text: 'Search' }),
+      el('span', { class: 'chip-val', text: state.search }),
+      x,
+    ]));
+  }
+
+  const clearAll = el('button', { class: 'chip-x', type: 'button', 'aria-label': 'Clear all filters', text: '×' });
+  clearAll.addEventListener('click', () => {
+    state.filters = { squads: [], kams: [], statuses: [] };
+    state.search = '';
+    onFiltersChanged();
+  });
+  box.append(el('span', { class: 'chip', style: 'border-style:dashed' }, [
+    el('span', { class: 'chip-val', text: 'Clear all' }),
+    clearAll,
+  ]));
+}
+
+function onFiltersChanged() {
+  syncUrl();
+  renderSidebar();
+  updateFilters();
+  renderView();
+}
+
+function renderView() {
+  const root = $('#view-root');
+  root.replaceChildren();
+
+  if (state.loading) {
+    root.append(el('div', { class: 'state' }, [
+      el('div', { class: 'spinner' }),
+      el('h3', { text: 'Loading from Supabase' }),
+      el('p', { text: `Reading the “${SUPABASE_TABLE}” table.` }),
+    ]));
+    return;
+  }
+
+  if (state.error) {
+    const retry = el('button', { type: 'button', text: 'Try again' });
+    retry.addEventListener('click', boot);
+    root.append(el('div', { class: 'state error' }, [
+      el('h3', { text: 'Could not load the data' }),
+      el('p', { text: state.error }),
+      el('p', { html: 'If the table loads but comes back empty, it is almost always Row Level Security — add a <code>SELECT</code> policy on the table in Supabase.' }),
+      retry,
+    ]));
+    return;
+  }
+
+  if (!state.rows.length) {
+    root.append(el('div', { class: 'state' }, [
+      el('h3', { text: 'No rows came back' }),
+      el('p', { html: `The <code>${SUPABASE_TABLE}</code> table returned zero rows. Check that a <code>SELECT</code> policy exists under Supabase → Authentication → Policies.` }),
+    ]));
+    return;
+  }
+
+  const rows = activeRows();
+
+  switch (state.view) {
+    case 'kam':
+      root.append(viewPivot(rows, '__kam', 'Owner Facing Account Manager', 'KAM-wise summary',
+        'Agreement status by Owner Facing Account Manager, matching the MIS pivot.'));
+      break;
+    case 'squad':
+      root.append(viewPivot(rows, '__squad', 'New Squad Mapping', 'Squad-wise summary',
+        'Agreement status by squad, matching the MIS pivot.'));
+      break;
+    case 'properties':
+      root.append(viewProperties(rows));
+      break;
+    case 'live-properties':
+      root.append(viewLiveProperties(rows));
+      break;
+    default:
+      root.append(viewOverview(rows));
+  }
+}
+
+function render() {
+  renderSidebar();
+  renderTabs();
+  renderFilters();
+  renderView();
+}
+
+/* drawer ------------------------------------------------------------------- */
+
+function openDrawer() {
+  $('#sidebar').classList.add('open');
+  $('#nav-toggle').setAttribute('aria-expanded', 'true');
+  const scrim = $('#scrim');
+  scrim.hidden = false;
+  requestAnimationFrame(() => scrim.classList.add('show'));
+  document.body.style.overflow = 'hidden';
+}
+
+function closeDrawer() {
+  $('#sidebar').classList.remove('open');
+  $('#nav-toggle')?.setAttribute('aria-expanded', 'false');
+  const scrim = $('#scrim');
+  scrim.classList.remove('show');
+  setTimeout(() => { scrim.hidden = true; }, 200);
+  document.body.style.overflow = '';
+}
+
+/* auth --------------------------------------------------------------------- */
+
+const USER_KEY = 'vt.user';
+const validEmail = (v) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
+
+function showApp(email) {
+  state.user = email;
+  $('#login-screen').classList.add('hidden');
+  $('#app').classList.remove('hidden');
+  $('#who-label').textContent = email;
+}
+
+function handleLogin() {
+  const input = $('#email-input');
+  const value = input.value.trim();
+  if (!validEmail(value)) {
+    input.classList.add('invalid');
+    $('#login-error').classList.add('show');
+    input.focus();
+    return;
+  }
+  input.classList.remove('invalid');
+  $('#login-error').classList.remove('show');
+  try { localStorage.setItem(USER_KEY, value); } catch { /* private mode */ }
+  showApp(value);
+  boot();
+}
+
+function signOut() {
+  try { localStorage.removeItem(USER_KEY); } catch { /* ignore */ }
+  state.user = null;
+  $('#app').classList.add('hidden');
+  $('#login-screen').classList.remove('hidden');
+  $('#email-input').value = '';
+}
+
+/* 10 -------------------------------------------------------------------- boot */
+
+async function boot() {
+  state.loading = true;
+  state.error = null;
+  render();
+
+  try {
+    const raw = await fetchAllRows();
+    state.cols = resolveColumns(raw[0]);
+    state.rows = normalizeRows(raw, state.cols);
+    state.error = null;
+  } catch (err) {
+    state.error = err.message || String(err);
+    state.rows = [];
+  } finally {
+    state.loading = false;
+    render();
+  }
+}
+
+function init() {
+  readUrl();
+
+  $('#login-btn')?.addEventListener('click', handleLogin);
+  $('#email-input')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') handleLogin(); });
+  $('#email-input')?.addEventListener('input', () => {
+    $('#email-input').classList.remove('invalid');
+    $('#login-error')?.classList.remove('show');
+  });
+  $('#signout-btn')?.addEventListener('click', signOut);
+
+  $('#nav-toggle')?.addEventListener('click', () => {
+    $('#sidebar').classList.contains('open') ? closeDrawer() : openDrawer();
+  });
+  $('#scrim')?.addEventListener('click', closeDrawer);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDrawer(); });
+  window.addEventListener('resize', () => { if (window.innerWidth > 980) closeDrawer(); });
+  window.addEventListener('popstate', () => { readUrl(); render(); });
+
+  let saved = null;
+  try { saved = localStorage.getItem(USER_KEY); } catch { /* ignore */ }
+
+  if (saved && validEmail(saved)) {
+    showApp(saved);
+    boot();
+  }
+}
+
+/* kept on window because index.html historically used inline onclick handlers */
 window.handleLogin = handleLogin;
 window.signOut = signOut;
-window.toggleSection = toggleSection;
-window.openTab = openTab;
-window.closeTab = closeTab;
-window.manualRefresh = manualRefresh;
-window.downloadReportCsv = downloadReportCsv;
-window.goDetailPage = goDetailPage;
-window.openDetailRowByIndex = openDetailRowByIndex;
-window.openDetailRowByIndexNewTab = openDetailRowByIndexNewTab;
-window.goBackHome = goBackHome;
-window.openPropertyInNewTabCurrent = openPropertyInNewTabCurrent;
-window.openLivePropertiesNewTab = openLivePropertiesNewTab;
-window.toggleFilterPanel = toggleFilterPanel;
-window.toggleFilterValue = toggleFilterValue;
-window.selectAllFilter = selectAllFilter;
-window.clearFilter = clearFilter;
+
+init();
