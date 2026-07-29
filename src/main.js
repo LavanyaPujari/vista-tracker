@@ -41,7 +41,7 @@ let RESPONSE_KEY = null;
 
 let tabState = {};
 function getTabState(tabId){
-  if(!tabState[tabId]) tabState[tabId] = { search:'', statusFilter:'all', urgentOnly:null, healthFilter:'all', sort:'health' };
+  if(!tabState[tabId]) tabState[tabId] = { search:'', detailPage:1, selectedSquads:new Set(), selectedPocs:new Set() };
   return tabState[tabId];
 }
 
@@ -97,10 +97,14 @@ async function boot(){
 
     // If this tab was opened via "View Full Details" (?property=ID), jump straight
     // to that property's record instead of showing the dashboard first.
-    const urlPropertyId = new URLSearchParams(window.location.search).get('property');
+    const urlParams = new URLSearchParams(window.location.search);
+    const urlPropertyId = urlParams.get('property');
     if(urlPropertyId){
       const match = allRows.find(r => String(getPropertyId(r)) === urlPropertyId);
       if(match) activeRow = match;
+    } else if(urlParams.get('view') === 'live'){
+      // Opened via the "Live Properties" card — land directly on that tab.
+      openTab(tabIdFor('STATUS','live'));
     }
 
     renderActiveTab();
@@ -387,6 +391,15 @@ function rowsForTab(tabId){
     return allRows.filter(r=>urgencyLevel(fieldsFor(r).endDateRaw) === p.name);
   }
   if(p.type==='CONTRACT') return allRows.filter(r=>contractCategoryFor(fieldsFor(r)) === p.name);
+  // Agreement-status cards clicked from inside the Live Properties tab — always scoped
+  // to Live properties specifically, matching what the card counted.
+  if(p.type==='LIVEAGREEMENT'){
+    const liveRows = allRows.filter(r=>statusKey(fieldsFor(r).status)==='live');
+    if(p.name==='expired') return liveRows.filter(r=>urgencyLevel(fieldsFor(r).endDateRaw)==='expired');
+    if(p.name==='founder') return liveRows.filter(r=>isFounderPartnerApproved(r));
+    if(p.name==='notsigned') return liveRows.filter(r=>contractCategoryFor(fieldsFor(r))==='pending');
+    return liveRows;
+  }
   return allRows;
 }
 
@@ -401,6 +414,11 @@ function tabDisplayName(p){
     if(p.name==='expired') return 'Expired agreements';
   }
   if(p.type==='CONTRACT') return p.name==='completed' ? 'Agreement Completed' : 'Pending / Not Signed';
+  if(p.type==='LIVEAGREEMENT'){
+    if(p.name==='expired') return 'Live · Expired Agreements';
+    if(p.name==='founder') return 'Live · Founder/Partner Approved';
+    if(p.name==='notsigned') return 'Live · Not Signed';
+  }
   return p.name;
 }
 
@@ -411,6 +429,24 @@ function contractCategoryFor(f){
   if(cs.includes('not signed') || cs.includes('pending')) return 'pending';
   if(cs.includes('signed')) return 'completed';
   return 'other';
+}
+
+// Checks whichever column tracks exception sign-off, under any of the names it might
+// have in this table, and looks for "Founder" or "Partner" in the value. If this data
+// hasn't been synced with that column yet, this correctly (and honestly) returns false
+// for everything rather than guessing — the card will show 0 until that field exists.
+const FOUNDER_APPROVAL_CANDIDATES = [
+  "If Yes, exceptions approved by (Central)",
+  "Exceptions approved by",
+  "Exception Approved By",
+  "Approved By",
+  "Founder Approval",
+  "Partner Approval",
+  "Founder/Partner Approved"
+];
+function isFounderPartnerApproved(row){
+  const val = getVal(row, FOUNDER_APPROVAL_CANDIDATES);
+  return !!val && /founder|partner/i.test(String(val));
 }
 
 /* ---------- LEADERBOARD DATA (used by Top 5 Squads strip) ---------- */
@@ -546,23 +582,126 @@ function agreementSummaryHtml(rows, clickable){
 
 /* ---------- EXPANDED DETAIL PAGE (used for Status / Squad / POC / Urgency clicks) ---------- */
 const DETAIL_PAGE_SIZE = 50;
-function detailPageShellHtml(){
+function mainDashboardCardsHtml(totalCount, liveCount){
+  return `
+    <div class="kpi-row" style="grid-template-columns:repeat(auto-fit,minmax(220px,1fr));">
+      <div class="kpi-card kpi-total" style="cursor:default;">
+        <div class="kpi-number">${totalCount}</div><div class="kpi-label">Total Properties</div>
+      </div>
+      <div class="kpi-card" style="background:linear-gradient(135deg, ${hexMix('#3f7d5c',0.82)}, ${hexMix('#3f7d5c',0.55)});border-color:#3f7d5c;" onclick="openLivePropertiesNewTab()" title="Opens in a new tab">
+        <div class="kpi-number" style="color:#1f5c37">${liveCount}</div><div class="kpi-label" style="color:#1f5c37">Live Properties ↗</div>
+      </div>
+    </div>`;
+}
+function openLivePropertiesNewTab(){
+  window.open(`${window.location.pathname}?view=live`, '_blank');
+}
+
+/* ---------- LIVE PROPERTIES: Agreement Summary (Expired / Founder-Partner Approved / Not Signed) ---------- */
+function liveAgreementSummaryHtml(rows, clickable){
+  let expired=0, founder=0, notSigned=0;
+  rows.forEach(row=>{
+    const f = fieldsFor(row);
+    if(urgencyLevel(f.endDateRaw)==='expired') expired++;
+    if(isFounderPartnerApproved(row)) founder++;
+    if(contractCategoryFor(f)==='pending') notSigned++;
+  });
+  const cards = [
+    {label:'Expired', value:expired, color:'#a13f30', nav: tabIdFor('LIVEAGREEMENT','expired')},
+    {label:'Founder Approved / Partner Approved', value:founder, color:'#8a6a1f', nav: tabIdFor('LIVEAGREEMENT','founder')},
+    {label:'Not Signed', value:notSigned, color:'#c07a1f', nav: tabIdFor('LIVEAGREEMENT','notsigned')},
+  ];
+  return `
+    <div class="section-card">
+      <div class="section-title">Agreement Summary</div>
+      <div class="section-desc">${clickable ? 'Click a card to see the full list.' : ''} Fetched live from Supabase — counts reflect Live properties only.</div>
+      <div class="kpi-row" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr));">
+        ${cards.map(c=>`
+          <div class="kpi-card" style="${clickable?'':'cursor:default;'}border-color:${c.color}22;" ${clickable ? `onclick="openTab('${c.nav}')"` : ''}>
+            <div class="kpi-number" style="color:${c.color}">${c.value}</div>
+            <div class="kpi-label">${escapeHtml(c.label)}</div>
+          </div>`).join('')}
+      </div>
+    </div>`;
+}
+
+/* ---------- MULTI-SELECT SQUAD / KAM FILTER DROPDOWNS ---------- */
+function multiselectFilterHtml(kind){
+  const state = getTabState(activeTabId);
+  const list = kind==='squad' ? squadList : pocList;
+  const selected = kind==='squad' ? state.selectedSquads : state.selectedPocs;
+  const label = kind==='squad' ? 'Squad' : 'KAM';
+  const isOpen = state.openFilterPanel === kind;
+  return `
+    <div class="filter-dropdown">
+      <button class="filter-dropdown-btn" onclick="toggleFilterPanel('${kind}')">${label}${selected.size ? ` (${selected.size})` : ''} ▾</button>
+      <div class="filter-dropdown-panel ${isOpen ? '' : 'hidden'}">
+        <div class="filter-dropdown-actions">
+          <span onclick="selectAllFilter('${kind}')">Select all</span>
+          <span onclick="clearFilter('${kind}')">Clear</span>
+        </div>
+        ${list.map(item=>`
+          <label><input type="checkbox" ${selected.has(item.name)?'checked':''} onchange="toggleFilterValue('${kind}', ${JSON.stringify(item.name)})"> ${escapeHtml(item.name)} <span class="filter-count">${item.count}</span></label>
+        `).join('')}
+      </div>
+    </div>`;
+}
+function toggleFilterPanel(kind){
+  const state = getTabState(activeTabId);
+  state.openFilterPanel = state.openFilterPanel === kind ? null : kind;
+  renderActiveTab();
+}
+function toggleFilterValue(kind, name){
+  const state = getTabState(activeTabId);
+  const set = kind==='squad' ? state.selectedSquads : state.selectedPocs;
+  if(set.has(name)) set.delete(name); else set.add(name);
+  state.detailPage = 1;
+  renderActiveTab();
+}
+function selectAllFilter(kind){
+  const state = getTabState(activeTabId);
+  const list = kind==='squad' ? squadList : pocList;
+  const set = kind==='squad' ? state.selectedSquads : state.selectedPocs;
+  list.forEach(item=>set.add(item.name));
+  state.detailPage = 1;
+  renderActiveTab();
+}
+function clearFilter(kind){
+  const state = getTabState(activeTabId);
+  const set = kind==='squad' ? state.selectedSquads : state.selectedPocs;
+  set.clear();
+  state.detailPage = 1;
+  renderActiveTab();
+}
+// close any open filter dropdown when clicking elsewhere on the page
+document.addEventListener('click', (e)=>{
+  if(e.target.closest('.filter-dropdown')) return;
+  const state = getTabState(activeTabId);
+  if(state.openFilterPanel){ state.openFilterPanel = null; renderActiveTab(); }
+});
+
+/* ---------- SHARED PROPERTIES TABLE (used by All Properties, Live Properties, and every drill-down page) ---------- */
+function detailPageShellHtml(showFilters, searchInHeader){
   return `
     <div class="section-card">
       <div class="section-title" id="detail-count-title">Properties</div>
       <div class="section-desc">Click any row to view its full record. Links open in a new tab.</div>
-      <div class="search-row">
-        <input id="search-box" placeholder="Search by property, squad, POC, or city…" />
-      </div>
+      ${searchInHeader ? '' : `<div class="search-row"><input id="search-box" placeholder="Search by property, squad, POC, or city…" /></div>`}
+      ${showFilters ? `<div class="filter-row">${multiselectFilterHtml('squad')}${multiselectFilterHtml('poc')}</div>` : ''}
       <div id="detail-result-area"></div>
     </div>`;
 }
 function renderDetailResultArea(rows){
   const state = getTabState(activeTabId);
   const filtered = rows.filter(row=>{
-    if(!state.search) return true;
     const f = fieldsFor(row);
-    return f.name.toLowerCase().includes(state.search) || f.owner.toLowerCase().includes(state.search) || f.squad.toLowerCase().includes(state.search) || f.city.toLowerCase().includes(state.search);
+    if(state.search){
+      const matchesSearch = f.name.toLowerCase().includes(state.search) || f.owner.toLowerCase().includes(state.search) || f.squad.toLowerCase().includes(state.search) || f.city.toLowerCase().includes(state.search);
+      if(!matchesSearch) return false;
+    }
+    if(state.selectedSquads && state.selectedSquads.size > 0 && !state.selectedSquads.has(f.squad)) return false;
+    if(state.selectedPocs && state.selectedPocs.size > 0 && !state.selectedPocs.has(f.owner)) return false;
+    return true;
   });
   window.__detailFilteredRows = filtered;
 
@@ -607,7 +746,7 @@ function renderDetailResultArea(rows){
             <th>Contract Status</th><th>Agreement End</th><th>City</th><th>Docs</th><th></th>
           </tr>
         </thead>
-        <tbody>${tableRows || `<tr><td colspan="10" style="text-align:center;color:#999;padding:30px;">No properties match this search.</td></tr>`}</tbody>
+        <tbody>${tableRows || `<tr><td colspan="10" style="text-align:center;color:#999;padding:30px;">No properties match this search/filter.</td></tr>`}</tbody>
       </table>
     </div>
     ${filtered.length > DETAIL_PAGE_SIZE ? `
@@ -619,13 +758,11 @@ function renderDetailResultArea(rows){
   `;
 }
 function goDetailPage(n){ getTabState(activeTabId).detailPage = n; renderDetailResultArea(rowsForTab(activeTabId)); }
-// Clicking a row shows a quick preview in the same tab...
 function openDetailRowByIndex(idx){
   const filtered = window.__detailFilteredRows || [];
   activeRow = filtered[idx];
   renderActiveTab();
 }
-// ...while the explicit "View Full Details" button opens it in a genuine new browser tab.
 function openDetailRowByIndexNewTab(idx){
   const filtered = window.__detailFilteredRows || [];
   const row = filtered[idx];
@@ -641,154 +778,67 @@ function renderActiveTab(){
   const state = getTabState(activeTabId);
   const root = document.getElementById('view-root');
 
-  const counts = {};
-  rows.forEach(r=>{ const k = statusKey(fieldsFor(r).status); counts[k]=(counts[k]||0)+1; });
+  // "All Properties" and "Live Properties" share the simplified header-with-search
+  // layout and the Squad/KAM multi-select filters; every other drill-down page keeps
+  // the previous title+description+Export header with its own search row.
+  const isMainOrLive = p.type === 'ALL' || (p.type === 'STATUS' && p.name === 'live');
 
-  let urgentRed=0, urgentOrange=0;
-  rows.forEach(r=>{
-    const lvl = urgencyLevel(fieldsFor(r).endDateRaw);
-    if(lvl==='red') urgentRed++;
-    else if(lvl==='orange') urgentOrange++;
-  });
-
-  const cityCounts = {};
-  rows.forEach(r=>{
-    const city = fieldsFor(r).city;
-    if(city && city !== '—') cityCounts[city] = (cityCounts[city] || 0) + 1;
-  });
-  const leadingCity = Object.entries(cityCounts).sort((a,b)=>b[1]-a[1])[0];
-  const timeOfDay = new Date().getHours() < 12 ? 'Good morning' : new Date().getHours() < 18 ? 'Good afternoon' : 'Good evening';
-  const heroHtml = p.type === 'ALL' ? `
-    <section class="portfolio-hero">
-      <div class="hero-copy">
-        <span class="eyebrow">Portfolio command centre</span>
-        <h1>${timeOfDay}.<br><em>Every stay</em> in view.</h1>
-        <p>${rows.length} homes across ${squadList.length || 0} squads, with the signals that need your attention first.</p>
-        <div class="hero-meta">
-          <span><b>${leadingCity ? leadingCity[1] : 0}</b> homes in ${escapeHtml(leadingCity ? leadingCity[0] : 'your top city')}</span>
-          <span><b>${urgentRed + urgentOrange}</b> renewals to watch</span>
-        </div>
+  const headerHtml = isMainOrLive ? `
+    <div class="view-header">
+      <div><h2>${escapeHtml(tabDisplayName(p))}</h2></div>
+      <div class="search-row" style="margin:0;max-width:360px;flex:1;min-width:220px;">
+        <input id="search-box" placeholder="Search properties, squad, or POC…" />
       </div>
-      <div class="hero-art" aria-hidden="true">
-        <div class="sun-orb"></div><div class="hill hill-one"></div><div class="hill hill-two"></div>
-        <div class="hero-home"><i></i><i></i><i></i></div>
-        <div class="hero-stamp">SV<br><small>EST. 2015</small></div>
-      </div>
-    </section>` : '';
+    </div>` : `
+    <div class="view-header">
+      <div><h2>${escapeHtml(tabDisplayName(p))}</h2><p class="desc">${p.type==='SQUAD' ? 'Squad-level view' : p.type==='POC' ? 'POC-level view' : 'Filtered view'} · live from Supabase</p></div>
+      <button class="btn" onclick="downloadReportCsv()">↓ Export</button>
+    </div>`;
 
-  // KPI cards navigate to a full expanded detail page instead of filtering in place.
-  const kpiHtml = `
-    <div class="kpi-card kpi-total" onclick="openTab('${tabIdFor('STATUS','all')}')">
-      <div class="kpi-number">${rows.length}</div><div class="kpi-label">Total</div>
-    </div>
-    ${KPI_ORDER.map(k=>{
-      const sem = semanticStyleFor(k);
-      return `
-      <div class="kpi-card" style="background:linear-gradient(135deg, ${hexMix(sem.dot,0.82)}, ${hexMix(sem.dot,0.55)});border-color:${sem.dot};" onclick="openTab('${tabIdFor('STATUS',k)}')">
-        <div class="kpi-number" style="color:${sem.fg}">${counts[k]||0}</div>
-        <div class="kpi-label" style="color:${sem.fg}">${escapeHtml(KPI_LABELS[k])}</div>
+  let cardsHtml;
+  if(p.type === 'ALL'){
+    const liveCount = allRows.filter(r=>statusKey(fieldsFor(r).status)==='live').length;
+    cardsHtml = mainDashboardCardsHtml(allRows.length, liveCount);
+  } else if(p.type === 'STATUS' && p.name === 'live'){
+    cardsHtml = liveAgreementSummaryHtml(rows, true);
+  } else {
+    // every other drill-down page keeps the original per-status count row + agreement summary
+    const counts = {};
+    rows.forEach(r=>{ const k = statusKey(fieldsFor(r).status); counts[k]=(counts[k]||0)+1; });
+    const statusRow = `
+      <div class="kpi-row">
+        <div class="kpi-card kpi-total" style="cursor:default;"><div class="kpi-number">${rows.length}</div><div class="kpi-label">Total</div></div>
+        ${KPI_ORDER.map(k=>{
+          const sem = semanticStyleFor(k);
+          return `<div class="kpi-card" style="cursor:default;background:linear-gradient(135deg, ${hexMix(sem.dot,0.82)}, ${hexMix(sem.dot,0.55)});border-color:${sem.dot};">
+            <div class="kpi-number" style="color:${sem.fg}">${counts[k]||0}</div><div class="kpi-label" style="color:${sem.fg}">${escapeHtml(KPI_LABELS[k])}</div>
+          </div>`;
+        }).join('')}
       </div>`;
-    }).join('')}
-  `;
+    cardsHtml = statusRow + agreementSummaryHtml(rows, false);
+  }
 
   const healthHtml = `<div class="health-strip"><span class="health-dot"></span> Auto-synced from Supabase${lastSyncedAt ? ` · last synced ${lastSyncedAt.toLocaleTimeString()}` : ''}.</div>`;
-
-  // Alert banners also navigate to an expanded detail page, filtered to just the urgent set.
-  let alertHtml = '';
-  if(urgentRed > 0) alertHtml += `<div class="alert-banner red" onclick="openTab('${tabIdFor('URGENT','red')}')">⚠ ${urgentRed} agreement${urgentRed===1?'':'s'} expiring within 7 days</div>`;
-  if(urgentOrange > 0) alertHtml += `<div class="alert-banner orange" onclick="openTab('${tabIdFor('URGENT','orange')}')">⚠ ${urgentOrange} agreement${urgentOrange===1?'':'s'} expiring within 30 days</div>`;
-
-  // Quick-search only appears on the main "All Properties" page, right under the header —
-  // typing shows a live dropdown of matches; clicking one opens its full record in a new tab.
-  const quickSearchHtml = p.type === 'ALL' ? `
-    <div class="quick-search">
-      <input id="quick-search-box" placeholder="🔍 Quickly search any property, squad, or POC…" autocomplete="off" />
-      <div id="quick-search-results" class="quick-search-results hidden"></div>
-    </div>` : '';
-
-  let bodyExtra = '';
-  let detailSection = '';
-  if(p.type === 'ALL'){
-    // Main dashboard: agreement info front-and-center, plus which squads carry the most homes.
-    // Everything else (per-status, per-squad, per-POC full lists) is one click away via the
-    // KPI cards, alert banners, agreement summary cards, or the sidebar.
-    bodyExtra = `
-      ${agreementSummaryHtml(rows, true)}
-      ${topSquadStripsHtml()}
-    `;
-  } else {
-    detailSection = `
-      ${agreementSummaryHtml(rows, false)}
-      ${detailPageShellHtml()}
-    `;
-  }
+  const bottomExtra = p.type === 'ALL' ? topSquadStripsHtml() : '';
 
   root.innerHTML = `
-    ${heroHtml}
-    <div class="view-header">
-      <div><h2>${escapeHtml(tabDisplayName(p))}</h2><p class="desc">${p.type==='ALL' ? 'Portfolio-wide summary' : p.type==='SQUAD' ? 'Squad-level view' : p.type==='POC' ? 'POC-level view' : 'Filtered view'} · live from Supabase</p></div>
-      ${p.type!=='ALL' ? `<button class="btn" onclick="downloadReportCsv()">↓ Export</button>` : ''}
-    </div>
-    ${quickSearchHtml}
+    ${headerHtml}
     ${healthHtml}
-    <div class="kpi-row">${kpiHtml}</div>
-    ${alertHtml}
-    ${bodyExtra}
-    ${detailSection}
+    ${cardsHtml}
+    ${detailPageShellHtml(isMainOrLive, isMainOrLive)}
+    ${bottomExtra}
   `;
 
-  if(p.type === 'ALL'){
-    const qsBox = document.getElementById('quick-search-box');
-    if(qsBox){
-      qsBox.addEventListener('input', (e)=> renderQuickSearchResults(e.target.value));
-      document.addEventListener('click', (e)=>{
-        if(!e.target.closest('.quick-search')) document.getElementById('quick-search-results')?.classList.add('hidden');
-      });
-    }
-  } else {
-    const searchBox = document.getElementById('search-box');
-    if(searchBox){
-      searchBox.value = state.search;
-      searchBox.addEventListener('input', (e)=>{
-        state.search = e.target.value.toLowerCase();
-        state.detailPage = 1;
-        renderDetailResultArea(rows);
-      });
-    }
-    renderDetailResultArea(rows);
+  const searchBox = document.getElementById('search-box');
+  if(searchBox){
+    searchBox.value = state.search;
+    searchBox.addEventListener('input', (e)=>{
+      state.search = e.target.value.toLowerCase();
+      state.detailPage = 1;
+      renderDetailResultArea(rows);
+    });
   }
-}
-
-// Quick-search dropdown shown under the "All Properties" header — up to 8 live matches,
-// clicking one opens that property's full record in a new browser tab.
-function renderQuickSearchResults(term){
-  const box = document.getElementById('quick-search-results');
-  if(!box) return;
-  const q = term.trim().toLowerCase();
-  if(!q){ box.classList.add('hidden'); box.innerHTML=''; return; }
-  const matches = allRows.filter(row=>{
-    const f = fieldsFor(row);
-    return f.name.toLowerCase().includes(q) || f.squad.toLowerCase().includes(q) || f.owner.toLowerCase().includes(q) || f.city.toLowerCase().includes(q);
-  }).slice(0, 8);
-  window.__quickSearchMatches = matches;
-  if(matches.length === 0){
-    box.innerHTML = `<div class="quick-search-empty">No matching properties.</div>`;
-  } else {
-    box.innerHTML = matches.map((row,i)=>{
-      const f = fieldsFor(row);
-      const st = styleFor(statusKey(f.status));
-      return `<div class="quick-search-item" onclick="openQuickSearchMatch(${i})">
-        <span class="qs-name">${escapeHtml(f.name)}</span>
-        <span class="qs-meta">${escapeHtml(f.squad)} · ${escapeHtml(f.owner)}</span>
-        <span class="pill" style="background:${st.bg};color:${st.fg}">${escapeHtml(f.status)}</span>
-      </div>`;
-    }).join('');
-  }
-  box.classList.remove('hidden');
-}
-function openQuickSearchMatch(i){
-  const row = (window.__quickSearchMatches||[])[i];
-  if(row) openPropertyInNewTab(row);
+  renderDetailResultArea(rows);
 }
 
 function renderRowDetail(){
@@ -826,4 +876,8 @@ window.openDetailRowByIndex = openDetailRowByIndex;
 window.openDetailRowByIndexNewTab = openDetailRowByIndexNewTab;
 window.goBackHome = goBackHome;
 window.openPropertyInNewTabCurrent = openPropertyInNewTabCurrent;
-window.openQuickSearchMatch = openQuickSearchMatch;
+window.openLivePropertiesNewTab = openLivePropertiesNewTab;
+window.toggleFilterPanel = toggleFilterPanel;
+window.toggleFilterValue = toggleFilterValue;
+window.selectAllFilter = selectAllFilter;
+window.clearFilter = clearFilter;

@@ -218,4 +218,16 @@
   .squad-strip-fill{height:100%;background:#0e0e0f;}
   .squad-strip-meta{display:flex;justify-content:space-between;align-items:center;font-size:11.5px;color:var(--muted);}
 
+  /* ---------- SQUAD / KAM MULTI-SELECT FILTERS ---------- */
+  .filter-row{display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap;}
+  .filter-dropdown{position:relative;}
+  .filter-dropdown-btn{padding:9px 14px;border:1px solid var(--line);border-radius:7px;background:#fff;font-size:12.5px;font-weight:600;cursor:pointer;white-space:nowrap;}
+  .filter-dropdown-btn:hover{border-color:#bbb;}
+  .filter-dropdown-panel{position:absolute;top:calc(100% + 6px);left:0;background:#fff;border:1px solid var(--line);border-radius:9px;box-shadow:0 12px 30px rgba(0,0,0,.12);width:240px;max-height:300px;overflow-y:auto;z-index:25;padding:8px;}
+  .filter-dropdown-panel label{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12.5px;padding:6px 8px;border-radius:6px;cursor:pointer;}
+  .filter-dropdown-panel label:hover{background:#f5f5f5;}
+  .filter-dropdown-actions{display:flex;justify-content:space-between;padding:6px 8px 8px;border-bottom:1px solid var(--line);margin-bottom:4px;}
+  .filter-dropdown-actions span{font-size:11.5px;color:var(--muted);cursor:pointer;text-decoration:underline;}
+  .filter-count{font-size:11px;color:var(--muted);}
+
   footer.proto-flag{position:fixed;bottom:0;left:0;right:0;background:#0e0e0f;color:#fff;font-size:11px;text-align:center;padding:6px;font-weight:600;}
