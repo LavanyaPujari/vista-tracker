@@ -17,7 +17,13 @@
 
 const ENV = import.meta.env;
 
-const SUPABASE_URL   = (ENV.VITE_SUPABASE_URL || '').replace(/\/+$/, '');
+/* Supabase's Data API page shows the URL with /rest/v1/ already on the end, so
+   accept it either way rather than failing on a reasonable copy-paste. */
+const SUPABASE_URL = (ENV.VITE_SUPABASE_URL || '')
+  .trim()
+  .replace(/\/+$/, '')
+  .replace(/\/rest\/v1$/i, '')
+  .replace(/\/+$/, '');
 const SUPABASE_KEY   = ENV.VITE_SUPABASE_ANON_KEY || '';
 const SUPABASE_TABLE = ENV.VITE_SUPABASE_TABLE || 'agreement track';
 
@@ -209,6 +215,56 @@ function normalizeStatus(raw) {
   if (n.includes('expired') || n.includes('lapsed')) return 'Expired';
   if (n.includes('valid') || n.includes('signed') || n.includes('executed') || n.includes('active')) return 'Valid';
   return '';
+}
+
+/**
+ * The table has two status columns whose names differ only by capitalisation
+ * ("Contract status" and "Contract Status"), so the name tells us nothing about
+ * which is which. Work it out from the values instead: whichever column carries
+ * the pre-signature wording is the signing column, whichever carries the
+ * expiry wording is the lifecycle column.
+ */
+const PRE_SIGNATURE = ['Not Signed', 'Email Confirmation', 'Founder/Partner Approved'];
+const POST_SIGNATURE = ['Expired', 'To Expire'];
+
+function detectStatusColumns(raw) {
+  const keys = Object.keys(raw[0] || {});
+  const candidates = keys.filter((k) => {
+    const n = norm(k);
+    return (n.includes('status') || n.includes('contract') || n.includes('agreement'))
+      && !n.includes('current')      // current_status is live / delisted
+      && !n.includes('date')
+      && !n.includes('link');
+  });
+
+  const sample = raw.length > 3000 ? raw.slice(0, 3000) : raw;
+  const scored = candidates.map((key) => {
+    let pre = 0, post = 0, valid = 0, mapped = 0, filled = 0;
+    for (const r of sample) {
+      const v = r[key];
+      if (!clean(v)) continue;
+      filled += 1;
+      const bucket = normalizeStatus(v);
+      if (!bucket) continue;
+      mapped += 1;
+      if (PRE_SIGNATURE.indexOf(bucket) !== -1) pre += 1;
+      else if (POST_SIGNATURE.indexOf(bucket) !== -1) post += 1;
+      else if (bucket === 'Valid') valid += 1;
+    }
+    return { key, pre, post, valid, mapped, filled };
+  }).filter((c) => c.mapped > 0);
+
+  const best = (metric) => scored.slice()
+    .sort((a, b) => b[metric] - a[metric] || b.mapped - a.mapped)[0];
+
+  const signingBest = best('pre');
+  const lifecycleBest = best('post');
+
+  return {
+    signing: signingBest && signingBest.pre > 0 ? signingBest.key : (scored[0] ? scored[0].key : null),
+    lifecycle: lifecycleBest && lifecycleBest.post > 0 ? lifecycleBest.key : null,
+    scored,
+  };
 }
 
 const DAY = 86400000;
@@ -1224,6 +1280,36 @@ function viewDiagnostics() {
       ]),
     ]));
 
+    const det = d.statusDetection || [];
+    if (det.length) {
+      frag.append(el('div', { class: 'panel' }, [
+        el('div', { class: 'panel-head' }, [
+          el('h3', { text: 'How the status columns were told apart' }),
+          el('span', { class: 'hint right', text: 'Decided by the values, not the column name' }),
+        ]),
+        el('div', { class: 'table-wrap stacked-wrap' }, [
+          el('table', { class: 'grid stacked' }, [
+            el('thead', {}, [el('tr', {}, ['Column', 'Filled', 'Recognised', 'Pre-signature', 'Expiry', 'Valid', 'Used as'].map((h, i) =>
+              el('th', { scope: 'col', class: i === 0 ? 'freeze' : '', style: i < 1 ? 'text-align:left' : '', text: h })))]),
+            el('tbody', {}, det.map((c) => el('tr', {}, [
+              el('td', { class: 'freeze', 'data-label': 'Column', style: 'text-align:left', text: c.key }),
+              el('td', { 'data-label': 'Filled', text: fmtInt(c.filled) }),
+              el('td', { 'data-label': 'Recognised', text: fmtInt(c.mapped) }),
+              el('td', { 'data-label': 'Pre-signature', text: fmtInt(c.pre) }),
+              el('td', { 'data-label': 'Expiry', text: fmtInt(c.post) }),
+              el('td', { 'data-label': 'Valid', text: fmtInt(c.valid) }),
+              el('td', { 'data-label': 'Used as', style: 'text-align:left' }, [
+                c.key === state.cols.signing ? statusPill('Not Signed') : null,
+                c.key === state.cols.lifecycle ? statusPill('Valid') : null,
+                (c.key !== state.cols.signing && c.key !== state.cols.lifecycle)
+                  ? el('span', { class: 'zero', text: 'not used' }) : null,
+              ]),
+            ]))),
+          ]),
+        ]),
+      ]));
+    }
+
     frag.append(el('div', { class: 'panel' }, [
       el('div', { class: 'panel-head' }, [
         el('h3', { text: 'Other columns in the table' }),
@@ -1679,6 +1765,16 @@ async function boot(isRefresh = false) {
     const raw = await fetchAllRows(state.diag);
     state.raw = raw;
     state.cols = resolveColumns(raw[0]);
+
+    // names can't separate the two status columns — the data can
+    const detected = detectStatusColumns(raw);
+    if (detected.signing)   state.cols.signing = detected.signing;
+    if (detected.lifecycle) state.cols.lifecycle = detected.lifecycle;
+    if (detected.signing && detected.lifecycle && detected.signing === detected.lifecycle) {
+      state.cols.lifecycle = null;   // one column carries everything
+    }
+    state.diag.statusDetection = detected.scored;
+
     state.rows = normalizeRows(raw, state.cols);
 
     // every column the table actually has — union, in case rows differ
