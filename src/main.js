@@ -504,10 +504,9 @@ async function fetchAllRows(diag) {
 /* 5 ------------------------------------------------------- state + routing --- */
 
 const VIEWS = [
-  { id: 'overview',        label: 'Dashboard',          group: 'Summary' },
+  { id: 'overview',        label: 'Live Properties',    group: 'Summary' },
   { id: 'squad',           label: 'Squad-wise',         group: 'Summary' },
   { id: 'kam',             label: 'KAM-wise',           group: 'Summary' },
-  { id: 'live-properties', label: 'Live Properties',    group: 'Detail'  },
   { id: 'properties',      label: 'Property Details',   group: 'Detail'  },
   { id: 'diagnostics',     label: 'Connection check',   group: 'Setup'   },
 ];
@@ -517,7 +516,6 @@ const SUBTABS = {
   overview:        [],
   squad:           [],
   kam:             [],
-  'live-properties': [],
   properties:      [],   // status filtering comes from the cards + the STATUS filter
   diagnostics: [
     { id: 'connection', label: 'Connection' },
@@ -545,7 +543,7 @@ const state = {
   page: {}, // per view: current page of the property list
 };
 
-const validView = (v) => VIEWS.some((x) => x.id === v) ? v : 'overview';
+const validView = (v) => (v === 'live-properties') ? 'overview' : (VIEWS.some((x) => x.id === v) ? v : 'overview');
 
 function defaultSub(view) {
   const subs = SUBTABS[view] || [];
@@ -791,7 +789,7 @@ const DETAIL_TAB = 'vista-tracker-details';
 /** URL for Property Details pre-filtered by the given dimensions. */
 function detailHref({ status, squad, kam, live } = {}) {
   const p = new URLSearchParams();
-  p.set('view', live ? 'live-properties' : 'properties');
+  p.set('view', live ? 'overview' : 'properties');
   const squads   = squad ? [squad] : state.filters.squads;
   const kams     = kam   ? [kam]   : state.filters.kams;
   const statuses = status ? [status] : state.filters.statuses;
@@ -951,7 +949,7 @@ function propertyList(rows, opts = {}) {
   const { wrap: pagerEl, page } = pager(rows.length);
   const slice = rows.slice((page - 1) * PAGE_ROWS, page * PAGE_ROWS);
 
-  const head = ['Property', 'Squad', 'POC', 'Agreement status', 'Ends', 'Link'];
+  const head = ['Property', 'Squad', 'KAM', 'Agreement status', 'Ends', 'Link'];
   const body = slice.map((r) => el('tr', {}, [
     el('td', { class: 'freeze', 'data-label': 'Property' }, [
       r.__url
@@ -960,7 +958,7 @@ function propertyList(rows, opts = {}) {
       r.__code ? el('div', { class: 'row-sub', text: r.__code }) : null,
     ]),
     el('td', { 'data-label': 'Squad', style: 'text-align:left', text: r.__squad }),
-    el('td', { 'data-label': 'POC', style: 'text-align:left', text: r.__kam }),
+    el('td', { 'data-label': 'KAM', style: 'text-align:left', text: r.__kam }),
     el('td', { 'data-label': 'Agreement status', style: 'text-align:left' }, [
       statusPill(r.__status),
       r.__reason ? el('div', { class: 'row-sub', text: r.__reason }) : null,
@@ -1025,37 +1023,27 @@ function groupBy(rows, field) {
 /* ---- Dashboard: live properties only, with a highlighted total ----------- */
 
 function viewOverview(allRows) {
-  const live    = allRows.filter((r) => r.__live === true);
-  const notLive = allRows.filter((r) => r.__live === false);
-  const unknown = allRows.filter((r) => r.__live === null);
-  const total = allRows.length;
+  const hasLiveCol = !!(state.cols.liveStatus || state.cols.liveDate || state.cols.delistDate);
+  const live = hasLiveCol ? allRows.filter((r) => r.__live === true) : allRows;
+  const unclear = hasLiveCol ? allRows.filter((r) => r.__live === null).length : 0;
 
   const frag = el('div', {}, [
-    pageHead('Dashboard', 'Live properties only. Every card opens the matching property details in another tab of this browser.'),
+    pageHead('Live properties', 'Live properties only. Every status card opens the matching properties in another tab of this browser.'),
   ]);
 
-  // hero row: agreement summary on the left, highlighted total on the right
-  const valid = live.filter((r) => r.__status === 'Valid').length;
-  const needsAction = live.filter((r) => ['Not Signed', 'Expired', 'To Expire'].includes(r.__status)).length;
+  if (unclear) {
+    frag.append(el('div', { class: 'panel' }, [
+      el('div', { class: 'panel-body' }, [
+        el('p', { style: 'margin:0' }, [
+          `${fmtInt(unclear)} propert${unclear === 1 ? 'y is' : 'ies are'} excluded because their status column holds a value this dashboard doesn't recognise as live or not live. Connection check → Status values lists the wording.`,
+        ]),
+      ]),
+    ]));
+  }
 
-  frag.append(el('div', { class: 'hero-row' }, [
-    el('div', { class: 'hero-main' }, [
-      sectionHead('Agreement summary', `${fmtInt(live.length)} live properties in scope`),
-      statusCards(live, { live: true }),
-    ]),
-    el('div', { class: 'hero-side' }, [
-      statCard({
-        label: 'Total properties',
-        value: fmtInt(total),
-        sub: `${fmtInt(live.length)} live · ${fmtInt(notLive.length)} not live`
-          + (unknown.length ? ` · ${fmtInt(unknown.length)} unclear` : ''),
-        highlight: true,
-        filter: {},
-      }),
-      statCard({ label: 'Valid agreements', value: fmtInt(valid), sub: fmtPct(live.length ? valid * 100 / live.length : null) + ' of live', accent: 'good', filter: { status: 'Valid', live: true } }),
-      statCard({ label: 'Needs action', value: fmtInt(needsAction), sub: 'not signed, expired or expiring', accent: 'bad' }),
-    ]),
-  ]));
+  // agreement status cards (Total / Valid / Needs action hero column removed)
+  frag.append(sectionHead('Agreement summary', `${fmtInt(live.length)} live properties in scope`));
+  frag.append(statusCards(live, { live: true }));
 
   // status split bar
   const statuses = statusColumns(live);
@@ -1085,12 +1073,15 @@ function viewOverview(allRows) {
     el('div', { class: 'panel-body' }, [bar, legend]),
   ]));
 
-  // squad and POC snapshots
+  // squad and KAM snapshots
   frag.append(sectionHead('By squad', 'Tap a card to open that squad'));
   frag.append(el('div', { class: 'group-grid' }, groupBy(live, '__squad').map((e) => groupCard(e, 'squad'))));
 
-  frag.append(sectionHead('By POC', 'Tap a card to open that POC'));
+  frag.append(sectionHead('By KAM', 'Tap a card to open that KAM'));
   frag.append(el('div', { class: 'group-grid' }, groupBy(live, '__kam').slice(0, 12).map((e) => groupCard(e, 'kam'))));
+
+  // the live property list (this page now also does the old Live Properties job)
+  frag.append(propertyList(live, { title: 'Live property list' }));
 
   return frag;
 }
@@ -1104,36 +1095,9 @@ function viewGroup(rows, field, dimension, title, desc) {
     pageHead(title, desc),
     sectionHead('Agreement status', 'Each card opens the matching properties in another tab'),
     statusCards(rows),
-    sectionHead(dimension === 'squad' ? 'Squads' : 'POCs', `${fmtInt(groups.length)} in scope · tap to open`),
+    sectionHead(dimension === 'squad' ? 'Squads' : 'KAMs', `${fmtInt(groups.length)} in scope · tap to open`),
     el('div', { class: 'group-grid' }, groups.map((e) => groupCard(e, dimension))),
     propertyList(rows, { title: 'Property details' }),
-  ]);
-}
-
-/* ---- Live Properties: summary cards, then the paginated list ------------- */
-
-function viewLiveProperties(rows) {
-  const hasLiveCol = !!(state.cols.liveStatus || state.cols.liveDate || state.cols.delistDate);
-  const live = hasLiveCol ? rows.filter((r) => r.__live === true) : rows;
-
-  const unclear = hasLiveCol ? rows.filter((r) => r.__live === null).length : 0;
-
-  return el('div', {}, [
-    pageHead('Live properties', hasLiveCol
-      ? 'Properties currently live, with their agreement position.'
-      : 'No live/not-live column was found, so every property is listed.'),
-    unclear
-      ? el('div', { class: 'panel' }, [
-          el('div', { class: 'panel-body' }, [
-            el('p', { style: 'margin:0' }, [
-              `${fmtInt(unclear)} propert${unclear === 1 ? 'y is' : 'ies are'} excluded because their status column holds a value this dashboard doesn't recognise as live or not live. Connection check → Status values lists the wording.`,
-            ]),
-          ]),
-        ])
-      : null,
-    sectionHead('Agreement summary', `${fmtInt(live.length)} live properties`),
-    statusCards(live, { live: true }),
-    propertyList(live, { title: 'Live property list' }),
   ]);
 }
 
@@ -1423,7 +1387,6 @@ function renderSidebar() {
     squad: new Set(rows.map((r) => r.__squad)).size,
     kam: new Set(rows.map((r) => r.__kam)).size,
     properties: rows.length,
-    'live-properties': rows.filter((r) => r.__live === true).length,
   };
 
   for (const group of ['Summary', 'Detail', 'Setup']) {
@@ -1698,13 +1661,10 @@ function renderView() {
       break;
     case 'kam':
       root.append(viewGroup(rows, '__kam', 'kam', 'KAM-wise summary',
-        'Agreement position by Owner Facing POC. Cards open filtered property details in another tab of this browser.'));
+        'Agreement position by Owner Facing KAM. Cards open filtered property details in another tab of this browser.'));
       break;
     case 'properties':
       root.append(viewProperties(rows));
-      break;
-    case 'live-properties':
-      root.append(viewLiveProperties(rows));
       break;
     default:
       root.append(viewOverview(rows));
