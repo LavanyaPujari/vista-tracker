@@ -21,13 +21,8 @@ const SUPABASE_URL   = (ENV.VITE_SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_KEY   = ENV.VITE_SUPABASE_ANON_KEY || '';
 const SUPABASE_TABLE = ENV.VITE_SUPABASE_TABLE || 'agreement track';
 
-/* Optional. If set, the Live Properties nav item opens this URL instead of the
-   in-app Live Properties page. Either way it opens in another tab. */
-const LIVE_PROPERTIES_URL = ENV.VITE_LIVE_PROPERTIES_URL || '';
 
-/* Named window target: opens a tab in the SAME browser window and reuses that
-   same tab on every later click, rather than piling up tabs or windows. */
-const LIVE_TAB_NAME = 'vista-tracker-live';
+
 
 const PAGE_SIZE = 1000; // Supabase returns at most 1000 rows per request
 
@@ -122,12 +117,24 @@ function resolveColumns(sample) {
   const is  = (...names) => (c) => names.includes(c.n);
 
   return {
+    // POC comes from the Owner Facing columns first — the sync writes them into
+    // `poc`, but reading them directly means the dashboard works either way.
     kam: pick([
-      is('poc'),
       is('ownerfacingaccountmanager'),
+      has('ownerfacing', 'accountmanager'),
       has('ownerfacing', 'manager'),
+      has('ownerfacing', 'poc'),
+      has('ownerfacing'),
+      is('poc'),
       has('account', 'manager'),
-      is('kam', 'kamname', 'accountmanager', 'owner'),
+      is('kam', 'kamname', 'accountmanager'),
+    ]),
+    // secondary Owner Facing column, used to fill blanks in the primary
+    kamAlt: pick([
+      has('ownerfacing', 'ops'),
+      has('ownerfacing', 'secondary'),
+      has('ownerfacing', 'backup'),
+      is('poc'),
     ]),
     squad: pick([
       is('squad'),
@@ -290,6 +297,7 @@ function buildCanonicalizer(raw, column) {
 
 function normalizeRows(raw, cols) {
   const canonKam   = buildCanonicalizer(raw, cols.kam);
+  const canonKamAlt = buildCanonicalizer(raw, cols.kamAlt);
   const canonSquad = buildCanonicalizer(raw, cols.squad);
   const now = new Date();
 
@@ -297,7 +305,12 @@ function normalizeRows(raw, cols) {
     const agreement = resolveAgreementStatus(r, cols, now, EXPIRY_WINDOW_DAYS);
     return {
       __i: i,
-      __kam:      canonKam(cols.kam     ? r[cols.kam]   : ''),
+      __kam:      (() => {
+        const primary = canonKam(cols.kam ? r[cols.kam] : '');
+        if (primary !== BLANK) return primary;
+        const alt = cols.kamAlt && cols.kamAlt !== cols.kam ? canonKamAlt(r[cols.kamAlt]) : BLANK;
+        return alt;
+      })(),
       __squad:    canonSquad(cols.squad ? r[cols.squad] : ''),
       __statusRaw: [cols.signing && clean(r[cols.signing]), cols.lifecycle && clean(r[cols.lifecycle])].filter(Boolean).join(' / '),
       __status:   agreement.status,
@@ -421,18 +434,20 @@ async function fetchAllRows(diag) {
 /* 5 ------------------------------------------------------- state + routing --- */
 
 const VIEWS = [
-  { id: 'overview',        label: 'Overview',           group: 'Summary' },
-  { id: 'kam',             label: 'KAM-wise Summary',   group: 'Summary' },
-  { id: 'squad',           label: 'Squad-wise Summary', group: 'Summary' },
-  { id: 'properties',      label: 'Properties',         group: 'Detail'  },
-  { id: 'live-properties', label: 'Live Properties',    group: 'Detail', external: true },
+  { id: 'overview',        label: 'Dashboard',          group: 'Summary' },
+  { id: 'squad',           label: 'Squad-wise',         group: 'Summary' },
+  { id: 'kam',             label: 'KAM-wise',           group: 'Summary' },
+  { id: 'live-properties', label: 'Live Properties',    group: 'Detail'  },
+  { id: 'properties',      label: 'Property Details',   group: 'Detail'  },
   { id: 'diagnostics',     label: 'Connection check',   group: 'Setup'   },
 ];
 
+/* Counts and Valid % tabs are gone — every summary is card-based now. */
 const SUBTABS = {
-  overview:        [{ id: 'snapshot', label: 'Snapshot' }, { id: 'detail', label: 'Status detail' }],
-  kam:             [{ id: 'counts', label: 'Counts' }, { id: 'ranking', label: 'Valid % ranking' }],
-  squad:           [{ id: 'counts', label: 'Counts' }, { id: 'ranking', label: 'Valid % ranking' }],
+  overview:        [],
+  squad:           [],
+  kam:             [],
+  'live-properties': [],
   properties:      [
     { id: 'all',        label: 'All' },
     { id: 'notsigned',  label: 'Not signed' },
@@ -440,7 +455,6 @@ const SUBTABS = {
     { id: 'toexpire',   label: 'To expire' },
     { id: 'valid',      label: 'Valid' },
   ],
-  'live-properties': [{ id: 'all', label: 'All live' }],
   diagnostics: [
     { id: 'connection', label: 'Connection' },
     { id: 'columns',    label: 'Columns' },
@@ -464,12 +478,14 @@ const state = {
   filters: { squads: [], kams: [], statuses: [] },
   search: '',
   sort: {}, // per view: { key, dir }
+  page: {}, // per view: current page of the property list
 };
 
 const validView = (v) => VIEWS.some((x) => x.id === v) ? v : 'overview';
 
 function defaultSub(view) {
-  return (SUBTABS[view] || [{ id: 'all' }])[0].id;
+  const subs = SUBTABS[view] || [];
+  return subs.length ? subs[0].id : '';
 }
 
 function readUrl() {
@@ -503,6 +519,7 @@ function syncUrl() {
 }
 
 function go(view, sub) {
+  if (view !== state.view) state.page = {};
   state.view = validView(view);
   state.sub = sub || defaultSub(state.view);
   closeDrawer();
@@ -546,37 +563,6 @@ function statusColumns(rows) {
   return cols;
 }
 
-/** Build the MIS pivot: one row per key, one count per status, plus totals. */
-function buildPivot(rows, field, statuses) {
-  const map = new Map();
-  for (const r of rows) {
-    const key = r[field] || BLANK;
-    let e = map.get(key);
-    if (!e) {
-      e = { key, total: 0, counts: Object.fromEntries(statuses.map((s) => [s, 0])) };
-      map.set(key, e);
-    }
-    if (e.counts[r.__status] === undefined) e.counts[r.__status] = 0;
-    e.counts[r.__status] += 1;
-    e.total += 1;
-  }
-
-  const list = [...map.values()].map((e) => ({
-    ...e,
-    validPct: e.total ? (e.counts['Valid'] || 0) * 100 / e.total : null,
-  }));
-  list.sort((a, b) => cmp(a.key, b.key));
-
-  const grand = { key: 'Grand Total', total: 0, counts: Object.fromEntries(statuses.map((s) => [s, 0])) };
-  for (const e of list) {
-    grand.total += e.total;
-    for (const s of statuses) grand.counts[s] += e.counts[s] || 0;
-  }
-  grand.validPct = grand.total ? (grand.counts['Valid'] || 0) * 100 / grand.total : null;
-
-  return { list, grand, statuses };
-}
-
 function uniqueValues(field, skip) {
   const rows = filterRows(skip);
   const counts = new Map();
@@ -589,31 +575,6 @@ function uniqueValues(field, skip) {
 }
 
 /* 7 ----------------------------------------------------------- UI primitives - */
-
-/** Excel-style 3-colour scale (red → yellow → green) for the Valid % column. */
-function makeScale(values) {
-  const nums = values.filter((v) => typeof v === 'number' && !Number.isNaN(v)).sort((a, b) => a - b);
-  if (!nums.length) return () => '';
-  const min = nums[0];
-  const max = nums[nums.length - 1];
-  const mid = nums[Math.floor(nums.length / 2)];
-  const stops = [
-    { at: min, rgb: [248, 105, 107] },
-    { at: mid, rgb: [255, 235, 132] },
-    { at: max, rgb: [ 99, 190, 123] },
-  ];
-  return (v) => {
-    if (typeof v !== 'number' || Number.isNaN(v)) return '';
-    if (max === min) return 'rgb(99,190,123)';
-    const i = v <= mid ? 0 : 1;
-    const a = stops[i];
-    const b = stops[i + 1];
-    const span = b.at - a.at;
-    const t = span === 0 ? 1 : Math.min(1, Math.max(0, (v - a.at) / span));
-    const c = a.rgb.map((ch, k) => Math.round(ch + (b.rgb[k] - ch) * t));
-    return `rgb(${c.join(',')})`;
-  };
-}
 
 /**
  * Multi-select dropdown: search, select-all/clear, live counts, and a trigger
@@ -746,72 +707,8 @@ document.addEventListener('click', (e) => {
 });
 
 /** Sortable, frozen-first-column pivot table shared by the KAM and Squad tabs. */
-function pivotTable(pivot, labelHeader) {
-  const sort = state.sort[state.view] || { key: '__label', dir: 'asc' };
-  const cols = [
-    { key: '__label', label: labelHeader, freeze: true },
-    ...pivot.statuses.map((s) => ({ key: s, label: s })),
-    { key: '__total', label: 'Grand Total' },
-    { key: '__pct',   label: 'Agreement Valid %' },
-  ];
-
-  const rows = pivot.list.slice().sort((a, b) => {
-    const dir = sort.dir === 'desc' ? -1 : 1;
-    if (sort.key === '__label') return dir * cmp(a.key, b.key);
-    const av = sort.key === '__total' ? a.total : sort.key === '__pct' ? (a.validPct ?? -1) : (a.counts[sort.key] || 0);
-    const bv = sort.key === '__total' ? b.total : sort.key === '__pct' ? (b.validPct ?? -1) : (b.counts[sort.key] || 0);
-    return av === bv ? cmp(a.key, b.key) : dir * (av - bv);
-  });
-
-  const scale = makeScale(rows.map((r) => r.validPct));
-
-  const headCells = cols.map((c) => {
-    const active = sort.key === c.key;
-    const th = el('th', {
-      scope: 'col',
-      class: `sortable${c.freeze ? ' freeze' : ''}`,
-      'aria-sort': active ? (sort.dir === 'asc' ? 'ascending' : 'descending') : 'none',
-      title: `Sort by ${c.label}`,
-    }, [c.label, el('span', { class: 'sort-arrow', text: active ? (sort.dir === 'asc' ? '▲' : '▼') : '⇅' })]);
-    th.addEventListener('click', () => {
-      const same = sort.key === c.key;
-      // names read best A→Z first; numbers read best biggest-first
-      const firstDir = c.key === '__label' ? 'asc' : 'desc';
-      state.sort[state.view] = { key: c.key, dir: same ? (sort.dir === 'asc' ? 'desc' : 'asc') : firstDir };
-      renderView();
-    });
-    return th;
-  });
-
-  const body = rows.map((r) => el('tr', {}, [
-    el('td', { class: 'freeze', 'data-label': labelHeader, text: r.key }),
-    ...pivot.statuses.map((s) => {
-      const v = r.counts[s] || 0;
-      return el('td', { class: v ? '' : 'zero', 'data-label': s, text: v ? fmtInt(v) : '–' });
-    }),
-    el('td', { 'data-label': 'Grand Total', text: fmtInt(r.total) }),
-    (() => {
-      const td = el('td', { class: 'pct-cell', 'data-label': 'Agreement Valid %', text: fmtPct(r.validPct) });
-      td.style.background = scale(r.validPct);
-      return td;
-    })(),
-  ]));
-
-  const foot = el('tr', {}, [
-    el('td', { class: 'freeze', text: 'Grand Total' }),
-    ...pivot.statuses.map((s) => el('td', { text: pivot.grand.counts[s] ? fmtInt(pivot.grand.counts[s]) : '–' })),
-    el('td', { text: fmtInt(pivot.grand.total) }),
-    el('td', { class: 'pct-cell', text: fmtPct(pivot.grand.validPct) }),
-  ]);
-
-  const table = el('table', { class: 'grid' }, [
-    el('thead', {}, [el('tr', {}, headCells)]),
-    el('tbody', {}, body.length ? body : [el('tr', {}, [el('td', { colspan: cols.length, class: 'freeze', text: 'No rows match the current filters.' })])]),
-    el('tfoot', {}, [foot]),
-  ]);
-
-  return el('div', { class: 'table-wrap' }, [table]);
-}
+/* Rows per page in every property list. */
+const PAGE_ROWS = 25;
 
 function statusPill(status) {
   const c = STATUS_COLOR[status] || '#d6cec2';
@@ -823,67 +720,212 @@ function statusPill(status) {
   });
 }
 
-/** Row-level property table. Restacks into cards under 540px via data-label. */
-function propertyTable(rows) {
-  const head = ['Property', 'Squad', 'KAM', 'Agreement status', 'Link'];
-  const capped = rows.slice(0, 500);
+/* ---- links that open a filtered Property Details tab in this same browser -- */
 
-  const body = capped.map((r) => el('tr', {}, [
+const DETAIL_TAB = 'vista-tracker-details';
+
+/** URL for Property Details pre-filtered by the given dimensions. */
+function detailHref({ status, squad, kam, live } = {}) {
+  const p = new URLSearchParams();
+  p.set('view', live ? 'live-properties' : 'properties');
+  const squads   = squad ? [squad] : state.filters.squads;
+  const kams     = kam   ? [kam]   : state.filters.kams;
+  const statuses = status ? [status] : state.filters.statuses;
+  if (squads.length)   p.set('squad',  squads.join('~'));
+  if (kams.length)     p.set('kam',    kams.join('~'));
+  if (statuses.length) p.set('status', statuses.join('~'));
+  if (state.search) p.set('q', state.search);
+  return `${location.pathname}?${p.toString()}`;
+}
+
+/**
+ * A clickable summary card. Uses a named window target so it lands in another
+ * tab of the SAME browser window, and reuses that tab on every later click.
+ */
+function statCard({ label, value, sub, accent, filter, highlight }) {
+  const cls = ['stat', accent ? `accent-${accent}` : '', highlight ? 'stat-hero' : '', filter ? 'stat-link' : '']
+    .filter(Boolean).join(' ');
+  const body = [
+    el('div', { class: 's-label' }, [label, filter ? el('span', { class: 'ext', text: '↗' }) : null]),
+    el('div', { class: 's-value', text: value }),
+    sub ? el('div', { class: 's-sub', text: sub }) : null,
+  ];
+  if (!filter) return el('div', { class: cls }, body);
+  return el('a', {
+    class: cls,
+    href: detailHref(filter),
+    target: DETAIL_TAB,
+    title: 'Opens the matching properties in another tab of this browser',
+  }, body);
+}
+
+/** The agreement status cards shown at the top of every summary page. */
+function statusCards(rows, { live } = {}) {
+  const statuses = statusColumns(rows);
+  const counts = Object.fromEntries(statuses.map((st) => [st, 0]));
+  for (const r of rows) counts[r.__status] = (counts[r.__status] || 0) + 1;
+  const total = rows.length;
+
+  const grid = el('div', { class: 'stat-grid' });
+  for (const st of statuses) {
+    const n = counts[st] || 0;
+    if (!n && st === UNMAPPED) continue;
+    grid.append(statCard({
+      label: st,
+      value: fmtInt(n),
+      sub: fmtPct(total ? n * 100 / total : null) + ' of scope',
+      accent: STATUS_ACCENT[st],
+      filter: { status: st, live },
+    }));
+  }
+  return grid;
+}
+
+const STATUS_ACCENT = {
+  'Valid': 'good',
+  'To Expire': 'warn',
+  'Expired': 'bad',
+  'Not Signed': 'bad',
+  'Email Confirmation': 'sky',
+  'Founder/Partner Approved': 'violet',
+  [UNMAPPED]: '',
+};
+
+/** Per-squad / per-KAM card: total plus a mini status breakdown. */
+function groupCard(entry, dimension) {
+  const filter = dimension === 'squad' ? { squad: entry.key } : { kam: entry.key };
+  const statuses = entry.statuses;
+
+  const bar = el('div', { class: 'mini-bar' });
+  for (const st of statuses) {
+    const n = entry.counts[st] || 0;
+    if (!n) continue;
+    bar.append(el('div', {
+      class: 'mini-seg',
+      style: `width:${n * 100 / entry.total}%; background:${STATUS_COLOR[st]}`,
+      title: `${st}: ${fmtInt(n)}`,
+    }));
+  }
+
+  const chips = statuses.filter((st) => entry.counts[st]).map((st) => el('span', { class: 'mini-chip' }, [
+    el('span', { class: 'mini-dot', style: `background:${STATUS_COLOR[st]}` }),
+    el('span', { class: 'mini-name', text: st }),
+    el('span', { class: 'mini-n', text: fmtInt(entry.counts[st]) }),
+  ]));
+
+  return el('a', {
+    class: 'group-card',
+    href: detailHref(filter),
+    target: DETAIL_TAB,
+    title: `Open ${entry.key} in another tab of this browser`,
+  }, [
+    el('div', { class: 'gc-head' }, [
+      el('div', { class: 'gc-name', text: entry.key }),
+      el('div', { class: 'gc-total' }, [fmtInt(entry.total), el('span', { class: 'ext', text: '↗' })]),
+    ]),
+    bar,
+    el('div', { class: 'gc-chips' }, chips),
+    el('div', { class: 'gc-foot' }, [
+      el('span', { text: `${fmtInt(entry.counts['Valid'] || 0)} valid` }),
+      el('span', { class: 'gc-pct', text: fmtPct(entry.validPct) }),
+    ]),
+  ]);
+}
+
+/* ---- paginated property list ------------------------------------------- */
+
+function pageKey() { return `${state.view}:${state.sub}`; }
+function currentPage() { return state.page[pageKey()] || 1; }
+function setPage(n) { state.page[pageKey()] = n; renderView(); }
+
+function pager(totalRows) {
+  const pages = Math.max(1, Math.ceil(totalRows / PAGE_ROWS));
+  const page = Math.min(currentPage(), pages);
+  const wrap = el('div', { class: 'pager' });
+  if (pages <= 1) {
+    wrap.append(el('span', { class: 'pager-info', text: `${fmtInt(totalRows)} properties` }));
+    return { wrap, page, pages };
+  }
+
+  const from = (page - 1) * PAGE_ROWS + 1;
+  const to = Math.min(page * PAGE_ROWS, totalRows);
+  wrap.append(el('span', { class: 'pager-info', text: `${fmtInt(from)}–${fmtInt(to)} of ${fmtInt(totalRows)}` }));
+
+  const btn = (label, target, disabled, current) => {
+    const b = el('button', {
+      type: 'button',
+      class: `pager-btn${current ? ' current' : ''}`,
+      disabled: disabled || undefined,
+      'aria-current': current ? 'page' : null,
+      text: label,
+    });
+    if (!disabled && !current) b.addEventListener('click', () => setPage(target));
+    return b;
+  };
+
+  const nums = [];
+  const push = (n) => nums.push(n);
+  push(1);
+  for (let n = page - 1; n <= page + 1; n++) if (n > 1 && n < pages) push(n);
+  if (pages > 1) push(pages);
+  const uniq = [...new Set(nums)].sort((a, b) => a - b);
+
+  const group = el('div', { class: 'pager-btns' }, [btn('‹', page - 1, page === 1)]);
+  let last = 0;
+  for (const n of uniq) {
+    if (n - last > 1) group.append(el('span', { class: 'pager-gap', text: '…' }));
+    group.append(btn(String(n), n, false, n === page));
+    last = n;
+  }
+  group.append(btn('›', page + 1, page === pages));
+  wrap.append(group);
+  return { wrap, page, pages };
+}
+
+/** Row-level property table. Restacks into cards under 540px via data-label. */
+function propertyList(rows, opts = {}) {
+  const { wrap: pagerEl, page } = pager(rows.length);
+  const slice = rows.slice((page - 1) * PAGE_ROWS, page * PAGE_ROWS);
+
+  const head = ['Property', 'Squad', 'POC', 'Agreement status', 'Ends', 'Link'];
+  const body = slice.map((r) => el('tr', {}, [
     el('td', { class: 'freeze', 'data-label': 'Property' }, [
       r.__url
         ? el('a', { class: 'link-out', href: r.__url, target: '_blank', rel: 'noopener noreferrer' }, [r.__property, el('span', { class: 'ext', text: '↗' })])
         : r.__property,
+      r.__code ? el('div', { class: 'row-sub', text: r.__code }) : null,
     ]),
     el('td', { 'data-label': 'Squad', style: 'text-align:left', text: r.__squad }),
-    el('td', { 'data-label': 'KAM', style: 'text-align:left', text: r.__kam }),
-    el('td', { 'data-label': 'Agreement status', style: 'text-align:left' }, [statusPill(r.__status)]),
+    el('td', { 'data-label': 'POC', style: 'text-align:left', text: r.__kam }),
+    el('td', { 'data-label': 'Agreement status', style: 'text-align:left' }, [
+      statusPill(r.__status),
+      r.__reason ? el('div', { class: 'row-sub', text: r.__reason }) : null,
+    ]),
+    el('td', { 'data-label': 'Ends', style: 'text-align:left', text: r.__endDate || '–' }),
     el('td', { 'data-label': 'Link', style: 'text-align:left' }, [
-      r.__url
-        ? el('a', { class: 'link-out', href: r.__url, target: '_blank', rel: 'noopener noreferrer' }, ['Open', el('span', { class: 'ext', text: '↗' })])
+      r.__agreementUrl
+        ? el('a', { class: 'link-out', href: r.__agreementUrl, target: '_blank', rel: 'noopener noreferrer' }, ['Agreement', el('span', { class: 'ext', text: '↗' })])
         : el('span', { class: 'zero', text: '–' }),
     ]),
   ]));
 
   const table = el('table', { class: 'grid stacked' }, [
-    el('thead', {}, [el('tr', {}, head.map((h, i) => el('th', { scope: 'col', class: i === 0 ? 'freeze' : '', style: i ? 'text-align:left' : '', text: h })))]),
+    el('thead', {}, [el('tr', {}, head.map((h, i) =>
+      el('th', { scope: 'col', class: i === 0 ? 'freeze' : '', style: 'text-align:left', text: h })))]),
     el('tbody', {}, body.length ? body : [el('tr', {}, [el('td', { colspan: head.length, class: 'freeze', text: 'No properties match the current filters.' })])]),
   ]);
 
-  const wrap = el('div', { class: 'table-wrap stacked-wrap' }, [table]);
-  if (rows.length > capped.length) {
-    return el('div', {}, [wrap, el('div', { class: 'scroll-hint', style: 'display:block', text: `Showing the first ${fmtInt(capped.length)} of ${fmtInt(rows.length)} properties — narrow the filters to see the rest.` })]);
-  }
-  return wrap;
+  return el('div', { class: 'panel' }, [
+    el('div', { class: 'panel-head' }, [
+      el('h3', { text: opts.title || 'Property details' }),
+      el('span', { class: 'hint right', text: `${fmtInt(rows.length)} properties · ${PAGE_ROWS} per page` }),
+    ]),
+    el('div', { class: 'table-wrap stacked-wrap' }, [table]),
+    pagerEl,
+  ]);
 }
 
 /* 8 -------------------------------------------------------------------- views */
-
-function kpiCard(label, value, sub, accent) {
-  return el('div', { class: `kpi${accent ? ` accent-${accent}` : ''}` }, [
-    el('div', { class: 'k-label', text: label }),
-    el('div', { class: 'k-value', text: value }),
-    sub ? el('div', { class: 'k-sub', text: sub }) : null,
-  ]);
-}
-
-function liveTabHref() {
-  return LIVE_PROPERTIES_URL || `${location.pathname}${urlFor('live-properties', defaultSub('live-properties'))}`;
-}
-
-/** Same card, but a link that opens the Live Properties tab in this browser. */
-function kpiLink(label, value, sub, accent) {
-  return el('a', {
-    class: `kpi kpi-link${accent ? ` accent-${accent}` : ''}`,
-    href: liveTabHref(),
-    target: LIVE_TAB_NAME,
-    rel: LIVE_PROPERTIES_URL ? 'noopener noreferrer' : null,
-    title: 'Opens the Live Properties tab in this browser',
-  }, [
-    el('div', { class: 'k-label' }, [label, el('span', { class: 'ext', text: '↗' })]),
-    el('div', { class: 'k-value', text: value }),
-    sub ? el('div', { class: 'k-sub', text: sub }) : null,
-  ]);
-}
 
 function pageHead(title, desc) {
   return el('div', { class: 'page-head' }, [
@@ -892,151 +934,132 @@ function pageHead(title, desc) {
   ]);
 }
 
-function viewOverview(rows) {
-  const statuses = statusColumns(rows);
-  const counts = Object.fromEntries(statuses.map((s) => [s, 0]));
-  for (const r of rows) counts[r.__status] = (counts[r.__status] || 0) + 1;
-  const total = rows.length;
-  const valid = counts['Valid'] || 0;
-  const needsAction = (counts['Not Signed'] || 0) + (counts['Expired'] || 0) + (counts['To Expire'] || 0);
-
-  const frag = el('div', {}, [
-    pageHead('Agreement summary', 'The same seven buckets as the Acq Master MIS, recalculated live from Supabase. Every filter above applies to all tabs.'),
+function sectionHead(title, hint) {
+  return el('div', { class: 'section-head' }, [
+    el('h3', { text: title }),
+    hint ? el('span', { class: 'hint', text: hint }) : null,
   ]);
-
-  if (state.sub === 'snapshot') {
-    const live    = rows.filter((r) => r.__live === true).length;
-    const notLive = rows.filter((r) => r.__live === false).length;
-    const unknown = rows.filter((r) => r.__live === null).length;
-    const livePct = total ? live * 100 / total : null;
-
-    frag.append(el('div', { class: 'panel' }, [
-      el('div', { class: 'panel-head' }, [
-        el('h3', { text: 'Property summary' }),
-        el('span', { class: 'hint right', text: unknown ? `${fmtInt(unknown)} with no live status` : 'From current_status and live/delist dates' }),
-      ]),
-      el('div', { class: 'panel-body' }, [
-        el('div', { class: 'kpi-grid', style: 'margin-bottom:0' }, [
-          kpiCard('Total properties', fmtInt(total), 'in scope', 'sky'),
-          kpiLink('Live properties', fmtInt(live), `${fmtPct(livePct)} of total`, 'good'),
-          kpiCard('Not live', fmtInt(notLive), 'delisted or paused', 'bad'),
-          kpiCard('Squads', fmtInt(new Set(rows.map((r) => r.__squad)).size), 'in scope'),
-          kpiCard('KAMs', fmtInt(new Set(rows.map((r) => r.__kam)).size), 'in scope'),
-        ]),
-      ]),
-    ]));
-
-    frag.append(
-      el('div', { class: 'panel-head', style: 'padding-left:0; border:0' }, [el('h3', { text: 'Agreement summary' })]),
-      el('div', { class: 'kpi-grid' }, [
-        kpiCard('Grand total', fmtInt(total), 'agreements counted', 'sky'),
-        kpiCard('Valid', fmtInt(valid), fmtPct(total ? valid * 100 / total : null) + ' of total', 'good'),
-        kpiCard('Needs action', fmtInt(needsAction), 'not signed, expired or expiring', 'bad'),
-        kpiCard('Expiring soon', fmtInt(counts['To Expire'] || 0), `within ${EXPIRY_WINDOW_DAYS} days`, 'warn'),
-      ]),
-    );
-
-    const bar = el('div', { class: 'dist-bar' });
-    const legend = el('div', { class: 'dist-legend' });
-    for (const s of statuses) {
-      const n = counts[s] || 0;
-      if (!n) continue;
-      const pct = n * 100 / total;
-      bar.append(el('div', { class: 'dist-seg', style: `width:${pct}%; background:${STATUS_COLOR[s]}`, title: `${s}: ${fmtInt(n)}` }));
-      legend.append(el('div', { class: 'item' }, [
-        el('span', { class: 'swatch', style: `background:${STATUS_COLOR[s]}` }),
-        el('span', { text: s }),
-        el('span', { class: 'n', text: fmtInt(n) }),
-        el('span', { class: 'pct', text: `(${fmtPct(pct)})` }),
-      ]));
-    }
-
-    frag.append(el('div', { class: 'panel' }, [
-      el('div', { class: 'panel-head' }, [
-        el('h3', { text: 'Agreement status split' }),
-        el('span', { class: 'hint right', text: `${fmtInt(total)} properties` }),
-      ]),
-      el('div', { class: 'panel-body' }, [bar, legend]),
-    ]));
-  } else {
-    const table = el('table', { class: 'grid stacked' }, [
-      el('thead', {}, [el('tr', {}, [
-        el('th', { scope: 'col', class: 'freeze', text: 'Agreement status' }),
-        el('th', { scope: 'col', text: 'Properties' }),
-        el('th', { scope: 'col', text: 'Share of total' }),
-      ])]),
-      el('tbody', {}, statuses.map((s) => el('tr', {}, [
-        el('td', { class: 'freeze', 'data-label': 'Status' }, [statusPill(s)]),
-        el('td', { 'data-label': 'Properties', text: fmtInt(counts[s] || 0) }),
-        el('td', { 'data-label': 'Share', text: fmtPct(total ? (counts[s] || 0) * 100 / total : null) }),
-      ]))),
-      el('tfoot', {}, [el('tr', {}, [
-        el('td', { class: 'freeze', text: 'Grand Total' }),
-        el('td', { text: fmtInt(total) }),
-        el('td', { text: '100%' }),
-      ])]),
-    ]);
-
-    frag.append(el('div', { class: 'panel' }, [
-      el('div', { class: 'panel-head' }, [el('h3', { text: 'Status detail' })]),
-      el('div', { class: 'table-wrap stacked-wrap' }, [table]),
-    ]));
-  }
-
-  return frag;
 }
 
-function viewPivot(rows, field, labelHeader, title, desc) {
+/** Aggregate rows by a dimension, newest MIS buckets included. */
+function groupBy(rows, field) {
   const statuses = statusColumns(rows);
-  const pivot = buildPivot(rows, field, statuses);
-  const frag = el('div', {}, [pageHead(title, desc)]);
+  const map = new Map();
+  for (const r of rows) {
+    const key = r[field] || BLANK;
+    if (!map.has(key)) map.set(key, { key, total: 0, statuses, counts: Object.fromEntries(statuses.map((st) => [st, 0])) });
+    const e = map.get(key);
+    if (e.counts[r.__status] === undefined) e.counts[r.__status] = 0;
+    e.counts[r.__status] += 1;
+    e.total += 1;
+  }
+  return [...map.values()]
+    .map((e) => ({ ...e, validPct: e.total ? (e.counts['Valid'] || 0) * 100 / e.total : null }))
+    .sort((a, b) => b.total - a.total || cmp(a.key, b.key));
+}
 
-  if (state.sub === 'ranking') {
-    const ranked = pivot.list.slice().sort((a, b) => (b.validPct ?? -1) - (a.validPct ?? -1) || cmp(a.key, b.key));
-    const scale = makeScale(ranked.map((r) => r.validPct));
-    const body = ranked.map((r, i) => el('tr', {}, [
-      el('td', { class: 'freeze', 'data-label': labelHeader, text: `${i + 1}. ${r.key}` }),
-      el('td', { 'data-label': 'Valid', text: fmtInt(r.counts['Valid'] || 0) }),
-      el('td', { 'data-label': 'Grand Total', text: fmtInt(r.total) }),
-      (() => {
-        const td = el('td', { class: 'pct-cell', 'data-label': 'Agreement Valid %', text: fmtPct(r.validPct) });
-        td.style.background = scale(r.validPct);
-        return td;
-      })(),
-    ]));
+/* ---- Dashboard: live properties only, with a highlighted total ----------- */
 
-    frag.append(el('div', { class: 'panel' }, [
-      el('div', { class: 'panel-head' }, [
-        el('h3', { text: 'Ranked by agreement validity' }),
-        el('span', { class: 'hint right', text: 'Highest valid share first' }),
-      ]),
-      el('div', { class: 'table-wrap stacked-wrap' }, [
-        el('table', { class: 'grid stacked' }, [
-          el('thead', {}, [el('tr', {}, [
-            el('th', { scope: 'col', class: 'freeze', text: labelHeader }),
-            el('th', { scope: 'col', text: 'Valid' }),
-            el('th', { scope: 'col', text: 'Grand Total' }),
-            el('th', { scope: 'col', text: 'Agreement Valid %' }),
-          ])]),
-          el('tbody', {}, body.length ? body : [el('tr', {}, [el('td', { colspan: 4, class: 'freeze', text: 'No rows match the current filters.' })])]),
-        ]),
-      ]),
+function viewOverview(allRows) {
+  const live = allRows.filter((r) => r.__live !== false);
+  const total = allRows.length;
+
+  const frag = el('div', {}, [
+    pageHead('Dashboard', 'Live properties only. Every card opens the matching property details in another tab of this browser.'),
+  ]);
+
+  // hero row: agreement summary on the left, highlighted total on the right
+  const valid = live.filter((r) => r.__status === 'Valid').length;
+  const needsAction = live.filter((r) => ['Not Signed', 'Expired', 'To Expire'].includes(r.__status)).length;
+
+  frag.append(el('div', { class: 'hero-row' }, [
+    el('div', { class: 'hero-main' }, [
+      sectionHead('Agreement summary', `${fmtInt(live.length)} live properties in scope`),
+      statusCards(live, { live: true }),
+    ]),
+    el('div', { class: 'hero-side' }, [
+      statCard({
+        label: 'Total properties',
+        value: fmtInt(total),
+        sub: `${fmtInt(live.length)} live · ${fmtInt(total - live.length)} not live`,
+        highlight: true,
+        filter: {},
+      }),
+      statCard({ label: 'Valid agreements', value: fmtInt(valid), sub: fmtPct(live.length ? valid * 100 / live.length : null) + ' of live', accent: 'good', filter: { status: 'Valid', live: true } }),
+      statCard({ label: 'Needs action', value: fmtInt(needsAction), sub: 'not signed, expired or expiring', accent: 'bad' }),
+    ]),
+  ]));
+
+  // status split bar
+  const statuses = statusColumns(live);
+  const counts = Object.fromEntries(statuses.map((st) => [st, 0]));
+  for (const r of live) counts[r.__status] = (counts[r.__status] || 0) + 1;
+
+  const bar = el('div', { class: 'dist-bar' });
+  const legend = el('div', { class: 'dist-legend' });
+  for (const st of statuses) {
+    const n = counts[st] || 0;
+    if (!n) continue;
+    const pct = n * 100 / live.length;
+    bar.append(el('div', { class: 'dist-seg', style: `width:${pct}%; background:${STATUS_COLOR[st]}`, title: `${st}: ${fmtInt(n)}` }));
+    legend.append(el('div', { class: 'item' }, [
+      el('span', { class: 'swatch', style: `background:${STATUS_COLOR[st]}` }),
+      el('span', { text: st }),
+      el('span', { class: 'n', text: fmtInt(n) }),
+      el('span', { class: 'pct', text: `(${fmtPct(pct)})` }),
     ]));
-    return frag;
   }
 
   frag.append(el('div', { class: 'panel' }, [
     el('div', { class: 'panel-head' }, [
-      el('h3', { text: `${labelHeader} × agreement status` }),
-      el('span', { class: 'hint', text: 'Tap a column heading to sort' }),
-      el('span', { class: 'hint right', text: `${fmtInt(pivot.list.length)} rows · ${fmtInt(pivot.grand.total)} properties` }),
+      el('h3', { text: 'Agreement status split — live properties' }),
+      el('span', { class: 'hint right', text: `${fmtInt(live.length)} properties` }),
     ]),
-    pivotTable(pivot, labelHeader),
-    el('div', { class: 'scroll-hint', text: 'Swipe the table sideways to see every status column.' }),
+    el('div', { class: 'panel-body' }, [bar, legend]),
   ]));
+
+  // squad and POC snapshots
+  frag.append(sectionHead('By squad', 'Tap a card to open that squad'));
+  frag.append(el('div', { class: 'group-grid' }, groupBy(live, '__squad').map((e) => groupCard(e, 'squad'))));
+
+  frag.append(sectionHead('By POC', 'Tap a card to open that POC'));
+  frag.append(el('div', { class: 'group-grid' }, groupBy(live, '__kam').slice(0, 12).map((e) => groupCard(e, 'kam'))));
 
   return frag;
 }
+
+/* ---- Squad-wise / KAM-wise: cards on top, property list below ------------ */
+
+function viewGroup(rows, field, dimension, title, desc) {
+  const groups = groupBy(rows, field);
+
+  return el('div', {}, [
+    pageHead(title, desc),
+    sectionHead('Agreement status', 'Each card opens the matching properties in another tab'),
+    statusCards(rows),
+    sectionHead(dimension === 'squad' ? 'Squads' : 'POCs', `${fmtInt(groups.length)} in scope · tap to open`),
+    el('div', { class: 'group-grid' }, groups.map((e) => groupCard(e, dimension))),
+    propertyList(rows, { title: 'Property details' }),
+  ]);
+}
+
+/* ---- Live Properties: summary cards, then the paginated list ------------- */
+
+function viewLiveProperties(rows) {
+  const hasLiveCol = !!(state.cols.liveStatus || state.cols.liveDate || state.cols.delistDate);
+  const live = hasLiveCol ? rows.filter((r) => r.__live === true) : rows;
+
+  return el('div', {}, [
+    pageHead('Live properties', hasLiveCol
+      ? 'Properties currently live, with their agreement position.'
+      : 'No live/not-live column was found, so every property is listed.'),
+    sectionHead('Agreement summary', `${fmtInt(live.length)} live properties`),
+    statusCards(live, { live: true }),
+    propertyList(live, { title: 'Live property list' }),
+  ]);
+}
+
+/* ---- Property Details: the filtered row-level list ---------------------- */
 
 function viewProperties(rows) {
   const bySub = {
@@ -1049,42 +1072,10 @@ function viewProperties(rows) {
   const shown = bySub ? rows.filter((r) => r.__status === bySub) : rows;
 
   return el('div', {}, [
-    pageHead('Properties', 'Every row behind the summaries. Property links open in a new browser tab.'),
-    el('div', { class: 'panel' }, [
-      el('div', { class: 'panel-head' }, [
-        el('h3', { text: bySub ? `${bySub} agreements` : 'All properties' }),
-        el('span', { class: 'hint right', text: `${fmtInt(shown.length)} properties` }),
-      ]),
-      propertyTable(shown),
-    ]),
-  ]);
-}
-
-function viewLiveProperties(rows) {
-  const hasLiveCol = !!(state.cols.liveStatus || state.cols.liveDate || state.cols.delistDate);
-  const shown = hasLiveCol ? rows.filter((r) => r.__live === true) : rows;
-
-  const statuses = statusColumns(shown);
-  const counts = Object.fromEntries(statuses.map((s) => [s, 0]));
-  for (const r of shown) counts[r.__status] = (counts[r.__status] || 0) + 1;
-
-  return el('div', {}, [
-    pageHead('Live properties', hasLiveCol
-      ? 'Properties currently live, with their agreement status. Filters carry over from the tab you opened this from.'
-      : 'No live/not-live column was found in the table, so every property is listed. Add one to the Acq Master and it will filter here automatically.'),
-    el('div', { class: 'kpi-grid' }, [
-      kpiCard('Live properties', fmtInt(shown.length), 'in scope', 'sky'),
-      kpiCard('Valid', fmtInt(counts['Valid'] || 0), fmtPct(shown.length ? (counts['Valid'] || 0) * 100 / shown.length : null) + ' of live', 'good'),
-      kpiCard('Not signed', fmtInt(counts['Not Signed'] || 0), 'need chasing', 'bad'),
-      kpiCard('Expiring', fmtInt(counts['To Expire'] || 0), 'renew before expiry', 'warn'),
-    ]),
-    el('div', { class: 'panel' }, [
-      el('div', { class: 'panel-head' }, [
-        el('h3', { text: 'Live property list' }),
-        el('span', { class: 'hint right', text: `${fmtInt(shown.length)} properties` }),
-      ]),
-      propertyTable(shown),
-    ]),
+    pageHead('Property details', 'Every row behind the summaries. Links open in a new tab.'),
+    sectionHead('Agreement summary', `${fmtInt(shown.length)} properties in scope`),
+    statusCards(shown),
+    propertyList(shown, { title: bySub ? `${bySub} agreements` : 'All properties' }),
   ]);
 }
 
@@ -1312,9 +1303,9 @@ function renderSidebar() {
 
   const rows = activeRows();
   const countFor = {
-    overview: rows.length,
-    kam: new Set(rows.map((r) => r.__kam)).size,
+    overview: rows.filter((r) => r.__live !== false).length,
     squad: new Set(rows.map((r) => r.__squad)).size,
+    kam: new Set(rows.map((r) => r.__kam)).size,
     properties: rows.length,
     'live-properties': rows.filter((r) => r.__live !== false).length,
   };
@@ -1323,26 +1314,6 @@ function renderSidebar() {
     const g = el('div', { class: 'nav-group' }, [el('div', { class: 'nav-label', text: group })]);
 
     for (const v of VIEWS.filter((x) => x.group === group)) {
-      if (v.external) {
-        const external = !!LIVE_PROPERTIES_URL;
-        const href = external ? LIVE_PROPERTIES_URL : `${location.pathname}${urlFor(v.id, defaultSub(v.id))}`;
-        g.append(el('a', {
-          class: 'nav-item',
-          href,
-          // A *named* target opens a tab in this same browser window and reuses
-          // it on later clicks. rel=noopener is only added for third-party URLs;
-          // on our own origin it is what makes some browsers spawn a new window.
-          target: LIVE_TAB_NAME,
-          rel: external ? 'noopener noreferrer' : null,
-          title: 'Opens in another tab of this browser',
-        }, [
-          el('span', { class: 'dot' }),
-          el('span', { class: 'label', text: v.label }),
-          el('span', { class: 'nav-count', text: fmtInt(countFor[v.id] ?? 0) }),
-          el('span', { class: 'ext', text: '↗' }),
-        ]));
-        continue;
-      }
 
       const a = el('a', {
         class: 'nav-item',
@@ -1536,6 +1507,7 @@ function renderActiveFilters() {
 }
 
 function onFiltersChanged() {
+  state.page = {};
   syncUrl();
   renderSidebar();
   updateFilters();
@@ -1604,13 +1576,13 @@ function renderView() {
     case 'diagnostics':
       root.append(viewDiagnostics());
       return;
-    case 'kam':
-      root.append(viewPivot(rows, '__kam', 'Owner Facing Account Manager', 'KAM-wise summary',
-        'Agreement status by Owner Facing Account Manager, matching the MIS pivot.'));
-      break;
     case 'squad':
-      root.append(viewPivot(rows, '__squad', 'New Squad Mapping', 'Squad-wise summary',
-        'Agreement status by squad, matching the MIS pivot.'));
+      root.append(viewGroup(rows, '__squad', 'squad', 'Squad-wise summary',
+        'Agreement position by squad. Cards open filtered property details in another tab of this browser.'));
+      break;
+    case 'kam':
+      root.append(viewGroup(rows, '__kam', 'kam', 'KAM-wise summary',
+        'Agreement position by Owner Facing POC. Cards open filtered property details in another tab of this browser.'));
       break;
     case 'properties':
       root.append(viewProperties(rows));
