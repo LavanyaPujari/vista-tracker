@@ -7,7 +7,7 @@
 
 /* 1 ------------------------------------------------------------------ tokens */
 :root {
-  --ground:      #faf8f5;
+  --ground:      #faf7f2;   /* SV Warm White */
   --surface:     #ffffff;
   --surface-2:   #f4f1ec;
   --surface-3:   #ebe6de;
@@ -24,9 +24,10 @@
   --head-strong: #b9c4d8;
   --head-ink:    #21324c;
 
-  --sky:         #9cccfb;
-  --bloom:       #e9a0a7;
-  --shine:       #fcd4a8;
+  --sky:         #9ccdfb;   /* SV-Sky */
+  --bloom:       #e9a0a7;   /* SV-Bloom */
+  --shine:       #fdd5a9;   /* SV-Shine */
+  --sage:        #a8c8a8;   /* SV-Sage */
 
   --good:        #2e7d5b;
   --good-bg:     #e4f1ea;
@@ -215,8 +216,7 @@ a { color: inherit; }
   gap: 12px;
   height: var(--topbar-h);
   padding: 0 18px;
-  background: rgba(250,248,245,.92);
-  backdrop-filter: saturate(1.4) blur(10px);
+  background: var(--ground);
   border-bottom: 1px solid var(--line);
 }
 
@@ -413,9 +413,6 @@ a { color: inherit; }
 
 /* 6 -------------------------------------------------------------------- tabs */
 .tab-strip {
-  position: sticky;
-  top: var(--topbar-h);
-  z-index: 30;
   display: flex;
   gap: 4px;
   padding: 0 24px;
@@ -450,11 +447,18 @@ a { color: inherit; }
   border-radius: 2px 2px 0 0;
 }
 
+/* --- one sticky block for the tab strip + filters ------------------------- */
+.sticky-controls {
+  position: sticky;
+  top: var(--topbar-h);
+  z-index: 30;
+  background: var(--ground);
+}
+/* keeps cards from tucking under the block when a card link jumps the page */
+#view-root { scroll-margin-top: calc(var(--topbar-h) + 110px); }
+
 /* 7 ----------------------------------------------------------------- filters */
 .filter-bar {
-  position: sticky;
-  top: calc(var(--topbar-h) + 43px);
-  z-index: 28;
   padding: 12px 24px;
   background: var(--ground);
   border-bottom: 1px solid var(--line);
@@ -1009,7 +1013,6 @@ td.pct-cell { font-weight: 600; }
 
   #view-root { padding: 16px 14px 34px; }
   .tab-strip, .filter-bar { padding-left: 14px; padding-right: 14px; }
-  .filter-bar { top: calc(var(--topbar-h) + 42px); }
 
   .page-head h2 { font-size: 19px; }
   .kpi-grid { grid-template-columns: repeat(auto-fit, minmax(132px, 1fr)); gap: 9px; }
@@ -1092,8 +1095,9 @@ td.pct-cell { font-weight: 600; }
 
 /* 13 ------------------------------------------- refresh control & link cards */
 .stamp {
-  font-size: 11.5px;
-  color: var(--muted-2);
+  font-size: 12px;
+  color: var(--ink-2);
+  font-weight: 500;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
@@ -1186,7 +1190,8 @@ td.pct-cell { font-weight: 600; }
 .stat.accent-warn   { box-shadow: var(--shadow-1), inset 3px 0 0 var(--shine); }
 .stat.accent-bad    { box-shadow: var(--shadow-1), inset 3px 0 0 var(--bloom); }
 .stat.accent-sky    { box-shadow: var(--shadow-1), inset 3px 0 0 var(--sky); }
-.stat.accent-violet { box-shadow: var(--shadow-1), inset 3px 0 0 #c9b8e4; }
+.stat.accent-violet { box-shadow: var(--shadow-1), inset 3px 0 0 var(--sage); }
+.stat.accent-sage   { box-shadow: var(--shadow-1), inset 3px 0 0 var(--sage); }
 
 a.stat-link:hover {
   transform: translateY(-1px);

@@ -47,13 +47,15 @@ const STATUS_ORDER = [
 
 const UNMAPPED = 'Unmapped';
 
+/* Brand palette (StayVista): Sky #9CCDFB · Bloom #E9A0A7 · Shine #FDD5A9 ·
+   Sage #A8C8A8. Reds/greens are darkened brand-adjacent tones for legibility. */
 const STATUS_COLOR = {
-  'Email Confirmation':       '#9cccfb',
-  'Expired':                  '#b4433f',
-  'Founder/Partner Approved': '#c9b8e4',
-  'Not Signed':               '#e9a0a7',
-  'To Expire':                '#fcd4a8',
-  'Valid':                    '#2e7d5b',
+  'Email Confirmation':       '#9ccdfb', // SV-Sky
+  'Expired':                  '#c65f5b', // deepened bloom-red, legible on white
+  'Founder/Partner Approved': '#a8c8a8', // SV-Sage
+  'Not Signed':               '#e9a0a7', // SV-Bloom
+  'To Expire':                '#fdd5a9', // SV-Shine
+  'Valid':                    '#3f8f6b', // deepened sage-green
   [UNMAPPED]:                 '#d6cec2',
 };
 
@@ -304,19 +306,31 @@ function resolveAgreementStatus(row, cols, now, windowDays) {
   return { status: UNMAPPED, source: null };
 }
 
-/** A property is live unless current_status says otherwise, or it is delisted. */
+/**
+ * Live / not live / unknown.
+ *
+ * Deliberately strict: a row is only live if something actually says so. An
+ * unreadable status used to fall through to "has a live date, therefore live",
+ * which quietly inflated the live count above what the sheet reports.
+ */
 function resolveLive(row, cols, now) {
-  const label = norm(cols.liveStatus ? row[cols.liveStatus] : '');
-  if (label) {
-    if (label.includes('delist') || label.includes('churn') || label.includes('exit') || label.includes('inactive') || label.includes('notlive')) return false;
-    if (label.includes('pause') || label.includes('hold')) return false;
-    if (label.includes('live') || label.includes('active')) return true;
-  }
+  // being delisted overrides everything else
   const delist = parseDate(cols.delistDate ? row[cols.delistDate] : null);
   if (delist && delist <= now) return false;
+
+  const label = norm(cols.liveStatus ? row[cols.liveStatus] : '');
+  if (label) {
+    if (label.includes('delist') || label.includes('churn') || label.includes('exit')
+      || label.includes('inactive') || label.includes('notlive') || label.includes('terminat')) return false;
+    if (label.includes('pause') || label.includes('hold')) return false;
+    if (label.includes('live') || label.includes('active')) return true;
+    return null;   // there IS a status, we just don't recognise it — don't guess
+  }
+
+  // no status column value at all: fall back to the live date
   const live = parseDate(cols.liveDate ? row[cols.liveDate] : null);
   if (live) return live <= now;
-  return label ? false : null; // null = cannot tell
+  return null;
 }
 
 /**
@@ -504,13 +518,7 @@ const SUBTABS = {
   squad:           [],
   kam:             [],
   'live-properties': [],
-  properties:      [
-    { id: 'all',        label: 'All' },
-    { id: 'notsigned',  label: 'Not signed' },
-    { id: 'expired',    label: 'Expired' },
-    { id: 'toexpire',   label: 'To expire' },
-    { id: 'valid',      label: 'Valid' },
-  ],
+  properties:      [],   // status filtering comes from the cards + the STATUS filter
   diagnostics: [
     { id: 'connection', label: 'Connection' },
     { id: 'columns',    label: 'Columns' },
@@ -843,7 +851,7 @@ const STATUS_ACCENT = {
   'Expired': 'bad',
   'Not Signed': 'bad',
   'Email Confirmation': 'sky',
-  'Founder/Partner Approved': 'violet',
+  'Founder/Partner Approved': 'sage',
   [UNMAPPED]: '',
 };
 
@@ -1017,7 +1025,9 @@ function groupBy(rows, field) {
 /* ---- Dashboard: live properties only, with a highlighted total ----------- */
 
 function viewOverview(allRows) {
-  const live = allRows.filter((r) => r.__live !== false);
+  const live    = allRows.filter((r) => r.__live === true);
+  const notLive = allRows.filter((r) => r.__live === false);
+  const unknown = allRows.filter((r) => r.__live === null);
   const total = allRows.length;
 
   const frag = el('div', {}, [
@@ -1037,7 +1047,8 @@ function viewOverview(allRows) {
       statCard({
         label: 'Total properties',
         value: fmtInt(total),
-        sub: `${fmtInt(live.length)} live · ${fmtInt(total - live.length)} not live`,
+        sub: `${fmtInt(live.length)} live · ${fmtInt(notLive.length)} not live`
+          + (unknown.length ? ` · ${fmtInt(unknown.length)} unclear` : ''),
         highlight: true,
         filter: {},
       }),
@@ -1105,10 +1116,21 @@ function viewLiveProperties(rows) {
   const hasLiveCol = !!(state.cols.liveStatus || state.cols.liveDate || state.cols.delistDate);
   const live = hasLiveCol ? rows.filter((r) => r.__live === true) : rows;
 
+  const unclear = hasLiveCol ? rows.filter((r) => r.__live === null).length : 0;
+
   return el('div', {}, [
     pageHead('Live properties', hasLiveCol
       ? 'Properties currently live, with their agreement position.'
       : 'No live/not-live column was found, so every property is listed.'),
+    unclear
+      ? el('div', { class: 'panel' }, [
+          el('div', { class: 'panel-body' }, [
+            el('p', { style: 'margin:0' }, [
+              `${fmtInt(unclear)} propert${unclear === 1 ? 'y is' : 'ies are'} excluded because their status column holds a value this dashboard doesn't recognise as live or not live. Connection check → Status values lists the wording.`,
+            ]),
+          ]),
+        ])
+      : null,
     sectionHead('Agreement summary', `${fmtInt(live.length)} live properties`),
     statusCards(live, { live: true }),
     propertyList(live, { title: 'Live property list' }),
@@ -1118,21 +1140,29 @@ function viewLiveProperties(rows) {
 /* ---- Property Details: the filtered row-level list ---------------------- */
 
 function viewProperties(rows) {
-  const bySub = {
-    notsigned: 'Not Signed',
-    expired:   'Expired',
-    toexpire:  'To Expire',
-    valid:     'Valid',
-  }[state.sub];
+  // A single status in the STATUS filter means we arrived from a card click.
+  // In that focused view the summary cards would all read 0 except one, so
+  // drop them entirely and just show the filtered list.
+  const singleStatus = state.filters.statuses.length === 1 ? state.filters.statuses[0] : null;
 
-  const shown = bySub ? rows.filter((r) => r.__status === bySub) : rows;
-
-  return el('div', {}, [
-    pageHead('Property details', 'Every row behind the summaries. Links open in a new tab.'),
-    sectionHead('Agreement summary', `${fmtInt(shown.length)} properties in scope`),
-    statusCards(shown),
-    propertyList(shown, { title: bySub ? `${bySub} agreements` : 'All properties' }),
+  const frag = el('div', {}, [
+    pageHead(
+      singleStatus ? `${singleStatus} properties` : 'Property details',
+      singleStatus
+        ? `Showing only properties with agreement status “${singleStatus}”. Clear the status filter to see the full summary.`
+        : 'Every row behind the summaries. Links open in a new tab.'
+    ),
   ]);
+
+  if (!singleStatus) {
+    frag.append(
+      sectionHead('Agreement summary', `${fmtInt(rows.length)} properties in scope`),
+      statusCards(rows),
+    );
+  }
+
+  frag.append(propertyList(rows, { title: singleStatus ? `${singleStatus} agreements` : 'All properties' }));
+  return frag;
 }
 
 /* diagnostics ------------------------------------------------------------- */
@@ -1389,11 +1419,11 @@ function renderSidebar() {
 
   const rows = activeRows();
   const countFor = {
-    overview: rows.filter((r) => r.__live !== false).length,
+    overview: rows.filter((r) => r.__live === true).length,
     squad: new Set(rows.map((r) => r.__squad)).size,
     kam: new Set(rows.map((r) => r.__kam)).size,
     properties: rows.length,
-    'live-properties': rows.filter((r) => r.__live !== false).length,
+    'live-properties': rows.filter((r) => r.__live === true).length,
   };
 
   for (const group of ['Summary', 'Detail', 'Setup']) {
@@ -1815,11 +1845,17 @@ function paintRefresh() {
   btn.setAttribute('aria-busy', state.refreshing ? 'true' : 'false');
   btn.title = state.refreshing ? 'Reloading from Supabase…' : 'Reload from Supabase';
   if (stamp) {
-    stamp.textContent = state.refreshing
-      ? 'Refreshing…'
-      : state.loadedAt
-        ? `Updated ${state.loadedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
-        : '';
+    if (state.refreshing) {
+      stamp.textContent = 'Refreshing…';
+    } else if (state.loadedAt) {
+      const live = state.rows.filter((r) => r.__live === true).length;
+      const total = state.rows.length;
+      const time = state.loadedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      // dynamic header: live/total straight from the last Supabase pull
+      stamp.textContent = `${fmtInt(live)} live · ${fmtInt(total)} total · ${time}`;
+    } else {
+      stamp.textContent = '';
+    }
   }
 }
 

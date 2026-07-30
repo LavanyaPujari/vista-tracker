@@ -51,8 +51,11 @@
     <aside class="sidebar" id="sidebar" aria-label="Sections"></aside>
     <div class="scrim" id="scrim" hidden></div>
     <div class="main-area">
-      <div class="tab-strip" id="tab-strip"></div>
-      <div class="filter-bar" id="filter-bar"></div>
+      <!-- one sticky block, so removing the tab strip can't misalign the filters -->
+      <div class="sticky-controls">
+        <div class="tab-strip" id="tab-strip"></div>
+        <div class="filter-bar" id="filter-bar"></div>
+      </div>
       <main id="view-root"></main>
     </div>
   </div>
