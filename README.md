@@ -66,28 +66,25 @@ Opens at `http://localhost:5173` with live-reload.
 ### Left-hand tabs
 | Tab | What it shows |
 |---|---|
-| **Overview** | Property summary (total / live / not live) + agreement summary + status split. Sub-tabs: Snapshot, Status detail |
-| **KAM-wise Summary** | The MIS pivot by Owner Facing Account Manager. Sub-tabs: Counts, Valid % ranking |
-| **Squad-wise Summary** | The MIS pivot by New Squad Mapping. Same sub-tabs |
-| **Properties** | Every underlying row. Sub-tabs: All / Not signed / Expired / To expire / Valid |
-| **Live Properties** | Opens in another tab of the same browser window, carrying the current filters |
+| **Dashboard** | Live properties only. Agreement summary cards, a highlighted Total Properties card top-right, the status split, then squad and POC cards |
+| **Squad-wise** | Agreement status cards, then one card per squad, then the property list (25 per page) |
+| **KAM-wise** | The same, grouped by Owner Facing POC |
+| **Live Properties** | Agreement summary cards, then the live property list (25 per page) |
+| **Property Details** | The filtered row-level list. Sub-tabs: All / Not signed / Expired / To expire / Valid |
 | **Connection check** | Under Setup — what was fetched, how each column mapped, why each status was assigned |
 
-### Agreement Summary columns
-Both summaries reproduce the MIS pivot, in MIS order:
+The MIS-style pivot tables are gone, along with the Counts and Valid % tabs.
+Every summary is now cards.
 
-`Email Confirmation · Expired · Founder/Partner Approved · Not Signed ·
-To Expire · Valid · Grand Total · Agreement Valid %`
+### Clickable cards
+Status cards and squad/POC cards are links. They open **Property Details**
+pre-filtered to that card, in another tab of the same browser window, using a
+named window target (`vista-tracker-details`) so repeat clicks reuse that one
+tab instead of stacking up new ones.
 
-`Agreement Valid %` = Valid ÷ Grand Total, with the same red→yellow→green
-colour scale Excel applies in the source MIS. Column headings are sortable.
-
-Raw status text is normalised before counting, so sheet spellings like
-`Not signed`, `not_signed`, `Founder / Partner approved` or `valid` all land in
-the right bucket. Anything genuinely unrecognised appears in an extra
-**Unmapped** column — if that column shows up, a new status value has been
-added to the Acq Master and `normalizeStatus()` in `src/main.js` needs one more
-line.
+### Pagination
+Every property list shows 25 rows per page with first/last/adjacent page
+buttons. Changing a filter or switching tabs resets to page 1.
 
 ### Filters
 Squad, KAM and Status are multi-select dropdowns with a search box, Select all
@@ -181,7 +178,7 @@ each field falls back to looser patterns if a column is ever renamed.
 | Used for | Column | Required |
 |---|---|---|
 | Squad-wise summary | `squad` | yes |
-| KAM-wise summary | `poc` | yes |
+| KAM-wise summary | `Owner Facing Account Manager`, then `Owner Facing Ops POC`, then `poc` | yes |
 | Pre-signature statuses | `contract_signing_status` | yes |
 | Valid / expiry statuses | `contract_lifecycle_status` | no |
 | Expiry fallback | `agreement_end_date` | no |
@@ -285,3 +282,54 @@ It uses a **named window target** (`vista-tracker-live`) rather than
 same tab on every later click, instead of stacking up tabs or — as some browsers
 do when `rel="noopener"` is set on a same-origin link — detaching a whole new
 window. The Live properties card on the Overview opens the same tab.
+
+---
+
+## The Apps Script sync (`apps-script/Code.gs`)
+
+Reads **Acq Master**, headers on row 2, data from row 3, `Property ID`
+mandatory, empty cells written as `null`. Same delete-then-insert approach and
+the same 85% row-count safety guard as before.
+
+### What changed
+
+**It no longer assumes sheet headers are the Supabase column names.** On every
+run it reads the live column list from Supabase's OpenAPI document and maps each
+header onto a real column:
+
+1. an explicit entry in `HEADER_OVERRIDES`
+2. an exact match after normalising (`Property ID` → `property_id`)
+3. the snake_case form of the header
+4. otherwise the field is skipped and named in the log
+
+A renamed column now costs you one skipped field and a log line instead of a
+400 that kills the sync.
+
+**POC comes from the Owner Facing columns.** Any header matching
+`Owner Facing Account Manager`, then `Owner Facing POC`, then `Owner Facing Ops`
+is tried in that order; the first non-empty value is written to `poc`. If the
+primary is blank the next one fills it.
+
+**Dates are formatted properly.** The old script did `String(val)` on a Date
+cell, which produced `Mon Jul 29 2026 00:00:00 GMT+0530` and would not load into
+a `date` column. Dates now go over as `yyyy-MM-dd`.
+
+**The delete filter uses the mapped ID column**, so it stays valid even if
+`property_id` is ever renamed.
+
+### Setup
+
+1. Paste `Code.gs` into the Apps Script editor.
+2. Run `setup()` once, replacing the placeholder URL and key, or set
+   `SUPABASE_URL` / `SUPABASE_KEY` under Project Settings → Script Properties.
+   Use the **service role** key here — this script writes.
+3. Run `previewMapping()`. It writes nothing and logs:
+   - every header and the column it mapped to
+   - anything **SKIPPED** — add those to `HEADER_OVERRIDES`
+   - Supabase columns nothing writes to
+   - which Owner Facing headers feed `poc`
+4. When the mapping looks right, run `syncSheetToSupabase()`, then
+   `createHourlyTrigger()` to keep it live.
+
+Run `previewMapping()` again any time the sheet changes — it is the fastest way
+to see what a rename broke.
