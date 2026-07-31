@@ -211,6 +211,9 @@ function resolveColumns(sample) {
 function normalizeStatus(raw) {
   const n = norm(raw);
   if (!n) return '';
+  // "Not live yet" is a pre-agreement state in the Contract Status column;
+  // group it with Not Signed rather than dropping it to Unmapped.
+  if (n.includes('notliveyet') || n.includes('notyetlive')) return 'Not Signed';
   if (n.includes('emailconfirm') || n.includes('confirmationemail') || n.includes('confirmationmail')) return 'Email Confirmation';
   if (n.includes('founder') || n.includes('partnerapproved') || n.includes('partnerapproval')) return 'Founder/Partner Approved';
   if (n.includes('notsigned') || n.includes('unsigned') || n.includes('yettosign') || n.includes('pendingsignature') || n.includes('nosign')) return 'Not Signed';
@@ -284,26 +287,16 @@ function parseDate(v) {
  * source each row actually used.
  */
 function resolveAgreementStatus(row, cols, now, windowDays) {
+  // The MIS counts agreement status from ONE column only (Contract Status),
+  // taken at face value. We do the same — no end-date logic, or the dashboard
+  // drifts away from the sheet the team trusts.
+  const primary = normalizeStatus(cols.lifecycle ? row[cols.lifecycle] : '');
+  if (primary) return { status: primary, source: cols.lifecycle };
+
+  // only if that column is genuinely empty, fall back to the signing column
   const signing = normalizeStatus(cols.signing ? row[cols.signing] : '');
-  if (signing === 'Not Signed' || signing === 'Email Confirmation' || signing === 'Founder/Partner Approved') {
-    return { status: signing, source: cols.signing };
-  }
-
-  const lifecycle = normalizeStatus(cols.lifecycle ? row[cols.lifecycle] : '');
-  if (lifecycle === 'Valid' || lifecycle === 'To Expire' || lifecycle === 'Expired') {
-    return { status: lifecycle, source: cols.lifecycle };
-  }
-
-  const end = parseDate(cols.endDate ? row[cols.endDate] : null);
-  if (end) {
-    const days = Math.floor((end - now) / DAY);
-    if (days < 0) return { status: 'Expired', source: `${cols.endDate} (date)` };
-    if (days <= windowDays) return { status: 'To Expire', source: `${cols.endDate} (date)` };
-    return { status: 'Valid', source: `${cols.endDate} (date)` };
-  }
-
   if (signing) return { status: signing, source: cols.signing };
-  if (lifecycle) return { status: lifecycle, source: cols.lifecycle };
+
   return { status: UNMAPPED, source: null };
 }
 
@@ -321,11 +314,15 @@ function resolveLive(row, cols, now) {
 
   const label = norm(cols.liveStatus ? row[cols.liveStatus] : '');
   if (label) {
+    // Order matters: "never went live" contains "live", so exclude it first.
+    if (label.includes('neverwentlive') || label.includes('neverlive')) return false;
     if (label.includes('delist') || label.includes('churn') || label.includes('exit')
       || label.includes('inactive') || label.includes('notlive') || label.includes('terminat')) return false;
     if (label.includes('pause') || label.includes('hold')) return false;
-    if (label.includes('live') || label.includes('active')) return true;
-    return null;   // there IS a status, we just don't recognise it — don't guess
+    if (label.includes('handedover') || label.includes('handover')) return false;
+    if (label === 'tac' || label.includes('tac')) return false;
+    if (label === 'live' || label.includes('active')) return true;
+    return null;   // a status we genuinely don't recognise — don't guess
   }
 
   // no status column value at all: fall back to the live date
