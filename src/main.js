@@ -36,13 +36,14 @@ const PAGE_SIZE = 1000; // Supabase returns at most 1000 rows per request
 const EXPIRY_WINDOW_DAYS = Number(ENV.VITE_EXPIRY_WINDOW_DAYS) || 90;
 
 /* The seven MIS columns, in MIS order. "Grand Total" is derived. */
+/* Card display order requested by the team. Internal bucket names in comments. */
 const STATUS_ORDER = [
-  'Email Confirmation',
-  'Expired',
-  'Founder/Partner Approved',
-  'Not Signed',
-  'To Expire',
-  'Valid',
+  'Valid',                     // 1. Valid
+  'Founder/Partner Approved',  // 2. Founder Approved
+  'Not Signed',                // 3. Pending
+  'To Expire',                 // 4. Expiring Soon
+  'Expired',                   // 5. Expired
+  'Email Confirmation',        // 6. Draft / In Progress
 ];
 
 const UNMAPPED = 'Unmapped';
@@ -392,6 +393,9 @@ function normalizeRows(raw, cols) {
       __agreementUrl: clean(cols.agreementUrl ? r[cols.agreementUrl] : ''),
       __reason:   clean(cols.reason   ? r[cols.reason]   : ''),
       __endDate:  cols.endDate ? clean(r[cols.endDate]) : '',
+      __liveDateObj: parseDate(cols.liveDate ? r[cols.liveDate] : null),
+      __endDateObj:  parseDate(cols.endDate ? r[cols.endDate] : null),
+      __delistObj:   parseDate(cols.delistDate ? r[cols.delistDate] : null),
       __live:     resolveLive(r, cols, now),
       __raw: r,
     };
@@ -538,6 +542,7 @@ const state = {
   view: 'overview',
   sub: 'snapshot',
   filters: { squads: [], kams: [], statuses: [] },
+  period: { month: '', year: '' },   // filter on live_date
   search: '',
   sort: {}, // per view: { key, dir }
   page: {}, // per view: current page of the property list
@@ -560,6 +565,8 @@ function readUrl() {
   state.filters.squads   = split(p.get('squad'));
   state.filters.kams     = split(p.get('kam'));
   state.filters.statuses = split(p.get('status'));
+  state.period.month = p.get('m') || '';
+  state.period.year  = p.get('y') || '';
   state.search = p.get('q') || '';
 }
 
@@ -571,6 +578,8 @@ function urlFor(view, sub) {
   if (state.filters.squads.length)   p.set('squad',  state.filters.squads.join('~'));
   if (state.filters.kams.length)     p.set('kam',    state.filters.kams.join('~'));
   if (state.filters.statuses.length) p.set('status', state.filters.statuses.join('~'));
+  if (state.period.month) p.set('m', state.period.month);
+  if (state.period.year)  p.set('y', state.period.year);
   if (state.search) p.set('q', state.search);
   const qs = p.toString();
   return qs ? `?${qs}` : location.pathname;
@@ -600,12 +609,23 @@ function matchesSearch(r, q) {
 }
 
 /** Rows matching every filter except `skip` — used for cross-filtered counts. */
+function inPeriod(r) {
+  const { month, year } = state.period;
+  if (!month && !year) return true;
+  const d = r.__liveDateObj;
+  if (!d) return false;   // no live date can't match a period filter
+  if (year && String(d.getFullYear()) !== String(year)) return false;
+  if (month && String(d.getMonth() + 1) !== String(month)) return false;
+  return true;
+}
+
 function filterRows(skip = null) {
   const { squads, kams, statuses } = state.filters;
   return state.rows.filter((r) =>
     (skip === 'squad'  || !squads.length   || squads.includes(r.__squad)) &&
     (skip === 'kam'    || !kams.length     || kams.includes(r.__kam)) &&
     (skip === 'status' || !statuses.length || statuses.includes(r.__status)) &&
+    (skip === 'period' || inPeriod(r)) &&
     (skip === 'search' || matchesSearch(r, state.search))
   );
 }
@@ -614,7 +634,7 @@ function activeRows() { return filterRows(null); }
 
 function hasAnyFilter() {
   const f = state.filters;
-  return !!(f.squads.length || f.kams.length || f.statuses.length || state.search);
+  return !!(f.squads.length || f.kams.length || f.statuses.length || state.period.month || state.period.year || state.search);
 }
 
 /** All statuses actually present, in MIS order, plus Unmapped only if it occurs. */
@@ -1020,7 +1040,93 @@ function groupBy(rows, field) {
     .sort((a, b) => b.total - a.total || cmp(a.key, b.key));
 }
 
-/* ---- Dashboard: live properties only, with a highlighted total ----------- */
+/* ---- business metrics (all derived from real columns only) --------------- */
+
+const MS_DAY = 86400000;
+
+function monthStart(d = new Date()) { return new Date(d.getFullYear(), d.getMonth(), 1); }
+
+/** Churn = delisted / total, as the team defined it. */
+function churnRate(rows) {
+  if (!rows.length) return null;
+  const delisted = rows.filter((r) => r.__live === false).length;
+  return delisted * 100 / rows.length;
+}
+
+/** Live agreements whose end date is within the next `days` days. */
+function expiringWithin(rows, days) {
+  const now = new Date();
+  const limit = new Date(now.getTime() + days * MS_DAY);
+  return rows.filter((r) => r.__live === true && r.__endDateObj && r.__endDateObj >= now && r.__endDateObj <= limit).length;
+}
+
+/** Properties that went live since the start of this calendar month. */
+function newLiveThisMonth(rows) {
+  const start = monthStart();
+  return rows.filter((r) => r.__live === true && r.__liveDateObj && r.__liveDateObj >= start).length;
+}
+
+/** Live properties needing attention: not signed, expired, or already lapsed. */
+function atRisk(rows) {
+  const now = new Date();
+  return rows.filter((r) => r.__live === true && (
+    r.__status === 'Not Signed' ||
+    r.__status === 'Expired' ||
+    (r.__endDateObj && r.__endDateObj < now)
+  )).length;
+}
+
+/** The row of quick-read insight cards shared across dashboard/squad/KAM. */
+function insightCards(scopeRows, { live }) {
+  const liveRows = scopeRows.filter((r) => r.__live === true);
+  const grid = el('div', { class: 'stat-grid insight-grid' });
+
+  grid.append(statCard({
+    label: 'Expiring in 30 days', value: fmtInt(expiringWithin(scopeRows, 30)),
+    sub: 'live agreements', accent: 'warn',
+    filter: { status: 'To Expire', live: true },
+  }));
+  grid.append(statCard({
+    label: 'New live this month', value: fmtInt(newLiveThisMonth(scopeRows)),
+    sub: 'went live since ' + monthStart().toLocaleDateString([], { month: 'short', day: 'numeric' }),
+    accent: 'sky',
+  }));
+  grid.append(statCard({
+    label: 'At-risk properties', value: fmtInt(atRisk(scopeRows)),
+    sub: 'not signed, expired or lapsed', accent: 'bad',
+  }));
+  grid.append(statCard({
+    label: 'Valid agreements', value: fmtInt(liveRows.filter((r) => r.__status === 'Valid').length),
+    sub: fmtPct(liveRows.length ? liveRows.filter((r) => r.__status === 'Valid').length * 100 / liveRows.length : null) + ' of live',
+    accent: 'good', filter: { status: 'Valid', live: true },
+  }));
+  return grid;
+}
+
+/**
+ * The prominent Live Properties + Churn pair shown at the top of the dashboard
+ * and, when a squad or KAM is selected, on those pages too.
+ */
+function heroStats(scopeRows, { label } = {}) {
+  const live = scopeRows.filter((r) => r.__live === true).length;
+  const total = scopeRows.length;
+  const churn = churnRate(scopeRows);
+
+  return el('div', { class: 'hero-stats' }, [
+    el('div', { class: 'hero-live' }, [
+      el('div', { class: 's-label', text: label || 'Live properties' }),
+      el('div', { class: 'hero-num', text: fmtInt(live) }),
+      el('div', { class: 's-sub', text: `${fmtPct(total ? live * 100 / total : null)} of ${fmtInt(total)} in scope` }),
+    ]),
+    el('div', { class: 'hero-churn' }, [
+      el('div', { class: 's-label', text: 'Churn rate' }),
+      el('div', { class: 'hero-num', text: fmtPct(churn) }),
+      el('div', { class: 's-sub', text: `${fmtInt(scopeRows.filter((r) => r.__live === false).length)} delisted` }),
+    ]),
+  ]);
+}
+
+/* ---- Dashboard: live properties only, highlighted live + churn ----------- */
 
 function viewOverview(allRows) {
   const hasLiveCol = !!(state.cols.liveStatus || state.cols.liveDate || state.cols.delistDate);
@@ -1030,6 +1136,10 @@ function viewOverview(allRows) {
   const frag = el('div', {}, [
     pageHead('Live properties', 'Live properties only. Every status card opens the matching properties in another tab of this browser.'),
   ]);
+
+  // prominent live count + churn, then the quick-read insight cards
+  frag.append(heroStats(allRows, { label: 'Live properties' }));
+  frag.append(insightCards(allRows, { live: true }));
 
   if (unclear) {
     frag.append(el('div', { class: 'panel' }, [
@@ -1091,14 +1201,28 @@ function viewOverview(allRows) {
 function viewGroup(rows, field, dimension, title, desc) {
   const groups = groupBy(rows, field);
 
-  return el('div', {}, [
-    pageHead(title, desc),
+  // When exactly one squad/KAM is selected, lead with its live count + churn.
+  const selected = dimension === 'squad' ? state.filters.squads : state.filters.kams;
+  const focused = selected.length === 1 ? selected[0] : null;
+
+  const frag = el('div', {}, [pageHead(title, desc)]);
+
+  if (focused) {
+    frag.append(heroStats(rows, { label: `${focused} · live properties` }));
+    frag.append(insightCards(rows, { live: true }));
+  } else {
+    // still keep churn + live visible for the whole scope
+    frag.append(heroStats(rows, { label: 'Live properties' }));
+  }
+
+  frag.append(
     sectionHead('Agreement status', 'Each card opens the matching properties in another tab'),
     statusCards(rows),
     sectionHead(dimension === 'squad' ? 'Squads' : 'KAMs', `${fmtInt(groups.length)} in scope · tap to open`),
     el('div', { class: 'group-grid' }, groups.map((e) => groupCard(e, dimension))),
     propertyList(rows, { title: 'Property details' }),
-  ]);
+  );
+  return frag;
 }
 
 /* ---- Property Details: the filtered row-level list ---------------------- */
@@ -1459,6 +1583,29 @@ function renderFilters() {
   bar.replaceChildren();
   const row = el('div', { class: 'filter-row' });
 
+  // Month + Year period selects (filter on live_date)
+  const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+  const monthSel = el('select', { class: 'period-select', 'aria-label': 'Month' }, [
+    el('option', { value: '', text: 'All months' }),
+    ...MONTHS.map((m, i) => el('option', { value: String(i + 1), text: m })),
+  ]);
+  monthSel.value = state.period.month;
+  monthSel.classList.toggle('active', !!state.period.month);
+  monthSel.addEventListener('change', () => { state.period.month = monthSel.value; onFiltersChanged(); });
+
+  const years = [...new Set(state.rows.map((r) => r.__liveDateObj && r.__liveDateObj.getFullYear()).filter(Boolean))].sort((a, b) => b - a);
+  const yearSel = el('select', { class: 'period-select', 'aria-label': 'Year' }, [
+    el('option', { value: '', text: 'All years' }),
+    ...years.map((y) => el('option', { value: String(y), text: String(y) })),
+  ]);
+  yearSel.value = state.period.year;
+  yearSel.classList.toggle('active', !!state.period.year);
+  yearSel.addEventListener('change', () => { state.period.year = yearSel.value; onFiltersChanged(); });
+
+  row.append(monthSel, yearSel);
+  filterUI.monthSel = monthSel;
+  filterUI.yearSel = yearSel;
+
   for (const [stateKey, cfg] of Object.entries(FILTER_FIELDS)) {
     const ms = multiSelect({
       key: cfg.key,
@@ -1491,6 +1638,7 @@ function renderFilters() {
   const reset = el('button', { type: 'button', class: 'reset-btn', text: 'Reset filters', disabled: !hasAnyFilter() });
   reset.addEventListener('click', () => {
     state.filters = { squads: [], kams: [], statuses: [] };
+    state.period = { month: '', year: '' };
     state.search = '';
     onFiltersChanged();
   });
@@ -1525,6 +1673,8 @@ function updateFilters() {
     filterUI.search.value = state.search;
   }
   if (filterUI.reset) filterUI.reset.disabled = !hasAnyFilter();
+  if (filterUI.monthSel) { filterUI.monthSel.value = state.period.month; filterUI.monthSel.classList.toggle('active', !!state.period.month); }
+  if (filterUI.yearSel) { filterUI.yearSel.value = state.period.year; filterUI.yearSel.classList.toggle('active', !!state.period.year); }
   if (filterUI.note) {
     const shown = activeRows().length;
     filterUI.note.textContent = hasAnyFilter()
@@ -1576,6 +1726,7 @@ function renderActiveFilters() {
   const clearAll = el('button', { class: 'chip-x', type: 'button', 'aria-label': 'Clear all filters', text: '×' });
   clearAll.addEventListener('click', () => {
     state.filters = { squads: [], kams: [], statuses: [] };
+    state.period = { month: '', year: '' };
     state.search = '';
     onFiltersChanged();
   });

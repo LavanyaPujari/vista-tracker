@@ -1371,3 +1371,93 @@ a.stat.stat-hero:hover { box-shadow: var(--shadow-3); }
   .stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .hero-side { grid-template-columns: 1fr; }
 }
+
+/* 15 --------------------------------- hero stats, insight cards, period select */
+
+/* prominent Live + Churn pair */
+.hero-stats {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.hero-live, .hero-churn {
+  padding: 16px 20px 17px;
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-2);
+}
+
+/* Live count — the standout card */
+.hero-live {
+  background: var(--ink);
+  color: var(--ground);
+  position: relative;
+  overflow: hidden;
+}
+.hero-live::after {
+  content: "";
+  position: absolute;
+  right: -30px; top: -30px;
+  width: 130px; height: 130px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(168,200,168,.35), transparent 70%);
+}
+.hero-live .s-label { color: rgba(250,247,242,.66); }
+.hero-live .s-sub { color: rgba(250,247,242,.72); }
+
+/* Churn — top-right, warm accent so it reads as a watch-metric */
+.hero-churn {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-1), inset 3px 0 0 var(--bloom);
+}
+
+.hero-live .s-label, .hero-churn .s-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+.hero-num {
+  margin-top: 6px;
+  font-family: var(--display);
+  font-size: 40px;
+  line-height: 1;
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+.hero-churn .hero-num { color: var(--ink); }
+.hero-live .s-sub, .hero-churn .s-sub { margin-top: 5px; font-size: 12px; }
+
+/* the insight card row */
+.insight-grid { margin-bottom: 6px; }
+
+/* period selects in the filter bar */
+.period-select {
+  flex: 0 0 auto;
+  padding: 8px 30px 8px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  background: var(--surface)
+    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path d='M1 1l4 4 4-4' fill='none' stroke='%237a736b' stroke-width='1.5' stroke-linecap='round'/></svg>")
+    no-repeat right 11px center;
+  font-size: 13px;
+  color: var(--ink);
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+  transition: border-color .14s, box-shadow .14s;
+}
+.period-select:hover { border-color: var(--muted); }
+.period-select:focus { outline: none; border-color: var(--ink); box-shadow: 0 0 0 3px rgba(30,30,30,.06); }
+.period-select.active { border-color: var(--ink); font-weight: 500; }
+
+@media (max-width: 900px) {
+  .hero-stats { grid-template-columns: 1fr 1fr; }
+  .hero-num { font-size: 32px; }
+}
+@media (max-width: 560px) {
+  .hero-stats { grid-template-columns: 1fr; }
+  .period-select { flex: 1 1 46%; min-width: 0; }
+}
