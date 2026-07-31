@@ -1152,7 +1152,9 @@ td.pct-cell { font-weight: 600; }
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(158px, 1fr));
   gap: 10px;
+  margin-bottom: 22px;   /* clear gap before the status-split panel */
 }
+.insight-grid { margin-bottom: 6px; }   /* insights sit tighter to the cards below */
 
 .stat {
   display: block;
@@ -1461,3 +1463,61 @@ a.stat.stat-hero:hover { box-shadow: var(--shadow-3); }
   .hero-stats { grid-template-columns: 1fr; }
   .period-select { flex: 1 1 46%; min-width: 0; }
 }
+
+/* 16 ---------------------------------------------------------- back button */
+.back-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 14px;
+  padding: 7px 14px 7px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ink-2);
+  transition: border-color .14s, background .14s, transform .05s;
+}
+.back-btn:hover { border-color: var(--ink); color: var(--ink); background: var(--surface-2); }
+.back-btn:active { transform: translateY(1px); }
+.back-arrow { font-size: 17px; line-height: 1; margin-top: -1px; }
+
+/* 17 ------------------------------------------------- needs-action cards */
+.action-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+  margin-bottom: 22px;
+}
+.act-card {
+  border-radius: 12px;
+  padding: 15px 17px;
+  text-decoration: none;
+  display: block;
+  transition: transform .05s, box-shadow .14s;
+}
+a.act-card:hover { box-shadow: var(--shadow-2); }
+a.act-card:active { transform: translateY(1px); }
+.act-label {
+  font-size: 13px;
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.act-num {
+  font-family: var(--display);
+  font-size: 30px;
+  line-height: 1;
+  font-weight: 400;
+  margin-top: 6px;
+  font-variant-numeric: tabular-nums;
+}
+.act-card .ext { font-size: 11px; opacity: .55; }
+
+/* tones use the brand-adjacent status colours */
+.tone-danger  { background: #f7e7e6; color: #8f3a37; }
+.tone-warning { background: #fdeede; color: #8a5a1e; }
+.tone-success { background: #e4f0e4; color: #356b46; }
+.tone-danger  .act-num, .tone-warning .act-num, .tone-success .act-num { color: inherit; }

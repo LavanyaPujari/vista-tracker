@@ -541,6 +541,8 @@ const state = {
   filters: { squads: [], kams: [], statuses: [] },
   period: { month: '', year: '' },   // filter on live_date
   search: '',
+  focus: false,        // drilled-in view: back button shown, summary cards hidden
+  returnTo: null,      // where the Back button returns to
   sort: {}, // per view: { key, dir }
   page: {}, // per view: current page of the property list
 };
@@ -565,6 +567,7 @@ function readUrl() {
   state.period.month = p.get('m') || '';
   state.period.year  = p.get('y') || '';
   state.search = p.get('q') || '';
+  state.focus = p.get('focus') === '1';
 }
 
 function urlFor(view, sub) {
@@ -578,6 +581,7 @@ function urlFor(view, sub) {
   if (state.period.month) p.set('m', state.period.month);
   if (state.period.year)  p.set('y', state.period.year);
   if (state.search) p.set('q', state.search);
+  if (state.focus) p.set('focus', '1');
   const qs = p.toString();
   return qs ? `?${qs}` : location.pathname;
 }
@@ -591,6 +595,28 @@ function go(view, sub) {
   state.view = validView(view);
   state.sub = sub || defaultSub(state.view);
   closeDrawer();
+  syncUrl();
+  render();
+  window.scrollTo({ top: 0, behavior: 'auto' });
+}
+
+/** Return from a drilled-in card view to wherever the click came from. */
+function goBack() {
+  const r = state.returnTo;
+  state.focus = false;
+  state.returnTo = null;
+  state.page = {};
+  if (r) {
+    state.filters = r.filters;
+    state.search = r.search;
+    state.view = validView(r.view);
+  } else {
+    // opened directly via a focus URL (e.g. Ctrl-click tab) → go to the summary
+    state.filters = { squads: [], kams: [], statuses: [] };
+    state.search = '';
+    state.view = 'overview';
+  }
+  state.sub = defaultSub(state.view);
   syncUrl();
   render();
   window.scrollTo({ top: 0, behavior: 'auto' });
@@ -806,7 +832,7 @@ const DETAIL_TAB = 'vista-tracker-details';
 /** URL for Property Details pre-filtered by the given dimensions. */
 function detailHref({ status, squad, kam, live } = {}) {
   const p = new URLSearchParams();
-  p.set('view', live ? 'overview' : 'properties');
+  p.set('view', 'properties');   // drilled-in list always lives on Property Details
   const squads   = squad ? [squad] : state.filters.squads;
   const kams     = kam   ? [kam]   : state.filters.kams;
   const statuses = status ? [status] : state.filters.statuses;
@@ -814,12 +840,34 @@ function detailHref({ status, squad, kam, live } = {}) {
   if (kams.length)     p.set('kam',    kams.join('~'));
   if (statuses.length) p.set('status', statuses.join('~'));
   if (state.search) p.set('q', state.search);
+  p.set('focus', '1');   // marks a drilled-in view (back button, cards hidden)
   return `${location.pathname}?${p.toString()}`;
 }
 
 /**
- * A clickable summary card. Uses a named window target so it lands in another
- * tab of the SAME browser window, and reuses that tab on every later click.
+ * Normal click → filter in place (fast, no new tab). It records where we came
+ * from so the Back button can return there, applies the card's filter, and
+ * jumps to Property Details. Modifier/middle clicks fall through to the browser
+ * so Ctrl/Cmd-click still opens the same URL in a genuine new tab.
+ */
+function cardClickHandler(filter) {
+  return (e) => {
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.button === 1) return; // let the browser open a new tab
+    e.preventDefault();
+
+    state.returnTo = { view: state.view, filters: JSON.parse(JSON.stringify(state.filters)), search: state.search };
+    if (filter.status) state.filters.statuses = [filter.status];
+    if (filter.squad)  state.filters.squads = [filter.squad];
+    if (filter.kam)    state.filters.kams = [filter.kam];
+    state.focus = true;
+    state.page = {};
+    go('properties');   // the drilled-in list lives on Property Details
+  };
+}
+
+/**
+ * A clickable summary card. Normal click filters in place; Ctrl/Cmd-click opens
+ * the filtered view in another tab of the same browser window.
  */
 function statCard({ label, value, sub, accent, filter, highlight }) {
   const cls = ['stat', accent ? `accent-${accent}` : '', highlight ? 'stat-hero' : '', filter ? 'stat-link' : '']
@@ -830,12 +878,14 @@ function statCard({ label, value, sub, accent, filter, highlight }) {
     sub ? el('div', { class: 's-sub', text: sub }) : null,
   ];
   if (!filter) return el('div', { class: cls }, body);
-  return el('a', {
+  const a = el('a', {
     class: cls,
     href: detailHref(filter),
     target: DETAIL_TAB,
-    title: 'Opens the matching properties in another tab of this browser',
+    title: 'Click to filter · Ctrl/Cmd-click to open in a new tab',
   }, body);
+  a.addEventListener('click', cardClickHandler(filter));
+  return a;
 }
 
 /** The agreement status cards shown at the top of every summary page. */
@@ -892,11 +942,11 @@ function groupCard(entry, dimension) {
     el('span', { class: 'mini-n', text: fmtInt(entry.counts[st]) }),
   ]));
 
-  return el('a', {
+  const card = el('a', {
     class: 'group-card',
     href: detailHref(filter),
     target: DETAIL_TAB,
-    title: `Open ${entry.key} in another tab of this browser`,
+    title: `Click to filter · Ctrl/Cmd-click for a new tab`,
   }, [
     el('div', { class: 'gc-head' }, [
       el('div', { class: 'gc-name', text: entry.key }),
@@ -909,6 +959,8 @@ function groupCard(entry, dimension) {
       el('span', { class: 'gc-pct', text: fmtPct(entry.validPct) }),
     ]),
   ]);
+  card.addEventListener('click', cardClickHandler(filter));
+  return card;
 }
 
 /* ---- paginated property list ------------------------------------------- */
@@ -1123,72 +1175,60 @@ function heroStats(scopeRows, { label } = {}) {
   ]);
 }
 
-/* ---- Dashboard: live properties only, highlighted live + churn ----------- */
+/* ---- Dashboard: Style 3 — hero number, action cards, status, squads ------ */
+
+/** The coloured "needs action today" row. All values from live data. */
+function actionCards(scopeRows) {
+  const live = scopeRows.filter((r) => r.__live === true);
+  const now = new Date();
+
+  const notSigned = live.filter((r) => r.__status === 'Not Signed').length;
+  const expiring = expiringWithin(scopeRows, 30);
+  const risk = atRisk(scopeRows);
+  const newLive = newLiveThisMonth(scopeRows);
+
+  const card = (label, value, tone, filter) => {
+    const body = [
+      el('div', { class: 'act-label' }, [label, filter ? el('span', { class: 'ext', text: '↗' }) : null]),
+      el('div', { class: 'act-num', text: fmtInt(value) }),
+    ];
+    if (!filter) return el('div', { class: `act-card tone-${tone}` }, body);
+    const a = el('a', { class: `act-card tone-${tone}`, href: detailHref(filter), target: DETAIL_TAB,
+      title: 'Click to filter · Ctrl/Cmd-click for a new tab' }, body);
+    a.addEventListener('click', cardClickHandler(filter));
+    return a;
+  };
+
+  return el('div', { class: 'action-grid' }, [
+    card('Not signed', notSigned, 'danger', { status: 'Not Signed', live: true }),
+    card('Expiring in 30 days', expiring, 'warning', { status: 'To Expire', live: true }),
+    card('At-risk', risk, 'danger', null),
+    card('New live this month', newLive, 'success', null),
+  ]);
+}
 
 function viewOverview(allRows) {
   const hasLiveCol = !!(state.cols.liveStatus || state.cols.liveDate || state.cols.delistDate);
   const live = hasLiveCol ? allRows.filter((r) => r.__live === true) : allRows;
-  const unclear = hasLiveCol ? allRows.filter((r) => r.__live === null).length : 0;
 
   const frag = el('div', {}, [
-    pageHead('Live properties', 'Live properties only. Every status card opens the matching properties in another tab of this browser.'),
+    pageHead('Live properties', 'Everything at a glance. Tap any card to open the matching properties; Ctrl/Cmd-click opens a new tab.'),
   ]);
 
-  // prominent live count + churn, then the quick-read insight cards
+  // 1. hero band: the live number + churn
   frag.append(heroStats(allRows, { label: 'Live properties' }));
-  frag.append(insightCards(allRows, { live: true }));
 
-  if (unclear) {
-    frag.append(el('div', { class: 'panel' }, [
-      el('div', { class: 'panel-body' }, [
-        el('p', { style: 'margin:0' }, [
-          `${fmtInt(unclear)} propert${unclear === 1 ? 'y is' : 'ies are'} excluded because their status column holds a value this dashboard doesn't recognise as live or not live. Connection check → Status values lists the wording.`,
-        ]),
-      ]),
-    ]));
-  }
+  // 2. needs action today
+  frag.append(sectionHead('Needs action today', 'What requires attention right now'));
+  frag.append(actionCards(allRows));
 
-  // agreement status cards (Total / Valid / Needs action hero column removed)
-  frag.append(sectionHead('Agreement summary', `${fmtInt(live.length)} live properties in scope`));
+  // 3. agreement status (quieter reference cards, in the requested order)
+  frag.append(sectionHead('Agreement status', `${fmtInt(live.length)} live properties`));
   frag.append(statusCards(live, { live: true }));
 
-  // status split bar
-  const statuses = statusColumns(live);
-  const counts = Object.fromEntries(statuses.map((st) => [st, 0]));
-  for (const r of live) counts[r.__status] = (counts[r.__status] || 0) + 1;
-
-  const bar = el('div', { class: 'dist-bar' });
-  const legend = el('div', { class: 'dist-legend' });
-  for (const st of statuses) {
-    const n = counts[st] || 0;
-    if (!n) continue;
-    const pct = n * 100 / live.length;
-    bar.append(el('div', { class: 'dist-seg', style: `width:${pct}%; background:${STATUS_COLOR[st]}`, title: `${st}: ${fmtInt(n)}` }));
-    legend.append(el('div', { class: 'item' }, [
-      el('span', { class: 'swatch', style: `background:${STATUS_COLOR[st]}` }),
-      el('span', { text: st }),
-      el('span', { class: 'n', text: fmtInt(n) }),
-      el('span', { class: 'pct', text: `(${fmtPct(pct)})` }),
-    ]));
-  }
-
-  frag.append(el('div', { class: 'panel' }, [
-    el('div', { class: 'panel-head' }, [
-      el('h3', { text: 'Agreement status split — live properties' }),
-      el('span', { class: 'hint right', text: `${fmtInt(live.length)} properties` }),
-    ]),
-    el('div', { class: 'panel-body' }, [bar, legend]),
-  ]));
-
-  // squad and KAM snapshots
+  // 4. by squad
   frag.append(sectionHead('By squad', 'Tap a card to open that squad'));
   frag.append(el('div', { class: 'group-grid' }, groupBy(live, '__squad').map((e) => groupCard(e, 'squad'))));
-
-  frag.append(sectionHead('By KAM', 'Tap a card to open that KAM'));
-  frag.append(el('div', { class: 'group-grid' }, groupBy(live, '__kam').slice(0, 12).map((e) => groupCard(e, 'kam'))));
-
-  // the live property list (this page now also does the old Live Properties job)
-  frag.append(propertyList(live, { title: 'Live property list' }));
 
   return frag;
 }
@@ -1225,28 +1265,33 @@ function viewGroup(rows, field, dimension, title, desc) {
 /* ---- Property Details: the filtered row-level list ---------------------- */
 
 function viewProperties(rows) {
-  // A single status in the STATUS filter means we arrived from a card click.
-  // In that focused view the summary cards would all read 0 except one, so
-  // drop them entirely and just show the filtered list.
+  // A drilled-in view (from a card click) or a single-status filter should show
+  // just the list — the summary cards would be all-zero-but-one, so drop them.
   const singleStatus = state.filters.statuses.length === 1 ? state.filters.statuses[0] : null;
+  const drilled = state.focus || !!singleStatus;
+
+  const heading = singleStatus ? `${singleStatus} properties`
+    : state.filters.squads.length === 1 ? `${state.filters.squads[0]} properties`
+    : state.filters.kams.length === 1 ? `${state.filters.kams[0]} properties`
+    : 'Property details';
 
   const frag = el('div', {}, [
     pageHead(
-      singleStatus ? `${singleStatus} properties` : 'Property details',
-      singleStatus
-        ? `Showing only properties with agreement status “${singleStatus}”. Clear the status filter to see the full summary.`
+      heading,
+      drilled
+        ? 'Filtered view. Use Back to return, or clear the filters to see the full summary.'
         : 'Every row behind the summaries. Links open in a new tab.'
     ),
   ]);
 
-  if (!singleStatus) {
+  if (!drilled) {
     frag.append(
       sectionHead('Agreement summary', `${fmtInt(rows.length)} properties in scope`),
       statusCards(rows),
     );
   }
 
-  frag.append(propertyList(rows, { title: singleStatus ? `${singleStatus} agreements` : 'All properties' }));
+  frag.append(propertyList(rows, { title: drilled ? heading : 'All properties' }));
   return frag;
 }
 
@@ -1735,6 +1780,8 @@ function renderActiveFilters() {
 
 function onFiltersChanged() {
   state.page = {};
+  state.focus = false;      // touching a filter leaves the drilled-in view
+  state.returnTo = null;
   syncUrl();
   renderSidebar();
   updateFilters();
@@ -1782,6 +1829,16 @@ function renderView() {
   }
 
   const rows = activeRows();
+
+  // Back button for a drilled-in (focused) view — top-left, returns to origin.
+  if (state.focus) {
+    const back = el('button', { type: 'button', class: 'back-btn' }, [
+      el('span', { class: 'back-arrow', text: '‹' }),
+      'Back',
+    ]);
+    back.addEventListener('click', goBack);
+    root.append(back);
+  }
 
   // A missing required column means the pivots would quietly read "(blank)"
   const missing = [['squad', 'squad'], ['kam', 'poc'], ['signing', 'contract_signing_status']]
