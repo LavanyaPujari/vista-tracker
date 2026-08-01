@@ -320,7 +320,7 @@ a { color: inherit; }
 }
 
 #view-root {
-  padding: 20px 24px 40px;
+  padding: 16px 24px 40px;
   min-width: 0;
 }
 
@@ -704,7 +704,7 @@ a { color: inherit; }
 .ms-empty { padding: 16px 12px; text-align: center; color: var(--muted); font-size: 12.5px; }
 
 /* 9 ------------------------------------------------------------------- cards */
-.page-head { margin-bottom: 18px; }
+.page-head { margin-bottom: 12px; }
 .page-head h2 {
   margin: 0;
   font-family: var(--display);
@@ -1136,7 +1136,7 @@ td.pct-cell { font-weight: 600; }
   flex-wrap: wrap;
   align-items: baseline;
   gap: 10px;
-  margin: 24px 0 11px;
+  margin: 16px 0 8px;
 }
 .section-head h3 {
   margin: 0;
@@ -1152,7 +1152,7 @@ td.pct-cell { font-weight: 600; }
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(158px, 1fr));
   gap: 10px;
-  margin-bottom: 22px;   /* clear gap before the status-split panel */
+  margin-bottom: 12px;
 }
 .insight-grid { margin-bottom: 6px; }   /* insights sit tighter to the cards below */
 
@@ -1381,11 +1381,11 @@ a.stat.stat-hero:hover { box-shadow: var(--shadow-3); }
   display: grid;
   grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
   gap: 12px;
-  margin-bottom: 14px;
+  margin-bottom: 4px;
 }
 
 .hero-live, .hero-churn {
-  padding: 16px 20px 17px;
+  padding: 14px 18px;
   border-radius: var(--r-md);
   box-shadow: var(--shadow-2);
 }
@@ -1424,7 +1424,7 @@ a.stat.stat-hero:hover { box-shadow: var(--shadow-3); }
 .hero-num {
   margin-top: 6px;
   font-family: var(--display);
-  font-size: 40px;
+  font-size: 34px;
   line-height: 1;
   font-weight: 400;
   font-variant-numeric: tabular-nums;
@@ -1488,11 +1488,11 @@ a.stat.stat-hero:hover { box-shadow: var(--shadow-3); }
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 12px;
-  margin-bottom: 22px;
+  margin-bottom: 12px;
 }
 .act-card {
   border-radius: 12px;
-  padding: 15px 17px;
+  padding: 12px 15px;
   text-decoration: none;
   display: block;
   transition: transform .05s, box-shadow .14s;
@@ -1521,3 +1521,6 @@ a.act-card:active { transform: translateY(1px); }
 .tone-warning { background: #fdeede; color: #8a5a1e; }
 .tone-success { background: #e4f0e4; color: #356b46; }
 .tone-danger  .act-num, .tone-warning .act-num, .tone-success .act-num { color: inherit; }
+
+.seehint { color: var(--ink-2); font-size: 12px; text-decoration: none; border-bottom: 1px solid var(--line-strong); }
+.seehint:hover { color: var(--ink); border-color: var(--ink); }
