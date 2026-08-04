@@ -200,6 +200,8 @@ function resolveColumns(sample) {
     pauseDate:  pick([is('pausedate'), has('pause')]),
     city:       pick([is('city'), has('city')]),
     code:       pick([is('propertyid'), has('property', 'id'), is('propertycode', 'id')]),
+    // the *unit-level* name, used only to tell apart rows that share a Property ID
+    propertyName: pick([is('propertyname'), has('property', 'name')]),
   };
 }
 
@@ -394,8 +396,27 @@ function normalizeRows(raw, cols) {
       __endDateObj:  parseDate(cols.endDate ? r[cols.endDate] : null),
       __delistObj:   parseDate(cols.delistDate ? r[cols.delistDate] : null),
       __live:     resolveLive(r, cols, now),
+      // "new property, no agreement yet": live, but validity AND signing blank
+      __newNoAgreement: (() => {
+        const val = cols.lifecycle ? clean(r[cols.lifecycle]) : '';
+        const sig = cols.signing ? clean(r[cols.signing]) : '';
+        return !val && !sig;
+      })(),
+      // Dedup key: one row per unique Property Name within a Property ID.
+      // Rows sharing both an ID and a Property Name collapse to one (even if
+      // other columns like TAT differ); distinct Property Names are kept.
+      __identKey: (() => {
+        const id = cols.code ? clean(r[cols.code]) : '';
+        const nameCol = cols.propertyName || cols.property;
+        const name = nameCol ? clean(r[nameCol]) : '';
+        if (!id) return null;                 // no Property ID → never dedup
+        return id + '::' + name;
+      })(),
       __raw: r,
     };
+  }).filter((row, idx, arr) => {
+    if (!row.__identKey) return true;         // ineligible rows always kept
+    return arr.findIndex((o) => o.__identKey === row.__identKey) === idx;
   });
 }
 
@@ -538,7 +559,7 @@ const state = {
   error: null,
   view: 'overview',
   sub: 'snapshot',
-  filters: { squads: [], kams: [], statuses: [] },
+  filters: { squads: [], kams: [], statuses: [], newNoAgreement: false },
   period: { month: '', year: '' },   // filter on live_date
   search: '',
   focus: false,        // drilled-in view: back button shown, summary cards hidden
@@ -568,6 +589,7 @@ function readUrl() {
   state.period.year  = p.get('y') || '';
   state.search = p.get('q') || '';
   state.focus = p.get('focus') === '1';
+  state.filters.newNoAgreement = p.get('newna') === '1';
 }
 
 function urlFor(view, sub) {
@@ -582,6 +604,7 @@ function urlFor(view, sub) {
   if (state.period.year)  p.set('y', state.period.year);
   if (state.search) p.set('q', state.search);
   if (state.focus) p.set('focus', '1');
+  if (state.filters.newNoAgreement) p.set('newna', '1');
   const qs = p.toString();
   return qs ? `?${qs}` : location.pathname;
 }
@@ -648,6 +671,7 @@ function filterRows(skip = null) {
     (skip === 'squad'  || !squads.length   || squads.includes(r.__squad)) &&
     (skip === 'kam'    || !kams.length     || kams.includes(r.__kam)) &&
     (skip === 'status' || !statuses.length || statuses.includes(r.__status)) &&
+    (skip === 'newna'  || !state.filters.newNoAgreement || r.__newNoAgreement) &&
     (skip === 'period' || inPeriod(r)) &&
     (skip === 'search' || matchesSearch(r, state.search))
   );
@@ -657,7 +681,7 @@ function activeRows() { return filterRows(null); }
 
 function hasAnyFilter() {
   const f = state.filters;
-  return !!(f.squads.length || f.kams.length || f.statuses.length || state.period.month || state.period.year || state.search);
+  return !!(f.squads.length || f.kams.length || f.statuses.length || f.newNoAgreement || state.period.month || state.period.year || state.search);
 }
 
 /** All statuses actually present, in MIS order, plus Unmapped only if it occurs. */
@@ -830,9 +854,10 @@ function statusPill(status) {
 const DETAIL_TAB = 'vista-tracker-details';
 
 /** URL for Property Details pre-filtered by the given dimensions. */
-function detailHref({ status, squad, kam, live } = {}) {
+function detailHref({ status, squad, kam, live, newNoAgreement } = {}) {
   const p = new URLSearchParams();
   p.set('view', 'properties');   // drilled-in list always lives on Property Details
+  if (newNoAgreement) p.set('newna', '1');
   const squads   = squad ? [squad] : state.filters.squads;
   const kams     = kam   ? [kam]   : state.filters.kams;
   const statuses = status ? [status] : state.filters.statuses;
@@ -859,6 +884,7 @@ function cardClickHandler(filter) {
     if (filter.status) state.filters.statuses = [filter.status];
     if (filter.squad)  state.filters.squads = [filter.squad];
     if (filter.kam)    state.filters.kams = [filter.kam];
+    state.filters.newNoAgreement = !!filter.newNoAgreement;
     state.focus = true;
     state.page = {};
     go('properties');   // the drilled-in list lives on Property Details
@@ -1184,7 +1210,7 @@ function actionCards(scopeRows) {
 
   const notSigned = live.filter((r) => r.__status === 'Not Signed').length;
   const expiring = expiringWithin(scopeRows, 30);
-  const risk = atRisk(scopeRows);
+  const newNoAgreement = live.filter((r) => r.__newNoAgreement).length;
   const newLive = newLiveThisMonth(scopeRows);
 
   const card = (label, value, tone, filter) => {
@@ -1202,7 +1228,7 @@ function actionCards(scopeRows) {
   return el('div', { class: 'action-grid' }, [
     card('Not signed', notSigned, 'danger', { status: 'Not Signed', live: true }),
     card('Expiring in 30 days', expiring, 'warning', { status: 'To Expire', live: true }),
-    card('At-risk', risk, 'danger', null),
+    card('New — no agreement yet', newNoAgreement, 'sky', { newNoAgreement: true, live: true }),
     card('New live this month', newLive, 'success', null),
   ]);
 }
@@ -1282,9 +1308,10 @@ function viewProperties(rows) {
   // A drilled-in view (from a card click) or a single-status filter should show
   // just the list — the summary cards would be all-zero-but-one, so drop them.
   const singleStatus = state.filters.statuses.length === 1 ? state.filters.statuses[0] : null;
-  const drilled = state.focus || !!singleStatus;
+  const drilled = state.focus || !!singleStatus || state.filters.newNoAgreement;
 
-  const heading = singleStatus ? `${singleStatus} properties`
+  const heading = state.filters.newNoAgreement ? 'New properties — no agreement yet'
+    : singleStatus ? `${singleStatus} properties`
     : state.filters.squads.length === 1 ? `${state.filters.squads[0]} properties`
     : state.filters.kams.length === 1 ? `${state.filters.kams[0]} properties`
     : 'Property details';
@@ -1693,7 +1720,7 @@ function renderFilters() {
 
   const reset = el('button', { type: 'button', class: 'reset-btn', text: 'Reset filters', disabled: !hasAnyFilter() });
   reset.addEventListener('click', () => {
-    state.filters = { squads: [], kams: [], statuses: [] };
+    state.filters = { squads: [], kams: [], statuses: [], newNoAgreement: false };
     state.period = { month: '', year: '' };
     state.search = '';
     onFiltersChanged();
@@ -1781,7 +1808,7 @@ function renderActiveFilters() {
 
   const clearAll = el('button', { class: 'chip-x', type: 'button', 'aria-label': 'Clear all filters', text: '×' });
   clearAll.addEventListener('click', () => {
-    state.filters = { squads: [], kams: [], statuses: [] };
+    state.filters = { squads: [], kams: [], statuses: [], newNoAgreement: false };
     state.period = { month: '', year: '' };
     state.search = '';
     onFiltersChanged();
