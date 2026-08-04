@@ -1,3 +1,4 @@
+/* VISTA-TRACKER BUILD MARKER: EXPIRED-READS-COLUMN-v2 — if you see 209 Expired, this file is live */
 /* ==========================================================================
    Vista Tracker — application logic
    --------------------------------------------------------------------------
@@ -2071,6 +2072,7 @@ function paintRefresh() {
 }
 
 function init() {
+  console.log('%cVista Tracker build: EXPIRED-READS-COLUMN-v2', 'font-weight:bold;color:#2f7d5b');
   readUrl();
 
   $('#login-btn')?.addEventListener('click', handleLogin);
