@@ -1524,3 +1524,63 @@ a.act-card:active { transform: translateY(1px); }
 
 .seehint { color: var(--ink-2); font-size: 12px; text-decoration: none; border-bottom: 1px solid var(--line-strong); }
 .seehint:hover { color: var(--ink); border-color: var(--ink); }
+
+/* ---- needs-action cards ---- */
+.action-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.act-card {
+  border-radius: 12px;
+  padding: 12px 15px;
+  text-decoration: none;
+  display: block;
+  transition: transform .05s, box-shadow .14s;
+}
+a.act-card:hover { box-shadow: var(--shadow-2); }
+a.act-card:active { transform: translateY(1px); }
+.act-label {
+  font-size: 13px;
+  font-weight: 500;
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+  line-height: 1.3;
+  min-height: 2.5em;          /* room for 2 lines so cards align, no empty gaps */
+}
+.act-num {
+  font-family: var(--display);
+  font-size: 30px;
+  line-height: 1;
+  font-weight: 400;
+  margin-top: 6px;
+  font-variant-numeric: tabular-nums;
+}
+.act-card .ext { font-size: 11px; opacity: .55; }
+
+/* card tones */
+.tone-danger  { background: #f7e7e6; color: #8f3a37; }
+.tone-warning { background: #fdeede; color: #8a5a1e; }
+.tone-success { background: #e4f0e4; color: #356b46; }
+.tone-danger  .act-num,
+.tone-warning .act-num,
+.tone-success .act-num,
+.tone-sky     .act-num { color: inherit; }
+
+/* the "New — no agreement yet" card (SV-Sky tint) */
+.act-card.tone-sky {
+  background: #e6f0fb;
+  color: #2d5b86;
+  border: 0.5px solid #cfe1f4;
+}
+.act-card.tone-sky .act-num { color: #234b70; }
+.act-card.tone-sky .act-label { color: #2d5b86; }
+.act-card.tone-sky .ext { color: #6a94bd; }
+
+/* two-line status labels on the summary cards, so short/long align evenly */
+.stat .s-label {
+  min-height: 2.6em;
+  align-items: flex-start;
+}
