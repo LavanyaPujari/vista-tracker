@@ -317,27 +317,12 @@ function resolveAgreementStatus(row, cols, now, windowDays) {
  * which quietly inflated the live count above what the sheet reports.
  */
 function resolveLive(row, cols, now) {
-  // being delisted overrides everything else
-  const delist = parseDate(cols.delistDate ? row[cols.delistDate] : null);
-  if (delist && delist <= now) return false;
-
+  // Match the sheet's definition exactly: a property is live if, and only if,
+  // its Current Status column says "Live". No delist-date or live-date
+  // inference — that used to add rows the sheet's Current Status filter excludes.
   const label = norm(cols.liveStatus ? row[cols.liveStatus] : '');
-  if (label) {
-    // Order matters: "never went live" contains "live", so exclude it first.
-    if (label.includes('neverwentlive') || label.includes('neverlive')) return false;
-    if (label.includes('delist') || label.includes('churn') || label.includes('exit')
-      || label.includes('inactive') || label.includes('notlive') || label.includes('terminat')) return false;
-    if (label.includes('pause') || label.includes('hold')) return false;
-    if (label.includes('handedover') || label.includes('handover')) return false;
-    if (label === 'tac' || label.includes('tac')) return false;
-    if (label === 'live' || label.includes('active')) return true;
-    return null;   // a status we genuinely don't recognise — don't guess
-  }
-
-  // no status column value at all: fall back to the live date
-  const live = parseDate(cols.liveDate ? row[cols.liveDate] : null);
-  if (live) return live <= now;
-  return null;
+  if (!label) return null;              // no status value → unknown, not counted live
+  return label === 'live';              // only exactly "Live" counts
 }
 
 /**
