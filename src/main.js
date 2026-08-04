@@ -247,11 +247,14 @@ function detectStatusColumns(raw) {
 
   const sample = raw.length > 3000 ? raw.slice(0, 3000) : raw;
   const scored = candidates.map((key) => {
-    let pre = 0, post = 0, valid = 0, mapped = 0, filled = 0;
+    let pre = 0, post = 0, valid = 0, mapped = 0, filled = 0, signedExact = 0;
     for (const r of sample) {
       const v = r[key];
       if (!clean(v)) continue;
       filled += 1;
+      // "Signed" (but not "Not Signed") only ever appears in the signing column
+      const n = norm(v);
+      if (n === 'signed') signedExact += 1;
       const bucket = normalizeStatus(v);
       if (!bucket) continue;
       mapped += 1;
@@ -259,17 +262,20 @@ function detectStatusColumns(raw) {
       else if (POST_SIGNATURE.indexOf(bucket) !== -1) post += 1;
       else if (bucket === 'Valid') valid += 1;
     }
-    return { key, pre, post, valid, mapped, filled };
-  }).filter((c) => c.mapped > 0);
+    return { key, pre, post, valid, mapped, filled, signedExact };
+  }).filter((c) => c.mapped > 0 || c.signedExact > 0);
 
   const best = (metric) => scored.slice()
     .sort((a, b) => b[metric] - a[metric] || b.mapped - a.mapped)[0];
 
-  const signingBest = best('pre');
+  // The signing column is the one that actually contains the literal "Signed".
+  // Only if none does do we fall back to the pre-signature heuristic.
+  const signedCol = scored.slice().sort((a, b) => b.signedExact - a.signedExact)[0];
+  const signingBest = (signedCol && signedCol.signedExact > 0) ? signedCol : best('pre');
   const lifecycleBest = best('post');
 
   return {
-    signing: signingBest && signingBest.pre > 0 ? signingBest.key : (scored[0] ? scored[0].key : null),
+    signing: signingBest ? signingBest.key : (scored[0] ? scored[0].key : null),
     lifecycle: lifecycleBest && lifecycleBest.post > 0 ? lifecycleBest.key : null,
     scored,
   };
@@ -384,6 +390,14 @@ function normalizeRows(raw, cols) {
       __squad:    canonSquad(cols.squad ? r[cols.squad] : ''),
       __statusRaw: [cols.signing && clean(r[cols.signing]), cols.lifecycle && clean(r[cols.lifecycle])].filter(Boolean).join(' / '),
       __status:   agreement.status,
+      // A live row whose validity says "Not Signed" but whose signing column is
+      // blank has no real signing status recorded — it shouldn't sit in the
+      // Not Signed card. Flag it so status counts skip it (it still counts live).
+      __excludeFromStatus: (() => {
+        const validity = normalizeStatus(cols.lifecycle ? r[cols.lifecycle] : '');
+        const signing = cols.signing ? clean(r[cols.signing]) : '';
+        return validity === 'Not Signed' && !signing;
+      })(),
       __source:   agreement.source,
       __property: clean(cols.property ? r[cols.property] : '') || '—',
       __city:     clean(cols.city     ? r[cols.city]     : ''),
@@ -402,22 +416,11 @@ function normalizeRows(raw, cols) {
         const sig = cols.signing ? clean(r[cols.signing]) : '';
         return !val && !sig;
       })(),
-      // Dedup key: one row per unique Property Name within a Property ID.
-      // Rows sharing both an ID and a Property Name collapse to one (even if
-      // other columns like TAT differ); distinct Property Names are kept.
-      __identKey: (() => {
-        const id = cols.code ? clean(r[cols.code]) : '';
-        const nameCol = cols.propertyName || cols.property;
-        const name = nameCol ? clean(r[nameCol]) : '';
-        if (!id) return null;                 // no Property ID → never dedup
-        return id + '::' + name;
-      })(),
       __raw: r,
     };
-  }).filter((row, idx, arr) => {
-    if (!row.__identKey) return true;         // ineligible rows always kept
-    return arr.findIndex((o) => o.__identKey === row.__identKey) === idx;
   });
+  // No deduplication: the dashboard counts every row exactly as the sheet does,
+  // so the live total matches the sheet's filtered row count (e.g. 1,219).
 }
 
 
@@ -670,7 +673,7 @@ function filterRows(skip = null) {
   return state.rows.filter((r) =>
     (skip === 'squad'  || !squads.length   || squads.includes(r.__squad)) &&
     (skip === 'kam'    || !kams.length     || kams.includes(r.__kam)) &&
-    (skip === 'status' || !statuses.length || statuses.includes(r.__status)) &&
+    (skip === 'status' || !statuses.length || (statuses.includes(r.__status) && !r.__excludeFromStatus)) &&
     (skip === 'newna'  || !state.filters.newNoAgreement || r.__newNoAgreement) &&
     (skip === 'period' || inPeriod(r)) &&
     (skip === 'search' || matchesSearch(r, state.search))
@@ -916,10 +919,13 @@ function statCard({ label, value, sub, accent, filter, highlight }) {
 
 /** The agreement status cards shown at the top of every summary page. */
 function statusCards(rows, { live } = {}) {
-  const statuses = statusColumns(rows);
+  // Rows flagged __excludeFromStatus (live + validity Not Signed + blank signing)
+  // are not real agreement statuses, so leave them out of the cards entirely.
+  const counted = rows.filter((r) => !r.__excludeFromStatus);
+  const statuses = statusColumns(counted);
   const counts = Object.fromEntries(statuses.map((st) => [st, 0]));
-  for (const r of rows) counts[r.__status] = (counts[r.__status] || 0) + 1;
-  const total = rows.length;
+  for (const r of counted) counts[r.__status] = (counts[r.__status] || 0) + 1;
+  const total = counted.length;
 
   const grid = el('div', { class: 'stat-grid' });
   for (const st of statuses) {
@@ -1208,7 +1214,7 @@ function actionCards(scopeRows) {
   const live = scopeRows.filter((r) => r.__live === true);
   const now = new Date();
 
-  const notSigned = live.filter((r) => r.__status === 'Not Signed').length;
+  const notSigned = live.filter((r) => r.__status === 'Not Signed' && !r.__excludeFromStatus).length;
   const expiring = expiringWithin(scopeRows, 30);
   const newNoAgreement = live.filter((r) => r.__newNoAgreement).length;
   const newLive = newLiveThisMonth(scopeRows);
@@ -1276,29 +1282,28 @@ function viewOverview(allRows) {
 /* ---- Squad-wise / KAM-wise: cards on top, property list below ------------ */
 
 function viewGroup(rows, field, dimension, title, desc) {
-  const groups = groupBy(rows, field);
+  // Squad/KAM summaries are LIVE properties only.
+  const live = rows.filter((r) => r.__live === true);
+  const groups = groupBy(live, field);
 
-  // When exactly one squad/KAM is selected, lead with its live count + churn.
   const selected = dimension === 'squad' ? state.filters.squads : state.filters.kams;
   const focused = selected.length === 1 ? selected[0] : null;
 
   const frag = el('div', {}, [pageHead(title, desc)]);
 
-  if (focused) {
-    frag.append(heroStats(rows, { label: `${focused} · live properties` }));
-    frag.append(insightCards(rows, { live: true }));
-  } else {
-    // still keep churn + live visible for the whole scope
-    frag.append(heroStats(rows, { label: 'Live properties' }));
-  }
-
+  // Agreement status cards for the live set (no Live/Churn hero here — that
+  // lives only on the Live Properties tab).
   frag.append(
-    sectionHead('Agreement status', 'Each card opens the matching properties in another tab'),
-    statusCards(rows),
-    sectionHead(dimension === 'squad' ? 'Squads' : 'KAMs', `${fmtInt(groups.length)} in scope · tap to open`),
+    sectionHead('Agreement status', `${fmtInt(live.length)} live properties`),
+    statusCards(live, { live: true }),
+    sectionHead(dimension === 'squad' ? 'Squads' : 'KAMs', `${fmtInt(groups.length)} in scope · tap a card to open its properties`),
     el('div', { class: 'group-grid' }, groups.map((e) => groupCard(e, dimension))),
-    propertyList(rows, { title: 'Property details' }),
   );
+
+  // The property table only appears once a specific squad/KAM is selected.
+  if (focused) {
+    frag.append(propertyList(live, { title: `${focused} · properties` }));
+  }
   return frag;
 }
 
