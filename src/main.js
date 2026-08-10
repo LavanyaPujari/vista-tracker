@@ -585,7 +585,9 @@ const state = {
   page: {}, // per view: current page of the property list
 };
 
-const validView = (v) => (v === 'live-properties') ? 'overview' : (VIEWS.some((x) => x.id === v) ? v : 'overview');
+const EXTRA_VIEWS = ['churned'];
+const validView = (v) => (v === 'live-properties') ? 'overview'
+  : (VIEWS.some((x) => x.id === v) || EXTRA_VIEWS.includes(v)) ? v : 'overview';
 
 function defaultSub(view) {
   const subs = SUBTABS[view] || [];
@@ -1192,6 +1194,48 @@ function churnRateFY(squad) {
   return numerator * 100 / denominator;
 }
 
+/**
+ * The actual properties that churned this financial year (up to the selected
+ * month) — the numerator rows behind churnRateFY. Joined with the main table by
+ * Property ID so each shows a name and KAM, not just an ID.
+ */
+function churnedRowsFY(squad) {
+  const ref = state.churnRef || [];
+  if (!ref.length) return [];
+
+  const now = new Date();
+  const monthNum = state.period.month ? Number(state.period.month) : (now.getMonth() + 1);
+  const pickedYear = state.period.year ? Number(state.period.year) : now.getFullYear();
+  const fyStartYear = monthNum >= 4 ? pickedYear : pickedYear - 1;
+  const fyStart = new Date(fyStartYear, 3, 1);
+  const monthEnd = new Date(pickedYear, monthNum, 0);
+
+  const parse = (v) => { if (!v) return null; const d = new Date(v); return Number.isNaN(d.getTime()) ? null : d; };
+  const sameSquad = (r) => !squad || norm(r.squad) === norm(squad);
+
+  // index main rows by Property ID for the join
+  const byId = {};
+  for (const r of state.rows) if (r.__code) byId[String(r.__code).trim()] = r;
+
+  const out = [];
+  for (const r of ref) {
+    if (!sameSquad(r)) continue;
+    const leave = parse(r.consol_delist_paused_date);
+    if (!(leave && leave >= fyStart && leave <= monthEnd)) continue;
+    const main = byId[String(r.prop_id).trim()];
+    out.push({
+      __code: r.prop_id,
+      __property: main ? main.__property : `Property ${r.prop_id}`,
+      __squad: r.squad || (main ? main.__squad : ''),
+      __kam: main ? main.__kam : '—',
+      __leaveDate: r.consol_delist_paused_date || '',
+    });
+  }
+  // most recent churn first
+  out.sort((a, b) => String(b.__leaveDate).localeCompare(String(a.__leaveDate)));
+  return out;
+}
+
 /** Live agreements whose end date is within the next `days` days. */
 function expiringWithin(rows, days) {
   const now = new Date();
@@ -1264,17 +1308,35 @@ function heroStats(scopeRows, { label } = {}) {
     ? (selectedSquad ? `FYTD · ${selectedSquad}` : 'FYTD · all squads')
     : `${fmtInt(scopeRows.filter((r) => r.__live === false).length)} delisted`;
 
+  const churnCount = usingFY ? churnedRowsFY(selectedSquad).length : scopeRows.filter((r) => r.__live === false).length;
+
+  const churnInner = [
+    el('div', { class: 's-label' }, ['Churn rate', usingFY ? el('span', { class: 'ext', text: ' ↗' }) : null]),
+    el('div', { class: 'hero-num', text: fmtPct(churn) }),
+    el('div', { class: 's-sub', text: usingFY ? `${churnSub} · ${fmtInt(churnCount)} churned` : churnSub }),
+  ];
+
+  // clickable only when we have the FY churn detail to show
+  let churnCard;
+  if (usingFY) {
+    churnCard = el('a', { class: 'hero-churn', href: '?view=churned', target: DETAIL_TAB,
+      title: 'Click to see the churned properties' }, churnInner);
+    churnCard.addEventListener('click', (e) => {
+      if (e.ctrlKey || e.metaKey) return;   // let Ctrl/Cmd-click open the new tab
+      e.preventDefault();
+      go('churned');
+    });
+  } else {
+    churnCard = el('div', { class: 'hero-churn' }, churnInner);
+  }
+
   return el('div', { class: 'hero-stats' }, [
     el('div', { class: 'hero-live' }, [
       el('div', { class: 's-label', text: label || 'Live properties' }),
       el('div', { class: 'hero-num', text: fmtInt(live) }),
       el('div', { class: 's-sub', text: `${fmtPct(total ? live * 100 / total : null)} of ${fmtInt(total)} in scope` }),
     ]),
-    el('div', { class: 'hero-churn' }, [
-      el('div', { class: 's-label', text: 'Churn rate' }),
-      el('div', { class: 'hero-num', text: fmtPct(churn) }),
-      el('div', { class: 's-sub', text: churnSub }),
-    ]),
+    churnCard,
   ]);
 }
 
@@ -1328,6 +1390,71 @@ function viewOverview(allRows) {
   // 3. agreement status (quieter reference cards, in the requested order)
   frag.append(sectionHead('Agreement status', `${fmtInt(live.length)} live properties`));
   frag.append(statusCards(live, { live: true }));
+
+  return frag;
+}
+
+/* ---- Churned properties (drill-in from the churn card) ------------------- */
+
+function viewChurned() {
+  const selectedSquad = state.filters.squads.length === 1 ? state.filters.squads[0] : null;
+  const churned = churnedRowsFY(selectedSquad);
+
+  const now = new Date();
+  const monthNum = state.period.month ? Number(state.period.month) : (now.getMonth() + 1);
+  const pickedYear = state.period.year ? Number(state.period.year) : now.getFullYear();
+  const monthName = ['January','February','March','April','May','June','July','August','September','October','November','December'][monthNum - 1];
+  const scope = selectedSquad ? selectedSquad : 'all squads';
+
+  const frag = el('div', {}, []);
+
+  // back button to return to the dashboard
+  const back = el('button', { type: 'button', class: 'back-btn' }, [el('span', { class: 'back-arrow', text: '‹' }), 'Back']);
+  back.addEventListener('click', () => go('overview'));
+  frag.append(back);
+
+  frag.append(pageHead('Churned properties',
+    `Properties that churned this financial year up to ${monthName} ${pickedYear} · ${scope}.`));
+
+  if (!churned.length) {
+    frag.append(el('div', { class: 'state' }, [
+      el('h3', { text: 'No churned properties in this period' }),
+      el('p', { text: 'Nothing matched the selected month, year and squad.' }),
+    ]));
+    return frag;
+  }
+
+  frag.append(el('div', { class: 'panel' }, [
+    el('div', { class: 'panel-head' }, [
+      el('h3', { text: `${fmtInt(churned.length)} churned` }),
+      el('span', { class: 'hint right', text: `FYTD · ${scope}` }),
+    ]),
+    el('div', { class: 'panel-body', style: 'padding:0' }, [
+      (() => {
+        const table = el('table', { class: 'grid' });
+        table.append(el('thead', {}, [el('tr', {}, [
+          el('th', { style: 'text-align:left', text: 'Property' }),
+          el('th', { style: 'text-align:left', text: 'Squad' }),
+          el('th', { style: 'text-align:left', text: 'KAM' }),
+          el('th', { style: 'text-align:left', text: 'Churn date' }),
+        ])]));
+        const tbody = el('tbody', {});
+        for (const r of churned) {
+          tbody.append(el('tr', {}, [
+            el('td', { style: 'text-align:left' }, [
+              el('div', { text: r.__property }),
+              r.__code ? el('div', { class: 'row-sub', text: String(r.__code) }) : null,
+            ]),
+            el('td', { style: 'text-align:left', text: r.__squad || '—' }),
+            el('td', { style: 'text-align:left', text: r.__kam || '—' }),
+            el('td', { style: 'text-align:left', text: r.__leaveDate ? String(r.__leaveDate).slice(0, 10) : '—' }),
+          ]));
+        }
+        table.append(tbody);
+        return table;
+      })(),
+    ]),
+  ]));
 
   return frag;
 }
@@ -1969,6 +2096,9 @@ function renderView() {
       break;
     case 'properties':
       root.append(viewProperties(rows));
+      break;
+    case 'churned':
+      root.append(viewChurned());
       break;
     default:
       root.append(viewOverview(rows));

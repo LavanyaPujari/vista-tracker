@@ -1560,3 +1560,9 @@ a.act-card:active { transform: translateY(1px); }
   min-height: 2.5em;
   align-items: flex-start;
 }
+
+/* clickable churn card */
+a.hero-churn { text-decoration: none; color: inherit; cursor: pointer; transition: box-shadow .14s, transform .05s; }
+a.hero-churn:hover { box-shadow: var(--shadow-2); }
+a.hero-churn:active { transform: translateY(1px); }
+a.hero-churn .ext { font-size: 12px; opacity: .5; }
