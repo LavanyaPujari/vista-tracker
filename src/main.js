@@ -159,8 +159,11 @@ function resolveColumns(sample) {
       has('contract', 'status'),
       is('agreementstatus'),
     ]),
-    // post-signature states: Valid / To Expire / Expired
+    // post-signature / current agreement status: Valid / To Expire / Expired.
+    // The AQ column is now "Current Contract Status".
     lifecycle: pick([
+      is('currentcontractstatus'),
+      has('current', 'contract', 'status'),
       is('contractlifecyclestatus'),
       has('lifecycle', 'status'),
       is('agreementstatus'),
@@ -189,10 +192,11 @@ function resolveColumns(sample) {
       has('link'), has('url'),
     ]),
     agreementUrl: pick([is('agreementlink'), has('agreement', 'link')]),
-    // current_status carries Live / Delisted / Paused
+    // current_status carries Live / Delisted / Paused. Must NOT match
+    // "Current Contract Status" (the agreement column), so exclude "contract".
     liveStatus: pick([
       is('currentstatus'),
-      has('current', 'status'),
+      (c) => c.n.includes('current') && c.n.includes('status') && !c.n.includes('contract'),
       is('livestatus', 'islive', 'live'),
       has('live', 'status'),
     ]),
@@ -240,8 +244,13 @@ function detectStatusColumns(raw) {
   const keys = Object.keys(raw[0] || {});
   const candidates = keys.filter((k) => {
     const n = norm(k);
+    // The AQ column is now "Current Contract Status" — keep any column that
+    // mentions "contract" or "agreement" (these are the status columns), and
+    // only exclude the live/delisted column, which is "current status" WITHOUT
+    // the word "contract".
+    const isLiveStatus = n.includes('current') && n.includes('status') && !n.includes('contract') && !n.includes('agreement');
+    if (isLiveStatus) return false;
     return (n.includes('status') || n.includes('contract') || n.includes('agreement'))
-      && !n.includes('current')      // current_status is live / delisted
       && !n.includes('date')
       && !n.includes('link');
   });
