@@ -273,11 +273,19 @@ function detectStatusColumns(raw) {
   // Only if none does do we fall back to the pre-signature heuristic.
   const signedCol = scored.slice().sort((a, b) => b.signedExact - a.signedExact)[0];
   const signingBest = (signedCol && signedCol.signedExact > 0) ? signedCol : best('pre');
-  const lifecycleBest = best('post');
+
+  // Lifecycle = the CURRENT contract status column (AQ). It's the one with
+  // post-signature values (Expired / To Expire); if none stands out, it's the
+  // status column that ISN'T the signing column. Never leave it null when a
+  // status column exists, or every row falls through to Unmapped.
+  let lifecycleBest = best('post');
+  if (!lifecycleBest || lifecycleBest.post === 0) {
+    lifecycleBest = scored.find((c) => !signingBest || c.key !== signingBest.key) || scored[0];
+  }
 
   return {
     signing: signingBest ? signingBest.key : (scored[0] ? scored[0].key : null),
-    lifecycle: lifecycleBest && lifecycleBest.post > 0 ? lifecycleBest.key : null,
+    lifecycle: lifecycleBest ? lifecycleBest.key : null,
     scored,
   };
 }
@@ -296,16 +304,11 @@ function parseDate(v) {
  * source each row actually used.
  */
 function resolveAgreementStatus(row, cols, now, windowDays) {
-  // The MIS counts agreement status from ONE column only (Contract Status),
-  // taken at face value. We do the same — no end-date logic, or the dashboard
-  // drifts away from the sheet the team trusts.
-  const primary = normalizeStatus(cols.lifecycle ? row[cols.lifecycle] : '');
-  if (primary) return { status: primary, source: cols.lifecycle };
-
-  // only if that column is genuinely empty, fall back to the signing column
-  const signing = normalizeStatus(cols.signing ? row[cols.signing] : '');
-  if (signing) return { status: signing, source: cols.signing };
-
+  // Count purely from the CURRENT contract status column (AQ / "Contract Status",
+  // capital S), taken at face value. Column N ("Contract status", small s) is the
+  // historical entry status and is intentionally ignored.
+  const current = normalizeStatus(cols.lifecycle ? row[cols.lifecycle] : '');
+  if (current) return { status: current, source: cols.lifecycle };
   return { status: UNMAPPED, source: null };
 }
 
@@ -376,14 +379,6 @@ function normalizeRows(raw, cols) {
       __squad:    canonSquad(cols.squad ? r[cols.squad] : ''),
       __statusRaw: [cols.signing && clean(r[cols.signing]), cols.lifecycle && clean(r[cols.lifecycle])].filter(Boolean).join(' / '),
       __status:   agreement.status,
-      // A live row whose validity says "Not Signed" but whose signing column is
-      // blank has no real signing status recorded — it shouldn't sit in the
-      // Not Signed card. Flag it so status counts skip it (it still counts live).
-      __excludeFromStatus: (() => {
-        const validity = normalizeStatus(cols.lifecycle ? r[cols.lifecycle] : '');
-        const signing = cols.signing ? clean(r[cols.signing]) : '';
-        return validity === 'Not Signed' && !signing;
-      })(),
       __source:   agreement.source,
       __property: clean(cols.property ? r[cols.property] : '') || '—',
       __city:     clean(cols.city     ? r[cols.city]     : ''),
@@ -441,6 +436,29 @@ async function probeTable(name) {
 }
 
 /** Fetch every row, 1000 at a time. Without this the tabs silently cap at 1000. */
+async function fetchChurnRef() {
+  // Best-effort: if the churn_ref table isn't there yet, return [] so the
+  // dashboard still works and falls back to simple churn.
+  if (!SUPABASE_URL || !SUPABASE_KEY) return [];
+  try {
+    const out = [];
+    let from = 0;
+    for (let guard = 0; guard < 30; guard++) {
+      const res = await fetch(`${SUPABASE_URL}/rest/v1/churn_ref?select=*`, {
+        headers: { ...authHeaders(), 'Range-Unit': 'items', Range: `${from}-${from + PAGE_SIZE - 1}` },
+      });
+      if (!res.ok) return out;              // table missing or blocked → give up quietly
+      const batch = await res.json();
+      out.push(...batch);
+      if (batch.length < PAGE_SIZE) break;
+      from += PAGE_SIZE;
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
 async function fetchAllRows(diag) {
   if (!SUPABASE_URL || !SUPABASE_KEY) {
     throw new Error('Missing VITE_SUPABASE_URL or VITE_SUPABASE_ANON_KEY. Check .env (or Vercel → Settings → Environment Variables) and redeploy.');
@@ -540,6 +558,7 @@ const state = {
   user: null,
   rows: [],
   raw: [],
+  churnRef: [],
   cols: {},
   diag: {},
   loading: true,
@@ -659,7 +678,7 @@ function filterRows(skip = null) {
   return state.rows.filter((r) =>
     (skip === 'squad'  || !squads.length   || squads.includes(r.__squad)) &&
     (skip === 'kam'    || !kams.length     || kams.includes(r.__kam)) &&
-    (skip === 'status' || !statuses.length || (statuses.includes(r.__status) && !r.__excludeFromStatus)) &&
+    (skip === 'status' || !statuses.length || statuses.includes(r.__status)) &&
     (skip === 'newna'  || !state.filters.newNoAgreement || r.__newNoAgreement) &&
     (skip === 'period' || inPeriod(r)) &&
     (skip === 'search' || matchesSearch(r, state.search))
@@ -905,13 +924,10 @@ function statCard({ label, value, sub, accent, filter, highlight }) {
 
 /** The agreement status cards shown at the top of every summary page. */
 function statusCards(rows, { live } = {}) {
-  // Rows flagged __excludeFromStatus (live + validity Not Signed + blank signing)
-  // are not real agreement statuses, so leave them out of the cards entirely.
-  const counted = rows.filter((r) => !r.__excludeFromStatus);
-  const statuses = statusColumns(counted);
+  const statuses = statusColumns(rows);
   const counts = Object.fromEntries(statuses.map((st) => [st, 0]));
-  for (const r of counted) counts[r.__status] = (counts[r.__status] || 0) + 1;
-  const total = counted.length;
+  for (const r of rows) counts[r.__status] = (counts[r.__status] || 0) + 1;
+  const total = rows.length;
 
   const grid = el('div', { class: 'stat-grid' });
   for (const st of statuses) {
@@ -1113,11 +1129,58 @@ const MS_DAY = 86400000;
 
 function monthStart(d = new Date()) { return new Date(d.getFullYear(), d.getMonth(), 1); }
 
-/** Churn = delisted / total, as the team defined it. */
-function churnRate(rows) {
-  if (!rows.length) return null;
-  const delisted = rows.filter((r) => r.__live === false).length;
-  return delisted * 100 / rows.length;
+/**
+ * Financial-year churn, mirroring the sheet formula exactly.
+ *
+ *   churn % = (properties whose Consol DelistPaused Date falls between Apr 1 of
+ *             the financial year and the end of the selected month)
+ *           / (properties whose Live Date is before Apr 1 AND whose Consol
+ *             Delist date is on/after Apr 1 — the base at FY start)
+ *
+ * FY runs April–March: months Apr–Dec use the selected year, Jan–Mar use the
+ * previous year. Squad filters when one squad is selected, else all squads.
+ * Returns null when churn_ref isn't available so the caller can hide the card.
+ */
+function churnRateFY(squad) {
+  const ref = state.churnRef || [];
+  if (!ref.length) return null;
+
+  // month/year from the period filter, else today
+  const now = new Date();
+  const monthNum = state.period.month ? Number(state.period.month) : (now.getMonth() + 1);
+  const pickedYear = state.period.year ? Number(state.period.year) : now.getFullYear();
+
+  // FY start: if selected month is Apr(4) or later, FY started this year, else last year
+  const fyStartYear = monthNum >= 4 ? pickedYear : pickedYear - 1;
+  const fyStart = new Date(fyStartYear, 3, 1);                 // Apr 1
+  const monthEnd = new Date(pickedYear, monthNum, 0);          // last day of selected month
+
+  const parse = (v) => {
+    if (!v) return null;
+    const d = new Date(v);
+    return Number.isNaN(d.getTime()) ? null : d;
+  };
+  const sameSquad = (r) => !squad || norm(r.squad) === norm(squad);
+
+  let numerator = 0;
+  let denominator = 0;
+
+  for (const r of ref) {
+    if (!sameSquad(r)) continue;
+
+    const leave = parse(r.consol_delist_paused_date);   // column I
+    const live = parse(r.live_date);                    // column D
+    const consolDelist = parse(r.consol_delist);        // column J
+
+    // numerator: churned within the FY window up to the selected month-end
+    if (leave && leave >= fyStart && leave <= monthEnd) numerator += 1;
+
+    // denominator: live before FY start AND still around on/after FY start
+    if (live && live < fyStart && consolDelist && consolDelist >= fyStart) denominator += 1;
+  }
+
+  if (!denominator) return null;
+  return numerator * 100 / denominator;
 }
 
 /** Live agreements whose end date is within the next `days` days. */
@@ -1177,7 +1240,20 @@ function insightCards(scopeRows, { live }) {
 function heroStats(scopeRows, { label } = {}) {
   const live = scopeRows.filter((r) => r.__live === true).length;
   const total = scopeRows.length;
-  const churn = churnRate(scopeRows);
+
+  // FY churn from Churn Ref: squad-specific when exactly one squad is selected,
+  // otherwise all squads. Falls back to simple delisted/total if churn_ref is
+  // unavailable, so the card is never blank.
+  const selectedSquad = state.filters.squads.length === 1 ? state.filters.squads[0] : null;
+  const fyChurn = churnRateFY(selectedSquad);
+  const usingFY = fyChurn !== null;
+  const churn = usingFY
+    ? fyChurn
+    : (total ? scopeRows.filter((r) => r.__live === false).length * 100 / total : null);
+
+  const churnSub = usingFY
+    ? (selectedSquad ? `FYTD · ${selectedSquad}` : 'FYTD · all squads')
+    : `${fmtInt(scopeRows.filter((r) => r.__live === false).length)} delisted`;
 
   return el('div', { class: 'hero-stats' }, [
     el('div', { class: 'hero-live' }, [
@@ -1188,7 +1264,7 @@ function heroStats(scopeRows, { label } = {}) {
     el('div', { class: 'hero-churn' }, [
       el('div', { class: 's-label', text: 'Churn rate' }),
       el('div', { class: 'hero-num', text: fmtPct(churn) }),
-      el('div', { class: 's-sub', text: `${fmtInt(scopeRows.filter((r) => r.__live === false).length)} delisted` }),
+      el('div', { class: 's-sub', text: churnSub }),
     ]),
   ]);
 }
@@ -1200,7 +1276,7 @@ function actionCards(scopeRows) {
   const live = scopeRows.filter((r) => r.__live === true);
   const now = new Date();
 
-  const notSigned = live.filter((r) => r.__status === 'Not Signed' && !r.__excludeFromStatus).length;
+  const notSigned = live.filter((r) => r.__status === 'Not Signed').length;
   const expiring = expiringWithin(scopeRows, 30);
   const newNoAgreement = live.filter((r) => r.__newNoAgreement).length;
   const newLive = newLiveThisMonth(scopeRows);
@@ -1991,6 +2067,7 @@ async function boot(isRefresh = false) {
   try {
     const raw = await fetchAllRows(state.diag);
     state.raw = raw;
+    state.churnRef = await fetchChurnRef();
     state.cols = resolveColumns(raw[0]);
 
     // names can't separate the two status columns — the data can
