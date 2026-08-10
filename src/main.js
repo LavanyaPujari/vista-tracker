@@ -1329,24 +1329,6 @@ function viewOverview(allRows) {
   frag.append(sectionHead('Agreement status', `${fmtInt(live.length)} live properties`));
   frag.append(statusCards(live, { live: true }));
 
-  // 4. by squad — show the largest few here; full list lives on the Squad-wise tab
-  const squadGroups = groupBy(live, '__squad');
-  const SQUAD_CAP = 8;
-  const shownSquads = squadGroups.slice(0, SQUAD_CAP);
-  const moreCount = squadGroups.length - shownSquads.length;
-
-  const squadHead = el('div', { class: 'section-head' }, [
-    el('h3', { text: 'By squad' }),
-    el('span', { class: 'hint' }, [
-      moreCount > 0
-        ? (() => { const a = el('a', { class: 'seehint', href: '?view=squad', text: `+${moreCount} more · view all squads →` });
-                   a.addEventListener('click', (e) => { e.preventDefault(); go('squad'); }); return a; })()
-        : 'Tap a card to open that squad',
-    ]),
-  ]);
-  frag.append(squadHead);
-  frag.append(el('div', { class: 'group-grid' }, shownSquads.map((e) => groupCard(e, 'squad'))));
-
   return frag;
 }
 
