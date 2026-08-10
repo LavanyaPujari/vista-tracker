@@ -1176,9 +1176,11 @@ td.pct-cell { font-weight: 600; }
   letter-spacing: .09em;
   text-transform: uppercase;
   color: var(--muted);
-  line-height: 1.35;
+  line-height: 1.3;
+  min-height: 2.6em;          /* room for up to 2 lines so cards align evenly */
+  align-items: flex-start;
 }
-.stat .s-label .ext { font-size: 10px; color: var(--muted-2); }
+.stat .s-label .ext { font-size: 10px; color: var(--muted-2); margin-left: auto; }
 .stat .s-value {
   margin-top: 7px;
   font-family: var(--display);
@@ -1351,6 +1353,23 @@ a.stat.stat-hero:hover { box-shadow: var(--shadow-3); }
 
 .row-sub { margin-top: 2px; font-size: 11px; color: var(--muted); font-weight: 400; }
 
+/* status cell: pill on its own line, secondary text below with breathing room */
+.status-cell {
+  vertical-align: top;
+  padding-top: 12px;
+  padding-bottom: 12px;
+}
+.status-cell .pill {
+  display: inline-block;
+  margin-bottom: 7px;          /* gap between the pill and the text under it */
+}
+.status-cell .row-sub {
+  margin-top: 0;
+  line-height: 1.45;
+  max-width: 52ch;             /* let long reasons wrap onto their own lines */
+  white-space: normal;
+}
+
 /* --- responsive --- */
 @media (max-width: 900px) {
   .hero-row { grid-template-columns: 1fr; }
@@ -1520,67 +1539,24 @@ a.act-card:active { transform: translateY(1px); }
 .tone-danger  { background: #f7e7e6; color: #8f3a37; }
 .tone-warning { background: #fdeede; color: #8a5a1e; }
 .tone-success { background: #e4f0e4; color: #356b46; }
-.tone-danger  .act-num, .tone-warning .act-num, .tone-success .act-num { color: inherit; }
+.tone-sky     { background: #e2eefb; color: #2f5f8a; }
+.tone-danger  .act-num, .tone-warning .act-num, .tone-success .act-num, .tone-sky .act-num { color: inherit; }
 
 .seehint { color: var(--ink-2); font-size: 12px; text-decoration: none; border-bottom: 1px solid var(--line-strong); }
 .seehint:hover { color: var(--ink); border-color: var(--ink); }
 
-/* ---- needs-action cards ---- */
-.action-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-  gap: 12px;
-  margin-bottom: 12px;
-}
-.act-card {
-  border-radius: 12px;
-  padding: 12px 15px;
-  text-decoration: none;
-  display: block;
-  transition: transform .05s, box-shadow .14s;
-}
-a.act-card:hover { box-shadow: var(--shadow-2); }
-a.act-card:active { transform: translateY(1px); }
-.act-label {
-  font-size: 13px;
-  font-weight: 500;
-  display: flex;
-  align-items: flex-start;
-  gap: 4px;
-  line-height: 1.3;
-  min-height: 2.5em;          /* room for 2 lines so cards align, no empty gaps */
-}
-.act-num {
-  font-family: var(--display);
-  font-size: 30px;
-  line-height: 1;
-  font-weight: 400;
-  margin-top: 6px;
-  font-variant-numeric: tabular-nums;
-}
-.act-card .ext { font-size: 11px; opacity: .55; }
-
-/* card tones */
-.tone-danger  { background: #f7e7e6; color: #8f3a37; }
-.tone-warning { background: #fdeede; color: #8a5a1e; }
-.tone-success { background: #e4f0e4; color: #356b46; }
-.tone-danger  .act-num,
-.tone-warning .act-num,
-.tone-success .act-num,
-.tone-sky     .act-num { color: inherit; }
-
-/* the "New — no agreement yet" card (SV-Sky tint) */
+/* 18 ---------------------------------------- new-properties (no agreement) card */
 .act-card.tone-sky {
-  background: #e6f0fb;
+  background: #e6f0fb;               /* SV-Sky tint */
   color: #2d5b86;
   border: 0.5px solid #cfe1f4;
 }
 .act-card.tone-sky .act-num { color: #234b70; }
 .act-card.tone-sky .act-label { color: #2d5b86; }
 .act-card.tone-sky .ext { color: #6a94bd; }
-
-/* two-line status labels on the summary cards, so short/long align evenly */
-.stat .s-label {
-  min-height: 2.6em;
+/* long action labels wrap to 2 lines cleanly instead of leaving a gap */
+.act-label {
+  line-height: 1.3;
+  min-height: 2.5em;
   align-items: flex-start;
 }

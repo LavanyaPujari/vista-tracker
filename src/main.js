@@ -1071,7 +1071,7 @@ function propertyList(rows, opts = {}) {
     ]),
     el('td', { 'data-label': 'Squad', style: 'text-align:left', text: r.__squad }),
     el('td', { 'data-label': 'KAM', style: 'text-align:left', text: r.__kam }),
-    el('td', { 'data-label': 'Agreement status', style: 'text-align:left' }, [
+    el('td', { 'data-label': 'Agreement status', style: 'text-align:left', class: 'status-cell' }, [
       statusPill(r.__status),
       r.__reason ? el('div', { class: 'row-sub', text: r.__reason }) : null,
     ]),
