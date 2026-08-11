@@ -1574,3 +1574,12 @@ a.hero-churn .ext { font-size: 12px; opacity: .5; }
 .crumb.current { color: var(--ink); font-weight: 500; }
 .crumb-sep { color: var(--muted); margin: 0 2px; }
 .gc-count { font-size: 12px; color: var(--muted); margin-top: 4px; }
+
+/* churn flag dot + filter selects */
+.flag-dot { color: #c0392b; font-weight: 700; }
+.filter-bar { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 14px; }
+.flt {
+  font-size: 12px; padding: 6px 10px; border: 0.5px solid var(--line);
+  border-radius: var(--r-sm, 8px); background: var(--surface-2); color: var(--ink);
+}
+.flt:focus { outline: 1px solid var(--ink-2); }

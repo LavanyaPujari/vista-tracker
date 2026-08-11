@@ -567,7 +567,6 @@ const VIEWS = [
   { id: 'overview',        label: 'Live Properties',    group: 'Summary' },
   { id: 'squad',           label: 'Squad-wise',         group: 'Summary' },
   { id: 'kam',             label: 'KAM-wise',           group: 'Summary' },
-  { id: 'churn-analysis',  label: 'Churn Analysis',     group: 'Summary' },
   { id: 'properties',      label: 'Property Details',   group: 'Detail'  },
   { id: 'diagnostics',     label: 'Connection check',   group: 'Setup'   },
 ];
@@ -593,8 +592,13 @@ const state = {
   churnRef: [],
   churnAnalysis: [],
   gcfMarginal: [],
+  misSquadChurn: [],
+  misMonthlyChurn: [],
   caSquad: null,
   caKam: null,
+  cd: {},
+  cdFilters: {},
+  cdReturn: 'squad',
   cols: {},
   diag: {},
   loading: true,
@@ -612,7 +616,7 @@ const state = {
   page: {}, // per view: current page of the property list
 };
 
-const EXTRA_VIEWS = ['churned'];
+const EXTRA_VIEWS = ['churned', 'churn-detail'];
 const validView = (v) => (v === 'live-properties') ? 'overview'
   : (VIEWS.some((x) => x.id === v) || EXTRA_VIEWS.includes(v)) ? v : 'overview';
 
@@ -638,6 +642,12 @@ function readUrl() {
   state.filters.newNoAgreement = p.get('newna') === '1';
   state.caSquad = p.get('casquad') || null;
   state.caKam = p.get('cakam') || null;
+  state.cd = {
+    gcfLow: p.get('cgcf') === '1',
+    initiatedBy: p.get('cby') || null,
+    fnb: p.get('cfnb') || null,
+    reason: p.get('creason') || null,
+  };
 }
 
 function urlFor(view, sub) {
@@ -1325,37 +1335,44 @@ function heroStats(scopeRows, { label } = {}) {
   const live = scopeRows.filter((r) => r.__live === true).length;
   const total = scopeRows.length;
 
-  // FY churn from Churn Ref: squad-specific when exactly one squad is selected,
-  // otherwise all squads. Falls back to simple delisted/total if churn_ref is
-  // unavailable, so the card is never blank.
+  // Churn rate now comes from the MIS tab's pre-calculated numbers (the ones
+  // the team trusts). India total when no squad is selected; the squad's own
+  // rate when exactly one squad is selected. Falls back to the FY calculation,
+  // then to delisted/total, so the card is never blank.
   const selectedSquad = state.filters.squads.length === 1 ? state.filters.squads[0] : null;
+  const misRate = misChurnRate(selectedSquad);
   const fyChurn = churnRateFY(selectedSquad);
-  const usingFY = fyChurn !== null;
-  const churn = usingFY
-    ? fyChurn
-    : (total ? scopeRows.filter((r) => r.__live === false).length * 100 / total : null);
 
-  const churnSub = usingFY
-    ? (selectedSquad ? `FYTD · ${selectedSquad}` : 'FYTD · all squads')
-    : `${fmtInt(scopeRows.filter((r) => r.__live === false).length)} delisted`;
-
-  const churnCount = usingFY ? churnedRowsFY(selectedSquad).length : scopeRows.filter((r) => r.__live === false).length;
+  let churn, churnSub, churnClickable;
+  if (misRate !== null) {
+    churn = misRate;
+    churnSub = selectedSquad ? `${selectedSquad} · FYTD` : 'All India · FYTD';
+    churnClickable = true;
+  } else if (fyChurn !== null) {
+    churn = fyChurn;
+    churnSub = selectedSquad ? `FYTD · ${selectedSquad}` : 'FYTD · all squads';
+    churnClickable = true;
+  } else {
+    churn = total ? scopeRows.filter((r) => r.__live === false).length * 100 / total : null;
+    churnSub = `${fmtInt(scopeRows.filter((r) => r.__live === false).length)} delisted`;
+    churnClickable = false;
+  }
 
   const churnInner = [
-    el('div', { class: 's-label' }, ['Churn rate', usingFY ? el('span', { class: 'ext', text: ' ↗' }) : null]),
+    el('div', { class: 's-label' }, ['Churn rate', churnClickable ? el('span', { class: 'ext', text: ' ↗' }) : null]),
     el('div', { class: 'hero-num', text: fmtPct(churn) }),
-    el('div', { class: 's-sub', text: usingFY ? `${churnSub} · ${fmtInt(churnCount)} churned` : churnSub }),
+    el('div', { class: 's-sub', text: churnSub }),
   ];
 
-  // clickable only when we have the FY churn detail to show
+  // clickable → opens the Churn view (now inside the Squad-wise tab)
   let churnCard;
-  if (usingFY) {
-    churnCard = el('a', { class: 'hero-churn', href: '?view=churned', target: DETAIL_TAB,
-      title: 'Click to see the churned properties' }, churnInner);
+  if (churnClickable) {
+    churnCard = el('a', { class: 'hero-churn', href: '?view=squad', target: DETAIL_TAB,
+      title: 'Click to see churn detail by squad' }, churnInner);
     churnCard.addEventListener('click', (e) => {
-      if (e.ctrlKey || e.metaKey) return;   // let Ctrl/Cmd-click open the new tab
+      if (e.ctrlKey || e.metaKey) return;
       e.preventDefault();
-      go('churned');
+      go('squad');
     });
   } else {
     churnCard = el('div', { class: 'hero-churn' }, churnInner);
@@ -1426,6 +1443,38 @@ function viewOverview(allRows) {
 }
 
 /* ==== Churn Analysis module ============================================== */
+
+// Read the pre-calculated churn rate (%) for a squad from the MIS squad table.
+// Pass null/undefined for the overall "India" total.
+function misChurnRate(squad) {
+  const rows = state.misSquadChurn || [];
+  if (!rows.length) return null;
+  const target = squad ? norm(squad) : 'india';
+  const row = rows.find((r) => norm(r.squad) === target);
+  if (!row || row.churn_rate == null || row.churn_rate === '') return null;
+  const n = pctToNumber(row.churn_rate);
+  return n;
+}
+
+// The full MIS squad row (churned count, HO, SV, etc.) for a squad.
+function misSquadRow(squad) {
+  const rows = state.misSquadChurn || [];
+  const target = squad ? norm(squad) : 'india';
+  return rows.find((r) => norm(r.squad) === target) || null;
+}
+
+// Monthly churn rates for a squad, as [{month, rate}] in FY order (Apr→Mar).
+const FY_MONTHS = ['april','may','june','july','august','september','october','november','december','january','february','march'];
+function misMonthly(squad) {
+  const rows = state.misMonthlyChurn || [];
+  const target = squad ? norm(squad) : 'india';
+  const row = rows.find((r) => norm(r.squad) === target);
+  if (!row) return [];
+  return FY_MONTHS
+    .filter((m) => row[m] != null && String(row[m]).trim() !== '')
+    .map((m) => ({ month: m.charAt(0).toUpperCase() + m.slice(1), rate: pctToNumber(row[m]) }));
+}
+
 
 const FNB_BUCKETS = ['0%', '1-10%', '11-20%', '21%+'];
 
@@ -1593,113 +1642,107 @@ function churnMetricCard(label, value, tone) {
   ]);
 }
 
-function viewChurnAnalysis() {
+function viewChurnDetail() {
   const squad = state.caSquad || null;
   const kam = state.caKam || null;
-  const m = churnAnalysis(squad, kam);
+  const cd = state.cd || {};
 
   const frag = el('div', {}, []);
 
-  // breadcrumb: All squads › Squad › KAM
-  const crumb = el('div', { class: 'crumbs' });
-  const addCrumb = (label, target) => {
-    if (target) {
-      const a = el('a', { class: 'crumb', href: '#', text: label });
-      a.addEventListener('click', (e) => { e.preventDefault(); target(); });
-      crumb.append(a);
-    } else {
-      crumb.append(el('span', { class: 'crumb current', text: label }));
-    }
-    crumb.append(el('span', { class: 'crumb-sep', text: ' › ' }));
-  };
-  addCrumb('All squads', (squad || kam) ? () => { state.caSquad = null; state.caKam = null; go('churn-analysis'); } : null);
-  if (squad) addCrumb(squad, kam ? () => { state.caKam = null; go('churn-analysis'); } : null);
-  if (kam) addCrumb(kam, null);
-  // strip trailing separator
-  if (crumb.lastChild) crumb.removeChild(crumb.lastChild);
+  // back button → return to where we came from (squad or kam tab)
+  const back = el('button', { type: 'button', class: 'back-btn' }, [el('span', { class: 'back-arrow', text: '‹' }), 'Back']);
+  back.addEventListener('click', () => go(state.cdReturn || 'squad'));
+  frag.append(back);
 
-  const scopeLabel = kam ? `${kam} · ${squad}` : squad ? squad : 'all squads';
-  frag.append(pageHead('Churn analysis', `Delisted properties · ${scopeLabel}. Click a squad, then a KAM, to drill in.`));
-  frag.append(crumb);
+  // build the churned rows, then apply the card's filter + any user filters
+  let rows = churnAnalysis(squad, kam).rows;
+  if (cd.gcfLow) rows = rows.filter((r) => { const n = pctToNumber(r.gcf); return n !== null && n < 5; });
+  if (cd.initiatedBy) rows = rows.filter((r) => norm(r.initiatedBy).includes(norm(cd.initiatedBy)));
+  if (cd.fnb) rows = rows.filter((r) => fnbBucket(r.fnb) === cd.fnb);
+  if (cd.reason) rows = rows.filter((r) => norm(r.reason) === norm(cd.reason));
 
-  if (!state.churnAnalysis || !state.churnAnalysis.length) {
-    frag.append(el('div', { class: 'state' }, [
-      el('h3', { text: 'Churn analysis data not loaded' }),
-      el('p', { text: 'The churn_analysis table is empty or not created yet. Run the Churn Analysis sync in Apps Script.' }),
-    ]));
-    return frag;
+  // apply the extra user filters (state.cdFilters), if any
+  const f = state.cdFilters || {};
+  if (f.squad) rows = rows.filter((r) => norm(r.squad) === norm(f.squad));
+  if (f.kam) rows = rows.filter((r) => norm(r.kam) === norm(f.kam));
+  if (f.fnb) rows = rows.filter((r) => fnbBucket(r.fnb) === f.fnb);
+  if (f.reason) rows = rows.filter((r) => norm(r.reason) === norm(f.reason));
+  if (f.initiatedBy) rows = rows.filter((r) => norm(r.initiatedBy).includes(norm(f.initiatedBy)));
+  if (f.gcfRange) {
+    rows = rows.filter((r) => {
+      const n = pctToNumber(r.gcf); if (n === null) return false;
+      if (f.gcfRange === '<5%') return n < 5;
+      if (f.gcfRange === '5-10%') return n >= 5 && n <= 10;
+      if (f.gcfRange === '>10%') return n > 10;
+      return true;
+    });
   }
 
-  // metric cards
-  frag.append(sectionHead('Overview', `${fmtInt(m.total)} delisted · ${scopeLabel}`));
-  frag.append(el('div', { class: 'stat-grid' }, [
-    churnMetricCard('Total churned', m.total),
-    churnMetricCard('GCF below 5%', m.lowGcf, 'danger'),
-  ]));
+  // title describing the active card filter
+  const bits = [];
+  if (cd.gcfLow) bits.push('GCF below 5%');
+  if (cd.initiatedBy) bits.push(`initiated by ${cd.initiatedBy}`);
+  if (cd.fnb) bits.push(`F&B ${cd.fnb}`);
+  if (cd.reason) bits.push(cd.reason);
+  const scope = kam ? `${kam} · ${squad}` : squad ? squad : 'all squads';
+  frag.append(pageHead('Churned properties', `${scope}${bits.length ? ' · ' + bits.join(' · ') : ''}`));
 
-  // initiated by
-  frag.append(sectionHead('Churn initiated by', 'Who started the delist'));
-  frag.append(el('div', { class: 'stat-grid' },
-    m.initiatedBy.map(([k, v]) => churnMetricCard(k, v))));
+  // ---- filter bar (Squad, KAM, F&B, reason, initiated-by, GCF range) ----
+  frag.append(churnFilterBar(churnAnalysis(squad, kam).rows));
 
-  // F&B ranges
-  frag.append(sectionHead('F&B share ranges', 'Owner F&B share of churned properties'));
-  frag.append(el('div', { class: 'stat-grid' },
-    FNB_BUCKETS.map((b) => churnMetricCard(b, m.fnbCounts[b]))));
-
-  // top reasons
-  frag.append(sectionHead('Top churn reasons', 'From Reason Bucket'));
-  frag.append(el('div', { class: 'stat-grid' },
-    m.reasons.slice(0, 8).map(([k, v]) => churnMetricCard(k, v))));
-
-  // drill cards: squads (top level) or KAMs (inside a squad)
-  if (!squad) {
-    frag.append(sectionHead('By squad', 'Click a squad to drill in'));
-    frag.append(el('div', { class: 'group-grid' }, churnSquads().map((s) => churnDrillCard(s, 'squad'))));
-  } else if (!kam) {
-    frag.append(sectionHead('By KAM', `KAMs in ${squad} · click to drill in`));
-    frag.append(el('div', { class: 'group-grid' }, churnKams(squad).map((k) => churnDrillCard(k, 'kam'))));
-  }
-
-  // churned property list
-  frag.append(sectionHead('Churned properties', `${fmtInt(m.rows.length)} in scope`));
-  frag.append(churnPropertyTable(m.rows));
+  frag.append(sectionHead('Results', `${fmtInt(rows.length)} properties`));
+  frag.append(churnPropertyTable(rows));
 
   return frag;
 }
 
-function churnDrillCard(entry, kind) {
-  const href = kind === 'squad'
-    ? `?view=churn-analysis&casquad=${encodeURIComponent(entry.name)}`
-    : `?view=churn-analysis&casquad=${encodeURIComponent(state.caSquad || '')}&cakam=${encodeURIComponent(entry.name)}`;
-  const card = el('a', { class: 'group-card', href, target: DETAIL_TAB,
-    title: 'Click to drill in · Ctrl/Cmd-click for a new tab' }, [
-    el('div', { class: 'gc-name', text: entry.name }),
-    el('div', { class: 'gc-count', text: `${fmtInt(entry.count)} churned` }),
-  ]);
-  card.addEventListener('click', (e) => {
-    if (e.ctrlKey || e.metaKey) return;
-    e.preventDefault();
-    if (kind === 'squad') { state.caSquad = entry.name; state.caKam = null; }
-    else { state.caKam = entry.name; }
-    go('churn-analysis');
-  });
-  return card;
+/** Filter controls for the churn-detail list. Simple dropdowns. */
+function churnFilterBar(allRows) {
+  const f = state.cdFilters || {};
+  const uniq = (key) => [...new Set(allRows.map((r) => r[key]).filter(Boolean))].sort();
+  const bar = el('div', { class: 'filter-bar' });
+
+  const addSelect = (label, key, options) => {
+    const sel = el('select', { class: 'flt' });
+    sel.append(el('option', { value: '', text: label }));
+    for (const o of options) {
+      const opt = el('option', { value: o, text: o });
+      if (f[key] === o) opt.selected = true;
+      sel.append(opt);
+    }
+    sel.addEventListener('change', () => {
+      state.cdFilters = { ...(state.cdFilters || {}), [key]: sel.value || null };
+      render();
+    });
+    bar.append(sel);
+  };
+
+  addSelect('All squads', 'squad', uniq('squad'));
+  addSelect('All KAMs', 'kam', uniq('kam'));
+  addSelect('All F&B bands', 'fnb', FNB_BUCKETS);
+  addSelect('All reasons', 'reason', uniq('reason'));
+  addSelect('All initiated-by', 'initiatedBy', uniq('initiatedBy'));
+  addSelect('All GCF ranges', 'gcfRange', ['<5%', '5-10%', '>10%']);
+
+  if (state.cdFilters && Object.values(state.cdFilters).some(Boolean)) {
+    const clear = el('button', { type: 'button', class: 'reset-btn', text: 'Clear filters' });
+    clear.addEventListener('click', () => { state.cdFilters = {}; render(); });
+    bar.append(clear);
+  }
+  return bar;
 }
 
 function churnPropertyTable(rows) {
   if (!rows.length) return el('div', { class: 'state' }, [el('p', { text: 'No churned properties in this scope.' })]);
   const table = el('table', { class: 'grid' });
   table.append(el('thead', {}, [el('tr', {}, [
-    'Property', 'KAM', 'Squad', 'GCF', 'F&B', 'Initiated by', 'Reason', 'Delist date',
+    'Property ID', 'Name', 'KAM', 'Squad', 'GCF', 'F&B', 'Initiated by', 'Reason', 'Delist date',
   ].map((h) => el('th', { style: 'text-align:left', text: h })))]));
   const tbody = el('tbody', {});
   for (const r of rows) {
     tbody.append(el('tr', {}, [
-      el('td', { style: 'text-align:left' }, [
-        el('div', { text: r.vista_name || `Property ${r.property_id}` }),
-        r.property_id ? el('div', { class: 'row-sub', text: String(r.property_id) }) : null,
-      ]),
+      el('td', { style: 'text-align:left', text: r.property_id != null ? String(r.property_id) : '—' }),
+      el('td', { style: 'text-align:left', text: r.vista_name || '—' }),
       el('td', { style: 'text-align:left', text: r.kam || '—' }),
       el('td', { style: 'text-align:left', text: r.squad || '—' }),
       el('td', { style: 'text-align:left', text: r.gcf != null && r.gcf !== '' ? String(r.gcf) : '—' }),
@@ -1716,7 +1759,7 @@ function churnPropertyTable(rows) {
 /* ---- Squad-wise / KAM-wise: cards on top, property list below ------------ */
 
 function viewGroup(rows, field, dimension, title, desc) {
-  // Squad/KAM summaries are LIVE properties only.
+  // Squad/KAM summaries are LIVE properties only (for the agreement section).
   const live = rows.filter((r) => r.__live === true);
   const groups = groupBy(live, field);
 
@@ -1725,21 +1768,128 @@ function viewGroup(rows, field, dimension, title, desc) {
 
   const frag = el('div', {}, [pageHead(title, desc)]);
 
-  // Agreement status cards for the live set (no Live/Churn hero here — that
-  // lives only on the Live Properties tab).
+  // ---- SECTION 1: Agreement status (live properties) ----
   frag.append(
     sectionHead('Agreement status', `${fmtInt(live.length)} live properties`),
     statusCards(live, { live: true }),
+  );
+
+  // ---- SECTION 2: Churn (delisted properties, from MIS + churn_analysis) ----
+  frag.append(churnSection(dimension, focused));
+
+  // ---- SECTION 3: the drill cards (squads or KAMs) ----
+  frag.append(
     sectionHead(dimension === 'squad' ? 'Squads' : 'KAMs', `${fmtInt(groups.length)} in scope · tap a card to open its properties`),
     el('div', { class: 'group-grid' }, groups.map((e) => groupCard(e, dimension))),
   );
 
-  // The property table only appears once a specific squad/KAM is selected.
+  // The live property table appears once a specific squad/KAM is selected.
   if (focused) {
     frag.append(propertyList(live, { title: `${focused} · properties` }));
   }
   return frag;
 }
+
+/**
+ * The Churn section shown inside the Squad-wise / KAM-wise tabs.
+ * Uses the MIS pre-calculated churn rate + churn_analysis breakdowns, scoped to
+ * the selected squad/KAM. Every metric card is clickable → opens the matching
+ * churned-property list (new tab in the same browser, with a back button).
+ */
+function churnSection(dimension, focused) {
+  const squad = dimension === 'squad' ? focused : (state.filters.squads.length === 1 ? state.filters.squads[0] : null);
+  const kam = dimension === 'kam' ? focused : null;
+
+  const wrap = el('div', {});
+  const rate = misChurnRate(squad);
+  const scope = kam ? kam : squad ? squad : 'all India';
+
+  // headline churn rate, flagged red if > 1%
+  const flagged = rate !== null && rate > 1;
+  const rateCard = el('div', { class: `stat ${flagged ? 'tone-danger' : ''}` }, [
+    el('div', { class: 's-label' }, ['Churn rate', flagged ? el('span', { class: 'flag-dot', title: 'Above 1%', text: ' ●' }) : null]),
+    el('div', { class: 's-value', text: rate !== null ? fmtPct(rate) : '—' }),
+    el('div', { class: 's-sub', text: flagged ? 'Above 1% — flagged' : `FYTD · ${scope}` }),
+  ]);
+
+  const misRow = misSquadRow(squad);
+  const churnedCount = misRow && misRow.churned ? misRow.churned : (churnAnalysis(squad, kam).total || 0);
+
+  wrap.append(sectionHead('Churn', `Delisted properties · ${scope}`));
+  wrap.append(el('div', { class: 'stat-grid' }, [
+    rateCard,
+    clickableChurnCard('Total churned', churnedCount, {}, squad, kam),
+    clickableChurnCard('GCF below 5%', churnAnalysis(squad, kam).lowGcf, { gcfLow: true }, squad, kam),
+  ]));
+
+  // Initiated by — from MIS (HO / SV) when available, else computed
+  let ho = misRow && misRow.ho ? misRow.ho : null;
+  let sv = misRow && misRow.sv ? misRow.sv : null;
+  if (ho === null && sv === null) {
+    const m = churnAnalysis(squad, kam);
+    const find = (k) => (m.initiatedBy.find(([label]) => norm(label).includes(k)) || [null, 0])[1];
+    ho = find('home'); sv = find('stay');
+  }
+  wrap.append(sectionHead('Churn initiated by', 'Home Owner vs StayVista'));
+  wrap.append(el('div', { class: 'stat-grid' }, [
+    clickableChurnCard('Home Owner', ho || 0, { initiatedBy: 'Home Owner' }, squad, kam),
+    clickableChurnCard('StayVista', sv || 0, { initiatedBy: 'StayVista' }, squad, kam),
+  ]));
+
+  // F&B ranges — clickable
+  const m2 = churnAnalysis(squad, kam);
+  wrap.append(sectionHead('F&B share ranges', 'Owner F&B share of churned properties'));
+  wrap.append(el('div', { class: 'stat-grid' },
+    FNB_BUCKETS.map((b) => clickableChurnCard(b, m2.fnbCounts[b], { fnb: b }, squad, kam))));
+
+  // Top reasons — clickable
+  wrap.append(sectionHead('Top churn reasons', 'From Reason Bucket'));
+  wrap.append(el('div', { class: 'stat-grid' },
+    m2.reasons.slice(0, 8).map(([k, v]) => clickableChurnCard(k, v, { reason: k }, squad, kam))));
+
+  // Monthly churn rate (from MIS Table 3) — flag months > 1%
+  const monthly = misMonthly(squad);
+  if (monthly.length) {
+    wrap.append(sectionHead('Monthly churn rate', `FY Apr–Mar · ${scope} · red = above 1%`));
+    wrap.append(el('div', { class: 'stat-grid' },
+      monthly.map((mm) => el('div', { class: `stat ${mm.rate > 1 ? 'tone-danger' : ''}` }, [
+        el('div', { class: 's-label', text: mm.month }),
+        el('div', { class: 's-value', text: fmtPct(mm.rate) }),
+      ]))));
+  }
+
+  return wrap;
+}
+
+/** A churn metric card that opens the filtered churned-property list on click. */
+function clickableChurnCard(label, value, filter, squad, kam) {
+  const p = new URLSearchParams();
+  p.set('view', 'churn-detail');
+  if (squad) p.set('casquad', squad);
+  if (kam) p.set('cakam', kam);
+  if (filter.gcfLow) p.set('cgcf', '1');
+  if (filter.initiatedBy) p.set('cby', filter.initiatedBy);
+  if (filter.fnb) p.set('cfnb', filter.fnb);
+  if (filter.reason) p.set('creason', filter.reason);
+  const href = '?' + p.toString();
+
+  const card = el('a', { class: 'stat stat-link', href, target: DETAIL_TAB,
+    title: 'Click to see these properties · Ctrl/Cmd-click for a new tab' }, [
+    el('div', { class: 's-label' }, [label, el('span', { class: 'ext', text: ' ↗' })]),
+    el('div', { class: 's-value', text: fmtInt(value) }),
+  ]);
+  card.addEventListener('click', (e) => {
+    if (e.ctrlKey || e.metaKey) return;
+    e.preventDefault();
+    state.caSquad = squad || null;
+    state.caKam = kam || null;
+    state.cd = { gcfLow: !!filter.gcfLow, initiatedBy: filter.initiatedBy || null, fnb: filter.fnb || null, reason: filter.reason || null };
+    state.cdReturn = state.view;
+    go('churn-detail');
+  });
+  return card;
+}
+
 
 /* ---- Property Details: the filtered row-level list ---------------------- */
 
@@ -2354,8 +2504,8 @@ function renderView() {
     case 'churned':
       root.append(viewChurned());
       break;
-    case 'churn-analysis':
-      root.append(viewChurnAnalysis());
+    case 'churn-detail':
+      root.append(viewChurnDetail());
       break;
     default:
       root.append(viewOverview(rows));
@@ -2448,6 +2598,8 @@ async function boot(isRefresh = false) {
     state.churnRef = await fetchChurnRef();
     state.churnAnalysis = await fetchTable('churn_analysis');
     state.gcfMarginal = await fetchTable('gcf_marginal');
+    state.misSquadChurn = await fetchTable('mis_squad_churn');
+    state.misMonthlyChurn = await fetchTable('mis_monthly_churn');
     state.cols = resolveColumns(raw[0]);
 
     // names can't separate the two status columns — the data can
