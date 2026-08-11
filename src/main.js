@@ -445,6 +445,28 @@ async function probeTable(name) {
 }
 
 /** Fetch every row, 1000 at a time. Without this the tabs silently cap at 1000. */
+async function fetchTable(tableName) {
+  // Best-effort read of an optional table; returns [] if it isn't there yet.
+  if (!SUPABASE_URL || !SUPABASE_KEY) return [];
+  try {
+    const out = [];
+    let from = 0;
+    for (let guard = 0; guard < 40; guard++) {
+      const res = await fetch(`${SUPABASE_URL}/rest/v1/${encodeURIComponent(tableName)}?select=*`, {
+        headers: { ...authHeaders(), 'Range-Unit': 'items', Range: `${from}-${from + PAGE_SIZE - 1}` },
+      });
+      if (!res.ok) return out;
+      const batch = await res.json();
+      out.push(...batch);
+      if (batch.length < PAGE_SIZE) break;
+      from += PAGE_SIZE;
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
 async function fetchChurnRef() {
   // Best-effort: if the churn_ref table isn't there yet, return [] so the
   // dashboard still works and falls back to simple churn.
@@ -545,6 +567,7 @@ const VIEWS = [
   { id: 'overview',        label: 'Live Properties',    group: 'Summary' },
   { id: 'squad',           label: 'Squad-wise',         group: 'Summary' },
   { id: 'kam',             label: 'KAM-wise',           group: 'Summary' },
+  { id: 'churn-analysis',  label: 'Churn Analysis',     group: 'Summary' },
   { id: 'properties',      label: 'Property Details',   group: 'Detail'  },
   { id: 'diagnostics',     label: 'Connection check',   group: 'Setup'   },
 ];
@@ -568,6 +591,10 @@ const state = {
   rows: [],
   raw: [],
   churnRef: [],
+  churnAnalysis: [],
+  gcfMarginal: [],
+  caSquad: null,
+  caKam: null,
   cols: {},
   diag: {},
   loading: true,
@@ -609,6 +636,8 @@ function readUrl() {
   state.search = p.get('q') || '';
   state.focus = p.get('focus') === '1';
   state.filters.newNoAgreement = p.get('newna') === '1';
+  state.caSquad = p.get('casquad') || null;
+  state.caKam = p.get('cakam') || null;
 }
 
 function urlFor(view, sub) {
@@ -624,6 +653,8 @@ function urlFor(view, sub) {
   if (state.search) p.set('q', state.search);
   if (state.focus) p.set('focus', '1');
   if (state.filters.newNoAgreement) p.set('newna', '1');
+  if (state.caSquad) p.set('casquad', state.caSquad);
+  if (state.caKam) p.set('cakam', state.caKam);
   const qs = p.toString();
   return qs ? `?${qs}` : location.pathname;
 }
@@ -1394,6 +1425,100 @@ function viewOverview(allRows) {
   return frag;
 }
 
+/* ==== Churn Analysis module ============================================== */
+
+const FNB_BUCKETS = ['0%', '1-10%', '11-20%', '21%+'];
+
+function pctToNumber(v) {
+  if (v === null || v === undefined || v === '') return null;
+  let n = Number(String(v).trim().replace('%', ''));
+  if (Number.isNaN(n)) return null;
+  if (n > 0 && n < 1) n = n * 100;   // 0.03 -> 3
+  return n;
+}
+
+function fnbBucket(v) {
+  const n = pctToNumber(v);
+  if (n === null) return null;
+  if (n <= 0) return '0%';
+  if (n <= 10) return '1-10%';
+  if (n <= 20) return '11-20%';
+  return '21%+';
+}
+
+function churnAnalysis(squad, kam) {
+  const churn = state.churnAnalysis || [];
+  const marginal = state.gcfMarginal || [];
+
+  const gcfById = {};
+  for (const m of marginal) if (m.property_id != null) gcfById[String(m.property_id).trim()] = m;
+
+  const isDelisted = (r) => norm(r.current_status) === 'delisted';
+  const matchSquad = (r) => !squad || norm(r.squad) === norm(squad);
+  const matchKam = (r) => !kam || norm(r.kam) === norm(kam);
+
+  const seen = new Set();
+  const rows = [];
+  for (const r of churn) {
+    if (!isDelisted(r) || !matchSquad(r) || !matchKam(r)) continue;
+    const id = r.property_id != null ? String(r.property_id).trim() : '';
+    if (id && seen.has(id)) continue;
+    if (id) seen.add(id);
+    const g = id ? gcfById[id] : null;
+    rows.push({
+      property_id: r.property_id,
+      vista_name: r.vista_name || '',
+      squad: r.squad || '',
+      kam: r.kam || '—',
+      initiatedBy: r.delist_initiated_by || 'Unknown',
+      reason: r.reason_bucket || 'Unspecified',
+      delistDate: r.delist_date || '',
+      gcf: g ? g.gcf_current : null,
+      fnb: g ? g.fnb_current : null,
+    });
+  }
+
+  const total = rows.length;
+  const lowGcf = rows.filter((r) => { const n = pctToNumber(r.gcf); return n !== null && n < 5; }).length;
+
+  const byBucket = (list, keyFn) => {
+    const m = {};
+    for (const r of list) { const k = keyFn(r) || 'Unknown'; m[k] = (m[k] || 0) + 1; }
+    return Object.entries(m).sort((a, b) => b[1] - a[1]);
+  };
+
+  const fnbCounts = Object.fromEntries(FNB_BUCKETS.map((b) => [b, 0]));
+  for (const r of rows) { const b = fnbBucket(r.fnb); if (b) fnbCounts[b] += 1; }
+
+  return { rows, total, lowGcf,
+    initiatedBy: byBucket(rows, (r) => r.initiatedBy),
+    reasons: byBucket(rows, (r) => r.reason),
+    fnbCounts };
+}
+
+function churnSquads() {
+  const m = {};
+  for (const r of (state.churnAnalysis || [])) {
+    if (norm(r.current_status) !== 'delisted') continue;
+    const s = r.squad || '—';
+    (m[s] = m[s] || new Set());
+    if (r.property_id != null) m[s].add(String(r.property_id).trim());
+  }
+  return Object.entries(m).map(([name, set]) => ({ name, count: set.size })).sort((a, b) => b.count - a.count);
+}
+
+function churnKams(squad) {
+  const m = {};
+  for (const r of (state.churnAnalysis || [])) {
+    if (norm(r.current_status) !== 'delisted') continue;
+    if (squad && norm(r.squad) !== norm(squad)) continue;
+    const k = r.kam || '—';
+    (m[k] = m[k] || new Set());
+    if (r.property_id != null) m[k].add(String(r.property_id).trim());
+  }
+  return Object.entries(m).map(([name, set]) => ({ name, count: set.size })).sort((a, b) => b.count - a.count);
+}
+
 /* ---- Churned properties (drill-in from the churn card) ------------------- */
 
 function viewChurned() {
@@ -1457,6 +1582,135 @@ function viewChurned() {
   ]));
 
   return frag;
+}
+
+/* ---- Churn Analysis: Squad -> KAM drill-down ---------------------------- */
+
+function churnMetricCard(label, value, tone) {
+  return el('div', { class: `stat ${tone ? 'tone-' + tone : ''}` }, [
+    el('div', { class: 's-label', text: label }),
+    el('div', { class: 's-value', text: fmtInt(value) }),
+  ]);
+}
+
+function viewChurnAnalysis() {
+  const squad = state.caSquad || null;
+  const kam = state.caKam || null;
+  const m = churnAnalysis(squad, kam);
+
+  const frag = el('div', {}, []);
+
+  // breadcrumb: All squads › Squad › KAM
+  const crumb = el('div', { class: 'crumbs' });
+  const addCrumb = (label, target) => {
+    if (target) {
+      const a = el('a', { class: 'crumb', href: '#', text: label });
+      a.addEventListener('click', (e) => { e.preventDefault(); target(); });
+      crumb.append(a);
+    } else {
+      crumb.append(el('span', { class: 'crumb current', text: label }));
+    }
+    crumb.append(el('span', { class: 'crumb-sep', text: ' › ' }));
+  };
+  addCrumb('All squads', (squad || kam) ? () => { state.caSquad = null; state.caKam = null; go('churn-analysis'); } : null);
+  if (squad) addCrumb(squad, kam ? () => { state.caKam = null; go('churn-analysis'); } : null);
+  if (kam) addCrumb(kam, null);
+  // strip trailing separator
+  if (crumb.lastChild) crumb.removeChild(crumb.lastChild);
+
+  const scopeLabel = kam ? `${kam} · ${squad}` : squad ? squad : 'all squads';
+  frag.append(pageHead('Churn analysis', `Delisted properties · ${scopeLabel}. Click a squad, then a KAM, to drill in.`));
+  frag.append(crumb);
+
+  if (!state.churnAnalysis || !state.churnAnalysis.length) {
+    frag.append(el('div', { class: 'state' }, [
+      el('h3', { text: 'Churn analysis data not loaded' }),
+      el('p', { text: 'The churn_analysis table is empty or not created yet. Run the Churn Analysis sync in Apps Script.' }),
+    ]));
+    return frag;
+  }
+
+  // metric cards
+  frag.append(sectionHead('Overview', `${fmtInt(m.total)} delisted · ${scopeLabel}`));
+  frag.append(el('div', { class: 'stat-grid' }, [
+    churnMetricCard('Total churned', m.total),
+    churnMetricCard('GCF below 5%', m.lowGcf, 'danger'),
+  ]));
+
+  // initiated by
+  frag.append(sectionHead('Churn initiated by', 'Who started the delist'));
+  frag.append(el('div', { class: 'stat-grid' },
+    m.initiatedBy.map(([k, v]) => churnMetricCard(k, v))));
+
+  // F&B ranges
+  frag.append(sectionHead('F&B share ranges', 'Owner F&B share of churned properties'));
+  frag.append(el('div', { class: 'stat-grid' },
+    FNB_BUCKETS.map((b) => churnMetricCard(b, m.fnbCounts[b]))));
+
+  // top reasons
+  frag.append(sectionHead('Top churn reasons', 'From Reason Bucket'));
+  frag.append(el('div', { class: 'stat-grid' },
+    m.reasons.slice(0, 8).map(([k, v]) => churnMetricCard(k, v))));
+
+  // drill cards: squads (top level) or KAMs (inside a squad)
+  if (!squad) {
+    frag.append(sectionHead('By squad', 'Click a squad to drill in'));
+    frag.append(el('div', { class: 'group-grid' }, churnSquads().map((s) => churnDrillCard(s, 'squad'))));
+  } else if (!kam) {
+    frag.append(sectionHead('By KAM', `KAMs in ${squad} · click to drill in`));
+    frag.append(el('div', { class: 'group-grid' }, churnKams(squad).map((k) => churnDrillCard(k, 'kam'))));
+  }
+
+  // churned property list
+  frag.append(sectionHead('Churned properties', `${fmtInt(m.rows.length)} in scope`));
+  frag.append(churnPropertyTable(m.rows));
+
+  return frag;
+}
+
+function churnDrillCard(entry, kind) {
+  const href = kind === 'squad'
+    ? `?view=churn-analysis&casquad=${encodeURIComponent(entry.name)}`
+    : `?view=churn-analysis&casquad=${encodeURIComponent(state.caSquad || '')}&cakam=${encodeURIComponent(entry.name)}`;
+  const card = el('a', { class: 'group-card', href, target: DETAIL_TAB,
+    title: 'Click to drill in · Ctrl/Cmd-click for a new tab' }, [
+    el('div', { class: 'gc-name', text: entry.name }),
+    el('div', { class: 'gc-count', text: `${fmtInt(entry.count)} churned` }),
+  ]);
+  card.addEventListener('click', (e) => {
+    if (e.ctrlKey || e.metaKey) return;
+    e.preventDefault();
+    if (kind === 'squad') { state.caSquad = entry.name; state.caKam = null; }
+    else { state.caKam = entry.name; }
+    go('churn-analysis');
+  });
+  return card;
+}
+
+function churnPropertyTable(rows) {
+  if (!rows.length) return el('div', { class: 'state' }, [el('p', { text: 'No churned properties in this scope.' })]);
+  const table = el('table', { class: 'grid' });
+  table.append(el('thead', {}, [el('tr', {}, [
+    'Property', 'KAM', 'Squad', 'GCF', 'F&B', 'Initiated by', 'Reason', 'Delist date',
+  ].map((h) => el('th', { style: 'text-align:left', text: h })))]));
+  const tbody = el('tbody', {});
+  for (const r of rows) {
+    tbody.append(el('tr', {}, [
+      el('td', { style: 'text-align:left' }, [
+        el('div', { text: r.vista_name || `Property ${r.property_id}` }),
+        r.property_id ? el('div', { class: 'row-sub', text: String(r.property_id) }) : null,
+      ]),
+      el('td', { style: 'text-align:left', text: r.kam || '—' }),
+      el('td', { style: 'text-align:left', text: r.squad || '—' }),
+      el('td', { style: 'text-align:left', text: r.gcf != null && r.gcf !== '' ? String(r.gcf) : '—' }),
+      el('td', { style: 'text-align:left', text: r.fnb != null && r.fnb !== '' ? String(r.fnb) : '—' }),
+      el('td', { style: 'text-align:left', text: r.initiatedBy || '—' }),
+      el('td', { style: 'text-align:left', text: r.reason || '—' }),
+      el('td', { style: 'text-align:left', text: r.delistDate ? String(r.delistDate).slice(0, 10) : '—' }),
+    ]));
+  }
+  table.append(tbody);
+  return el('div', { class: 'panel' }, [el('div', { class: 'panel-body', style: 'padding:0' }, [table])]);
 }
 
 /* ---- Squad-wise / KAM-wise: cards on top, property list below ------------ */
@@ -2100,6 +2354,9 @@ function renderView() {
     case 'churned':
       root.append(viewChurned());
       break;
+    case 'churn-analysis':
+      root.append(viewChurnAnalysis());
+      break;
     default:
       root.append(viewOverview(rows));
   }
@@ -2189,6 +2446,8 @@ async function boot(isRefresh = false) {
     const raw = await fetchAllRows(state.diag);
     state.raw = raw;
     state.churnRef = await fetchChurnRef();
+    state.churnAnalysis = await fetchTable('churn_analysis');
+    state.gcfMarginal = await fetchTable('gcf_marginal');
     state.cols = resolveColumns(raw[0]);
 
     // names can't separate the two status columns — the data can

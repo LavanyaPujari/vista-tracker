@@ -1566,3 +1566,11 @@ a.hero-churn { text-decoration: none; color: inherit; cursor: pointer; transitio
 a.hero-churn:hover { box-shadow: var(--shadow-2); }
 a.hero-churn:active { transform: translateY(1px); }
 a.hero-churn .ext { font-size: 12px; opacity: .5; }
+
+/* churn-analysis breadcrumbs */
+.crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; margin: 4px 0 14px; font-size: 13px; }
+.crumb { color: var(--ink-2); text-decoration: none; }
+.crumb:not(.current):hover { color: var(--ink); text-decoration: underline; }
+.crumb.current { color: var(--ink); font-weight: 500; }
+.crumb-sep { color: var(--muted); margin: 0 2px; }
+.gc-count { font-size: 12px; color: var(--muted); margin-top: 4px; }
