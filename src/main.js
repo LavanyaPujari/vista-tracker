@@ -1514,12 +1514,17 @@ function churnAnalysis(squad, kam) {
     if (id && seen.has(id)) continue;
     if (id) seen.add(id);
     const g = id ? gcfById[id] : null;
+    const rawBy = r.delist_initiated_by || '';
+    const byNorm = norm(rawBy);
+    const initiatedBy = byNorm === 'ho' ? 'Home Owner'
+      : byNorm === 'sv' ? 'StayVista'
+      : (rawBy || 'Unknown');
     rows.push({
       property_id: r.property_id,
       vista_name: r.vista_name || '',
       squad: r.squad || '',
       kam: r.kam || '—',
-      initiatedBy: r.delist_initiated_by || 'Unknown',
+      initiatedBy,
       reason: r.reason_bucket || 'Unspecified',
       delistDate: r.delist_date || '',
       gcf: g ? g.gcf_current : null,
