@@ -1884,9 +1884,10 @@ function churnSection(dimension, focused) {
   ]);
 
   const misRow = misSquadRow(squad);
-  // when a month is picked, the count comes from that month's churned rows;
-  // otherwise use the MIS pre-counted total (falls back to computed).
-  const churnedCount = month ? m2.total : (misRow && misRow.churned ? misRow.churned : m2.total);
+  // Counts come from the ACTUAL churn rows (m2) so every card matches the list
+  // that opens when you click it. (The churn RATE above still comes from MIS,
+  // since that's a trusted percentage, not a row count.)
+  const churnedCount = m2.total;
 
   wrap.append(sectionHead('Churn', `Delisted properties · ${scope}${month ? ' · ' + month : ''}`));
   wrap.append(el('div', { class: 'stat-grid' }, [
@@ -1895,20 +1896,11 @@ function churnSection(dimension, focused) {
     clickableChurnCard('GCF below 5%', m2.lowGcf, { gcfLow: true }, squad, kam),
   ]));
 
-  // Initiated by — when a month is picked, count from that month's rows;
-  // otherwise prefer the MIS HO/SV columns.
-  let ho, sv;
-  if (month) {
-    const find = (k) => (m2.initiatedBy.find(([label]) => norm(label).includes(k)) || [null, 0])[1];
-    ho = find('home'); sv = find('stay');
-  } else {
-    ho = misRow && misRow.ho ? misRow.ho : null;
-    sv = misRow && misRow.sv ? misRow.sv : null;
-    if (ho === null && sv === null) {
-      const find = (k) => (m2.initiatedBy.find(([label]) => norm(label).includes(k)) || [null, 0])[1];
-      ho = find('home'); sv = find('stay');
-    }
-  }
+  // Initiated by — always counted from the actual rows, so the card number
+  // equals the number of rows you see when you click it.
+  const findBy = (k) => (m2.initiatedBy.find(([label]) => norm(label).includes(k)) || [null, 0])[1];
+  const ho = findBy('home');
+  const sv = findBy('stay');
   wrap.append(sectionHead('Churn initiated by', 'Home Owner vs StayVista'));
   wrap.append(el('div', { class: 'stat-grid' }, [
     clickableChurnCard('Home Owner', ho || 0, { initiatedBy: 'Home Owner' }, squad, kam),
