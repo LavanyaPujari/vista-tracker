@@ -595,10 +595,12 @@ const state = {
   misSquadChurn: [],
   misMonthlyChurn: [],
   caSquad: null,
+  caMonth: null,
   caKam: null,
   cd: {},
   cdFilters: {},
   cdReturn: 'squad',
+  cdPage: 1,
   cols: {},
   diag: {},
   loading: true,
@@ -637,6 +639,11 @@ function readUrl() {
   state.filters.statuses = split(p.get('status'));
   state.period.month = p.get('m') || '';
   state.period.year  = p.get('y') || '';
+  // the top month filter (numeric 1-12) also drives the churn section's month
+  if (state.period.month) {
+    const n = Number(state.period.month);
+    if (n >= 1 && n <= 12) state.caMonth = MONTH_NAMES[n - 1];
+  }
   state.search = p.get('q') || '';
   state.focus = p.get('focus') === '1';
   state.filters.newNoAgreement = p.get('newna') === '1';
@@ -1477,6 +1484,7 @@ function misMonthly(squad) {
 
 
 const FNB_BUCKETS = ['0%', '1-10%', '11-20%', '21%+'];
+const MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
 
 function pctToNumber(v) {
   if (v === null || v === undefined || v === '') return null;
@@ -1495,21 +1503,27 @@ function fnbBucket(v) {
   return '21%+';
 }
 
-function churnAnalysis(squad, kam) {
+function churnAnalysis(squad, kam, month) {
   const churn = state.churnAnalysis || [];
   const marginal = state.gcfMarginal || [];
 
   const gcfById = {};
   for (const m of marginal) if (m.property_id != null) gcfById[String(m.property_id).trim()] = m;
 
+  const monthNum = month ? MONTH_NAMES.findIndex((mn) => norm(mn) === norm(month)) + 1 : 0;
   const isDelisted = (r) => norm(r.current_status) === 'delisted';
   const matchSquad = (r) => !squad || norm(r.squad) === norm(squad);
   const matchKam = (r) => !kam || norm(r.kam) === norm(kam);
+  const matchMonth = (r) => {
+    if (!monthNum) return true;
+    const d = r.delist_date ? new Date(r.delist_date) : null;
+    return d && !Number.isNaN(d.getTime()) && (d.getMonth() + 1) === monthNum;
+  };
 
   const seen = new Set();
   const rows = [];
   for (const r of churn) {
-    if (!isDelisted(r) || !matchSquad(r) || !matchKam(r)) continue;
+    if (!isDelisted(r) || !matchSquad(r) || !matchKam(r) || !matchMonth(r)) continue;
     const id = r.property_id != null ? String(r.property_id).trim() : '';
     if (id && seen.has(id)) continue;
     if (id) seen.add(id);
@@ -1717,6 +1731,7 @@ function churnFilterBar(allRows) {
     }
     sel.addEventListener('change', () => {
       state.cdFilters = { ...(state.cdFilters || {}), [key]: sel.value || null };
+      state.cdPage = 1;
       render();
     });
     bar.append(sel);
@@ -1731,7 +1746,7 @@ function churnFilterBar(allRows) {
 
   if (state.cdFilters && Object.values(state.cdFilters).some(Boolean)) {
     const clear = el('button', { type: 'button', class: 'reset-btn', text: 'Clear filters' });
-    clear.addEventListener('click', () => { state.cdFilters = {}; render(); });
+    clear.addEventListener('click', () => { state.cdFilters = {}; state.cdPage = 1; render(); });
     bar.append(clear);
   }
   return bar;
@@ -1739,12 +1754,21 @@ function churnFilterBar(allRows) {
 
 function churnPropertyTable(rows) {
   if (!rows.length) return el('div', { class: 'state' }, [el('p', { text: 'No churned properties in this scope.' })]);
+
+  const PER_PAGE = 25;
+  const pageCount = Math.ceil(rows.length / PER_PAGE);
+  let page = state.cdPage || 1;
+  if (page > pageCount) page = pageCount;
+  if (page < 1) page = 1;
+  const start = (page - 1) * PER_PAGE;
+  const pageRows = rows.slice(start, start + PER_PAGE);
+
   const table = el('table', { class: 'grid' });
   table.append(el('thead', {}, [el('tr', {}, [
     'Property ID', 'Name', 'KAM', 'Squad', 'GCF', 'F&B', 'Initiated by', 'Reason', 'Delist date',
   ].map((h) => el('th', { style: 'text-align:left', text: h })))]));
   const tbody = el('tbody', {});
-  for (const r of rows) {
+  for (const r of pageRows) {
     tbody.append(el('tr', {}, [
       el('td', { style: 'text-align:left', text: r.property_id != null ? String(r.property_id) : '—' }),
       el('td', { style: 'text-align:left', text: r.vista_name || '—' }),
@@ -1758,7 +1782,25 @@ function churnPropertyTable(rows) {
     ]));
   }
   table.append(tbody);
-  return el('div', { class: 'panel' }, [el('div', { class: 'panel-body', style: 'padding:0' }, [table])]);
+
+  const parts = [el('div', { class: 'panel-body', style: 'padding:0' }, [table])];
+
+  // pagination controls (Prev / page x of y / Next), only if >1 page
+  if (pageCount > 1) {
+    const pager = el('div', { class: 'pager' });
+    const prev = el('button', { type: 'button', class: 'pg-btn', text: '‹ Prev' });
+    if (page <= 1) prev.disabled = true;
+    prev.addEventListener('click', () => { state.cdPage = page - 1; render(); });
+    const next = el('button', { type: 'button', class: 'pg-btn', text: 'Next ›' });
+    if (page >= pageCount) next.disabled = true;
+    next.addEventListener('click', () => { state.cdPage = page + 1; render(); });
+    pager.append(prev,
+      el('span', { class: 'pg-info', text: `Page ${page} of ${pageCount} · ${fmtInt(rows.length)} total` }),
+      next);
+    parts.push(pager);
+  }
+
+  return el('div', { class: 'panel' }, parts);
 }
 
 /* ---- Squad-wise / KAM-wise: cards on top, property list below ------------ */
@@ -1804,36 +1846,68 @@ function viewGroup(rows, field, dimension, title, desc) {
 function churnSection(dimension, focused) {
   const squad = dimension === 'squad' ? focused : (state.filters.squads.length === 1 ? state.filters.squads[0] : null);
   const kam = dimension === 'kam' ? focused : null;
+  const month = state.caMonth || null;
 
   const wrap = el('div', {});
-  const rate = misChurnRate(squad);
   const scope = kam ? kam : squad ? squad : 'all India';
+
+  // churn rate: if a month is picked, use that month's rate from the monthly
+  // table; otherwise the FYTD rate from the squad summary.
+  let rate;
+  if (month) {
+    const mm = misMonthly(squad).find((x) => norm(x.month) === norm(month));
+    rate = mm ? mm.rate : null;
+  } else {
+    rate = misChurnRate(squad);
+  }
+
+  // month banner + clear
+  if (month) {
+    const banner = el('div', { class: 'month-banner' }, [
+      el('span', { text: `Showing: ${month} only` }),
+    ]);
+    const clear = el('button', { type: 'button', class: 'reset-btn', text: 'Clear month' });
+    clear.addEventListener('click', () => { state.caMonth = null; render(); });
+    banner.append(clear);
+    wrap.append(banner);
+  }
+
+  // all metric computations respect the selected month
+  const m2 = churnAnalysis(squad, kam, month);
 
   // headline churn rate, flagged red if > 1%
   const flagged = rate !== null && rate > 1;
   const rateCard = el('div', { class: `stat ${flagged ? 'tone-danger' : ''}` }, [
     el('div', { class: 's-label' }, ['Churn rate', flagged ? el('span', { class: 'flag-dot', title: 'Above 1%', text: ' ●' }) : null]),
     el('div', { class: 's-value', text: rate !== null ? fmtPct(rate) : '—' }),
-    el('div', { class: 's-sub', text: flagged ? 'Above 1% — flagged' : `FYTD · ${scope}` }),
+    el('div', { class: 's-sub', text: (flagged ? 'Above 1% — flagged' : '') + (month ? ` · ${month}` : ` · FYTD · ${scope}`) }),
   ]);
 
   const misRow = misSquadRow(squad);
-  const churnedCount = misRow && misRow.churned ? misRow.churned : (churnAnalysis(squad, kam).total || 0);
+  // when a month is picked, the count comes from that month's churned rows;
+  // otherwise use the MIS pre-counted total (falls back to computed).
+  const churnedCount = month ? m2.total : (misRow && misRow.churned ? misRow.churned : m2.total);
 
-  wrap.append(sectionHead('Churn', `Delisted properties · ${scope}`));
+  wrap.append(sectionHead('Churn', `Delisted properties · ${scope}${month ? ' · ' + month : ''}`));
   wrap.append(el('div', { class: 'stat-grid' }, [
     rateCard,
     clickableChurnCard('Total churned', churnedCount, {}, squad, kam),
-    clickableChurnCard('GCF below 5%', churnAnalysis(squad, kam).lowGcf, { gcfLow: true }, squad, kam),
+    clickableChurnCard('GCF below 5%', m2.lowGcf, { gcfLow: true }, squad, kam),
   ]));
 
-  // Initiated by — from MIS (HO / SV) when available, else computed
-  let ho = misRow && misRow.ho ? misRow.ho : null;
-  let sv = misRow && misRow.sv ? misRow.sv : null;
-  if (ho === null && sv === null) {
-    const m = churnAnalysis(squad, kam);
-    const find = (k) => (m.initiatedBy.find(([label]) => norm(label).includes(k)) || [null, 0])[1];
+  // Initiated by — when a month is picked, count from that month's rows;
+  // otherwise prefer the MIS HO/SV columns.
+  let ho, sv;
+  if (month) {
+    const find = (k) => (m2.initiatedBy.find(([label]) => norm(label).includes(k)) || [null, 0])[1];
     ho = find('home'); sv = find('stay');
+  } else {
+    ho = misRow && misRow.ho ? misRow.ho : null;
+    sv = misRow && misRow.sv ? misRow.sv : null;
+    if (ho === null && sv === null) {
+      const find = (k) => (m2.initiatedBy.find(([label]) => norm(label).includes(k)) || [null, 0])[1];
+      ho = find('home'); sv = find('stay');
+    }
   }
   wrap.append(sectionHead('Churn initiated by', 'Home Owner vs StayVista'));
   wrap.append(el('div', { class: 'stat-grid' }, [
@@ -1842,25 +1916,29 @@ function churnSection(dimension, focused) {
   ]));
 
   // F&B ranges — clickable
-  const m2 = churnAnalysis(squad, kam);
   wrap.append(sectionHead('F&B share ranges', 'Owner F&B share of churned properties'));
   wrap.append(el('div', { class: 'stat-grid' },
     FNB_BUCKETS.map((b) => clickableChurnCard(b, m2.fnbCounts[b], { fnb: b }, squad, kam))));
 
-  // Top reasons — clickable
-  wrap.append(sectionHead('Top churn reasons', 'From Reason Bucket'));
-  wrap.append(el('div', { class: 'stat-grid' },
-    m2.reasons.slice(0, 8).map(([k, v]) => clickableChurnCard(k, v, { reason: k }, squad, kam))));
-
-  // Monthly churn rate (from MIS Table 3) — flag months > 1%
+  // Monthly churn rate (from MIS Table 3) — flag months > 1%, click to filter by month
   const monthly = misMonthly(squad);
   if (monthly.length) {
-    wrap.append(sectionHead('Monthly churn rate', `FY Apr–Mar · ${scope} · red = above 1%`));
+    wrap.append(sectionHead('Monthly churn rate', `FY Apr–Mar · ${scope} · red = above 1% · click a month to filter`));
     wrap.append(el('div', { class: 'stat-grid' },
-      monthly.map((mm) => el('div', { class: `stat ${mm.rate > 1 ? 'tone-danger' : ''}` }, [
-        el('div', { class: 's-label', text: mm.month }),
-        el('div', { class: 's-value', text: fmtPct(mm.rate) }),
-      ]))));
+      monthly.map((mm) => {
+        const selected = norm(state.caMonth || '') === norm(mm.month);
+        const card = el('a', { class: `stat stat-link ${mm.rate > 1 ? 'tone-danger' : ''} ${selected ? 'month-active' : ''}`, href: '#',
+          title: 'Click to filter this section to ' + mm.month }, [
+          el('div', { class: 's-label', text: mm.month }),
+          el('div', { class: 's-value', text: fmtPct(mm.rate) }),
+        ]);
+        card.addEventListener('click', (e) => {
+          e.preventDefault();
+          state.caMonth = selected ? null : mm.month;   // toggle on/off
+          render();
+        });
+        return card;
+      })));
   }
 
   return wrap;
@@ -1890,6 +1968,7 @@ function clickableChurnCard(label, value, filter, squad, kam) {
     state.caKam = kam || null;
     state.cd = { gcfLow: !!filter.gcfLow, initiatedBy: filter.initiatedBy || null, fnb: filter.fnb || null, reason: filter.reason || null };
     state.cdReturn = state.view;
+    state.cdPage = 1;
     go('churn-detail');
   });
   return card;
