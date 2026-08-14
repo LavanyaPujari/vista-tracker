@@ -2005,6 +2005,14 @@ function viewProperties(rows) {
     );
   }
 
+  // When the drill-in is for a single squad or KAM, show the churn cards here
+  // too (so the filtered view has the same churn metrics as the Squad/KAM tab).
+  const oneSquad = state.filters.squads.length === 1 ? state.filters.squads[0] : null;
+  const oneKam = state.filters.kams.length === 1 ? state.filters.kams[0] : null;
+  if (!singleStatus && !state.filters.newNoAgreement && (oneSquad || oneKam)) {
+    frag.append(churnSection(oneKam ? 'kam' : 'squad', oneKam || oneSquad));
+  }
+
   frag.append(propertyList(rows, { title: drilled ? heading : 'All properties' }));
   return frag;
 }
