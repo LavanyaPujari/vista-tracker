@@ -1455,6 +1455,20 @@ function pidKey(v) {
   return s.toLowerCase();
 }
 
+// Count of properties under Marriott (any value in marriott_cost) vs not,
+// across ALL properties in the master (gcf_marginal). Optional squad/kam scope.
+function marriottCounts(squad, kam) {
+  let under = 0, notUnder = 0;
+  for (const m of (state.gcfMarginal || [])) {
+    if (squad && norm(m.squad) !== norm(squad)) continue;
+    if (kam && norm(m.kam) !== norm(kam)) continue;
+    const v = m.marriott_cost;
+    const has = v != null && String(v).trim() !== '' && String(v).trim() !== '-';
+    if (has) under += 1; else notUnder += 1;
+  }
+  return { under, notUnder };
+}
+
 /* ==== Churn Analysis module ============================================== */
 
 // Financial year window for churn: 1 Apr 2025 → 31 Mar 2026.
@@ -1605,7 +1619,11 @@ function churnAnalysis(squad, kam, month) {
       reason: r.reason_bucket || 'Unspecified',
       delistDate: r.delist_date || '',
       gcf: g ? g.gcf_current : null,
-      fnb: g ? g.fnb_current : null,
+      fnbOwner: g ? g.fnb_owner : null,
+      fnbVista: g ? g.fnb_vista : null,
+      fnb: g ? g.fnb_owner : null,   // F&B bucket uses owner's food share
+      gst: g ? g.gst : null,
+      marriott: g ? g.marriott_cost : null,
     });
   }
 
@@ -1876,19 +1894,22 @@ function churnPropertyTable(rows) {
   const { wrap: pagerEl, page } = pager(rows.length);
   const pageRows = rows.slice((page - 1) * PAGE_ROWS, page * PAGE_ROWS);
 
-  const head = ['Property ID', 'Name', 'KAM', 'Squad', 'GCF', 'F&B', 'Initiated by', 'Reason', 'Delist date'];
+  const head = ['Property ID', 'Name', 'KAM', 'Squad', 'GCF', 'F&B Owner', 'F&B Vista', 'GST', 'Initiated by', 'Reason', 'Delist date'];
   const table = el('table', { class: 'grid' });
   table.append(el('thead', {}, [el('tr', {}, head.map((h, i) =>
     el('th', { class: i === 0 ? 'freeze' : '', style: 'text-align:left', text: h })))]));
   const tbody = el('tbody', {});
   for (const r of pageRows) {
+    const show = (v) => (v != null && v !== '' ? String(v) : '—');
     tbody.append(el('tr', {}, [
       el('td', { class: 'freeze', style: 'text-align:left', text: r.property_id != null ? String(r.property_id) : '—' }),
       el('td', { style: 'text-align:left', text: r.vista_name || '—' }),
       el('td', { style: 'text-align:left', text: r.kam || '—' }),
       el('td', { style: 'text-align:left', text: r.squad || '—' }),
-      el('td', { style: 'text-align:left', text: r.gcf != null && r.gcf !== '' ? String(r.gcf) : '—' }),
-      el('td', { style: 'text-align:left', text: r.fnb != null && r.fnb !== '' ? String(r.fnb) : '—' }),
+      el('td', { style: 'text-align:left', text: show(r.gcf) }),
+      el('td', { style: 'text-align:left', text: show(r.fnbOwner) }),
+      el('td', { style: 'text-align:left', text: show(r.fnbVista) }),
+      el('td', { style: 'text-align:left', text: show(r.gst) }),
       el('td', { style: 'text-align:left', text: r.initiatedBy || '—' }),
       el('td', { style: 'text-align:left', text: r.reason || '—' }),
       el('td', { style: 'text-align:left', text: r.delistDate ? String(r.delistDate).slice(0, 10) : '—' }),
@@ -2008,6 +2029,14 @@ function churnSection(dimension, focused) {
   wrap.append(sectionHead('F&B share ranges', 'Owner F&B share of churned properties'));
   wrap.append(el('div', { class: 'stat-grid' },
     FNB_BUCKETS.map((b) => clickableChurnCard(b, m2.fnbCounts[b], { fnb: b }, squad, kam))));
+
+  // Under Marriott vs not (across ALL properties in the master, this scope)
+  const mc = marriottCounts(squad, kam);
+  wrap.append(sectionHead('Marriott', 'Properties under Marriott vs not · all properties'));
+  wrap.append(el('div', { class: 'stat-grid' }, [
+    el('div', { class: 'stat' }, [el('div', { class: 's-label', text: 'Under Marriott' }), el('div', { class: 's-value', text: fmtInt(mc.under) })]),
+    el('div', { class: 'stat' }, [el('div', { class: 's-label', text: 'Not under Marriott' }), el('div', { class: 's-value', text: fmtInt(mc.notUnder) })]),
+  ]));
 
   // Monthly churn rate (from MIS Table 3) — flag months > 1%, click to filter by month
   const monthly = misMonthly(squad);
