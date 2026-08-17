@@ -618,7 +618,7 @@ const state = {
   page: {}, // per view: current page of the property list
 };
 
-const EXTRA_VIEWS = ['churned', 'churn-detail'];
+const EXTRA_VIEWS = ['churned', 'churn-detail', 'churn-rate'];
 const validView = (v) => (v === 'live-properties') ? 'overview'
   : (VIEWS.some((x) => x.id === v) || EXTRA_VIEWS.includes(v)) ? v : 'overview';
 
@@ -1342,31 +1342,26 @@ function heroStats(scopeRows, { label } = {}) {
   const live = scopeRows.filter((r) => r.__live === true).length;
   const total = scopeRows.length;
 
-  // Churn rate now comes from the MIS tab's pre-calculated numbers (the ones
-  // the team trusts). India total when no squad is selected; the squad's own
-  // rate when exactly one squad is selected. Falls back to the FY calculation,
-  // then to delisted/total, so the card is never blank.
+  // Delisting rate = churned / (live + churned) * 100, computed from Supabase,
+  // FY 2025-26, scoped to the selected squad/KAM. Single source of truth.
   const selectedSquad = state.filters.squads.length === 1 ? state.filters.squads[0] : null;
-  const misRate = misChurnRate(selectedSquad);
-  const fyChurn = churnRateFY(selectedSquad);
+  const selectedKam = state.filters.kams.length === 1 ? state.filters.kams[0] : null;
+  const dr = delistingRate(selectedSquad, selectedKam, null);
 
   let churn, churnSub, churnClickable;
-  if (misRate !== null) {
-    churn = misRate;
-    churnSub = selectedSquad ? `${selectedSquad} · FYTD` : 'All India · FYTD';
-    churnClickable = true;
-  } else if (fyChurn !== null) {
-    churn = fyChurn;
-    churnSub = selectedSquad ? `FYTD · ${selectedSquad}` : 'FYTD · all squads';
+  if (dr.rate !== null) {
+    churn = dr.rate;
+    const who = selectedKam ? selectedKam : selectedSquad ? selectedSquad : 'All India';
+    churnSub = `${fmtInt(dr.churned)} ÷ (${fmtInt(dr.live)} + ${fmtInt(dr.churned)}) · ${who} · FY25-26`;
     churnClickable = true;
   } else {
-    churn = total ? scopeRows.filter((r) => r.__live === false).length * 100 / total : null;
-    churnSub = `${fmtInt(scopeRows.filter((r) => r.__live === false).length)} delisted`;
+    churn = null;
+    churnSub = 'no churn data';
     churnClickable = false;
   }
 
   const churnInner = [
-    el('div', { class: 's-label' }, ['Churn rate', churnClickable ? el('span', { class: 'ext', text: ' ↗' }) : null]),
+    el('div', { class: 's-label' }, ['Delisting rate', churnClickable ? el('span', { class: 'ext', text: ' ↗' }) : null]),
     el('div', { class: 'hero-num', text: fmtPct(churn) }),
     el('div', { class: 's-sub', text: churnSub }),
   ];
@@ -1374,12 +1369,13 @@ function heroStats(scopeRows, { label } = {}) {
   // clickable → opens the Churn view (now inside the Squad-wise tab)
   let churnCard;
   if (churnClickable) {
-    churnCard = el('a', { class: 'hero-churn', href: '?view=squad', target: DETAIL_TAB,
-      title: 'Click to see churn detail by squad' }, churnInner);
+    churnCard = el('a', { class: 'hero-churn', href: '?view=churn-rate', target: DETAIL_TAB,
+      title: 'Click to see how the delisting rate is calculated' }, churnInner);
     churnCard.addEventListener('click', (e) => {
       if (e.ctrlKey || e.metaKey) return;
       e.preventDefault();
-      go('squad');
+      state.cdReturn = state.view;
+      go('churn-rate');
     });
   } else {
     churnCard = el('div', { class: 'hero-churn' }, churnInner);
@@ -1450,6 +1446,62 @@ function viewOverview(allRows) {
 }
 
 /* ==== Churn Analysis module ============================================== */
+
+// Financial year window for churn: 1 Apr 2025 → 31 Mar 2026.
+const FY_START = new Date(2025, 3, 1);        // Apr 1, 2025
+const FY_END   = new Date(2026, 2, 31, 23, 59, 59); // Mar 31, 2026
+
+// Is a delist date inside FY 2025-26?
+function inFY(dateStr) {
+  if (!dateStr) return false;
+  const d = new Date(dateStr);
+  return !Number.isNaN(d.getTime()) && d >= FY_START && d <= FY_END;
+}
+
+// Count of LIVE properties (Current Status = "Live") in the main table, scoped
+// to an optional squad / KAM. This is the denominator's live component.
+function liveCount(squad, kam) {
+  let n = 0;
+  for (const r of (state.rows || [])) {
+    if (r.__live !== true) continue;
+    if (squad && norm(r.__squad) !== norm(squad)) continue;
+    if (kam && norm(r.__kam) !== norm(kam)) continue;
+    n += 1;
+  }
+  return n;
+}
+
+// Count of FY-churned properties (Delisted, delist date in FY), scoped, deduped.
+function churnedCountFY(squad, kam, month) {
+  const seen = new Set();
+  let n = 0;
+  const monthNum = month ? MONTH_NAMES.findIndex((mn) => norm(mn) === norm(month)) + 1 : 0;
+  for (const r of (state.churnAnalysis || [])) {
+    if (norm(r.current_status) !== 'delisted') continue;
+    if (squad && norm(r.squad) !== norm(squad)) continue;
+    if (kam && norm(r.kam) !== norm(kam)) continue;
+    if (!inFY(r.delist_date)) continue;
+    if (monthNum) {
+      const d = r.delist_date ? new Date(r.delist_date) : null;
+      if (!(d && (d.getMonth() + 1) === monthNum)) continue;
+    }
+    const id = r.property_id != null ? String(r.property_id).trim() : '';
+    if (id && seen.has(id)) continue;
+    if (id) seen.add(id);
+    n += 1;
+  }
+  return n;
+}
+
+// Delisting rate = churned / (live + churned) * 100, all in the same scope.
+// Returns { rate, churned, live } so the detail view can reconcile the number.
+function delistingRate(squad, kam, month) {
+  const churned = churnedCountFY(squad, kam, month);
+  const live = liveCount(squad, kam);
+  const denom = live + churned;
+  return { rate: denom ? (churned * 100 / denom) : null, churned, live, denom };
+}
+
 
 // Read the pre-calculated churn rate (%) for a squad from the MIS squad table.
 // Pass null/undefined for the overall "India" total.
@@ -1524,6 +1576,7 @@ function churnAnalysis(squad, kam, month) {
   const rows = [];
   for (const r of churn) {
     if (!isDelisted(r) || !matchSquad(r) || !matchKam(r) || !matchMonth(r)) continue;
+    if (!inFY(r.delist_date)) continue;   // FY 2025-26 only
     const id = r.property_id != null ? String(r.property_id).trim() : '';
     if (id && seen.has(id)) continue;
     if (id) seen.add(id);
@@ -1661,6 +1714,58 @@ function churnMetricCard(label, value, tone) {
   ]);
 }
 
+function viewChurnRate() {
+  const squad = state.filters.squads.length === 1 ? state.filters.squads[0] : null;
+  const kam = state.filters.kams.length === 1 ? state.filters.kams[0] : null;
+  const month = state.caMonth || null;
+  const scope = kam ? `${kam} · ${squad || ''}` : squad ? squad : 'All India';
+
+  const frag = el('div', {}, []);
+  const back = el('button', { type: 'button', class: 'back-btn' }, [el('span', { class: 'back-arrow', text: '‹' }), 'Back']);
+  back.addEventListener('click', () => go(state.cdReturn || 'overview'));
+  frag.append(back);
+
+  const dr = delistingRate(squad, kam, month);
+  frag.append(pageHead('Delisting rate', `How the rate is calculated · ${scope} · FY 2025-26${month ? ' · ' + month : ''}`));
+
+  // the reconciliation
+  frag.append(sectionHead('The calculation', 'Delisting rate = churned ÷ (live + churned) × 100'));
+  frag.append(el('div', { class: 'stat-grid' }, [
+    el('div', { class: 'stat' }, [el('div', { class: 's-label', text: 'Live properties' }), el('div', { class: 's-value', text: fmtInt(dr.live) })]),
+    el('div', { class: 'stat' }, [el('div', { class: 's-label', text: 'Churned (FY25-26)' }), el('div', { class: 's-value', text: fmtInt(dr.churned) })]),
+    el('div', { class: 'stat' }, [el('div', { class: 's-label', text: 'Denominator (live + churned)' }), el('div', { class: 's-value', text: fmtInt(dr.denom) })]),
+    el('div', { class: 'stat tone-danger' }, [el('div', { class: 's-label', text: 'Delisting rate' }), el('div', { class: 's-value', text: dr.rate !== null ? fmtPct(dr.rate) : '—' })]),
+  ]));
+
+  // squad breakdown (only at all-India level)
+  if (!squad && !kam) {
+    const squads = [...new Set((state.churnAnalysis || []).map((r) => r.squad).filter(Boolean))].sort();
+    frag.append(sectionHead('By squad', 'Delisting rate per squad · FY25-26'));
+    const table = el('table', { class: 'grid' });
+    table.append(el('thead', {}, [el('tr', {}, ['Squad', 'Live', 'Churned', 'Delisting rate'].map((h) => el('th', { style: 'text-align:left', text: h })))]));
+    const tb = el('tbody', {});
+    for (const s of squads) {
+      const d = delistingRate(s, null, month);
+      tb.append(el('tr', {}, [
+        el('td', { style: 'text-align:left', text: s }),
+        el('td', { style: 'text-align:left', text: fmtInt(d.live) }),
+        el('td', { style: 'text-align:left', text: fmtInt(d.churned) }),
+        el('td', { style: 'text-align:left' }, [
+          el('span', { class: d.rate !== null && d.rate > 1 ? 'flag-dot' : '', text: d.rate !== null ? fmtPct(d.rate) : '—' }),
+        ]),
+      ]));
+    }
+    table.append(tb);
+    frag.append(el('div', { class: 'panel' }, [el('div', { class: 'panel-body', style: 'padding:0' }, [table])]));
+  }
+
+  // the churned property list behind the number
+  frag.append(sectionHead('Churned properties', `${fmtInt(dr.churned)} in this scope`));
+  frag.append(churnPropertyTable(churnAnalysis(squad, kam, month).rows));
+
+  return frag;
+}
+
 function viewChurnDetail() {
   const squad = state.caSquad || null;
   const kam = state.caKam || null;
@@ -1674,14 +1779,17 @@ function viewChurnDetail() {
   frag.append(back);
 
   // build the churned rows, then apply the card's filter + any user filters
-  let rows = churnAnalysis(squad, kam).rows;
-  if (cd.gcfLow) rows = rows.filter((r) => { const n = pctToNumber(r.gcf); return n !== null && n < 5; });
-  if (cd.initiatedBy) rows = rows.filter((r) => norm(r.initiatedBy).includes(norm(cd.initiatedBy)));
-  if (cd.fnb) rows = rows.filter((r) => fnbBucket(r.fnb) === cd.fnb);
-  if (cd.reason) rows = rows.filter((r) => norm(r.reason) === norm(cd.reason));
-
-  // apply the extra user filters (state.cdFilters), if any
+  let rows = churnAnalysis(squad, kam, state.caMonth || null).rows;
   const f = state.cdFilters || {};
+
+  // The card filter applies UNLESS the user picked a value for the same field in
+  // the dropdowns (the dropdown then takes over — they never stack/conflict).
+  if (cd.gcfLow && !f.gcfRange) rows = rows.filter((r) => { const n = pctToNumber(r.gcf); return n !== null && n < 5; });
+  if (cd.initiatedBy && !f.initiatedBy) rows = rows.filter((r) => norm(r.initiatedBy).includes(norm(cd.initiatedBy)));
+  if (cd.fnb && !f.fnb) rows = rows.filter((r) => fnbBucket(r.fnb) === cd.fnb);
+  if (cd.reason && !f.reason) rows = rows.filter((r) => norm(r.reason) === norm(cd.reason));
+
+  // user dropdown filters
   if (f.squad) rows = rows.filter((r) => norm(r.squad) === norm(f.squad));
   if (f.kam) rows = rows.filter((r) => norm(r.kam) === norm(f.kam));
   if (f.fnb) rows = rows.filter((r) => fnbBucket(r.fnb) === f.fnb);
@@ -1707,7 +1815,7 @@ function viewChurnDetail() {
   frag.append(pageHead('Churned properties', `${scope}${bits.length ? ' · ' + bits.join(' · ') : ''}`));
 
   // ---- filter bar (Squad, KAM, F&B, reason, initiated-by, GCF range) ----
-  frag.append(churnFilterBar(churnAnalysis(squad, kam).rows));
+  frag.append(churnFilterBar(churnAnalysis(squad, kam, state.caMonth || null).rows));
 
   frag.append(sectionHead('Results', `${fmtInt(rows.length)} properties`));
   frag.append(churnPropertyTable(rows));
@@ -1851,15 +1959,10 @@ function churnSection(dimension, focused) {
   const wrap = el('div', {});
   const scope = kam ? kam : squad ? squad : 'all India';
 
-  // churn rate: if a month is picked, use that month's rate from the monthly
-  // table; otherwise the FYTD rate from the squad summary.
-  let rate;
-  if (month) {
-    const mm = misMonthly(squad).find((x) => norm(x.month) === norm(month));
-    rate = mm ? mm.rate : null;
-  } else {
-    rate = misChurnRate(squad);
-  }
+  // Delisting rate, computed = churned / (live + churned) * 100, same scope,
+  // FY 2025-26. When a month is picked, churned is that month's FY churn.
+  const dr = delistingRate(squad, kam, month);
+  const rate = dr.rate;
 
   // month banner + clear
   if (month) {
@@ -1877,10 +1980,13 @@ function churnSection(dimension, focused) {
 
   // headline churn rate, flagged red if > 1%
   const flagged = rate !== null && rate > 1;
+  const rateSub = rate !== null
+    ? `${fmtInt(dr.churned)} ÷ (${fmtInt(dr.live)} live + ${fmtInt(dr.churned)}) · FY25-26${month ? ' · ' + month : ''}`
+    : 'no data';
   const rateCard = el('div', { class: `stat ${flagged ? 'tone-danger' : ''}` }, [
-    el('div', { class: 's-label' }, ['Churn rate', flagged ? el('span', { class: 'flag-dot', title: 'Above 1%', text: ' ●' }) : null]),
+    el('div', { class: 's-label' }, ['Delisting rate', flagged ? el('span', { class: 'flag-dot', title: 'Above 1%', text: ' ●' }) : null]),
     el('div', { class: 's-value', text: rate !== null ? fmtPct(rate) : '—' }),
-    el('div', { class: 's-sub', text: (flagged ? 'Above 1% — flagged' : '') + (month ? ` · ${month}` : ` · FYTD · ${scope}`) }),
+    el('div', { class: 's-sub', text: rateSub }),
   ]);
 
   const misRow = misSquadRow(squad);
@@ -1959,6 +2065,7 @@ function clickableChurnCard(label, value, filter, squad, kam) {
     state.caSquad = squad || null;
     state.caKam = kam || null;
     state.cd = { gcfLow: !!filter.gcfLow, initiatedBy: filter.initiatedBy || null, fnb: filter.fnb || null, reason: filter.reason || null };
+    state.cdFilters = {};   // clear any leftover dropdown filters from a previous card
     state.cdReturn = state.view;
     state.cdPage = 1;
     go('churn-detail');
@@ -2590,6 +2697,9 @@ function renderView() {
       break;
     case 'churn-detail':
       root.append(viewChurnDetail());
+      break;
+    case 'churn-rate':
+      root.append(viewChurnRate());
       break;
     default:
       root.append(viewOverview(rows));
