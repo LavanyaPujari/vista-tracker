@@ -1900,16 +1900,28 @@ function churnPropertyTable(rows) {
     el('th', { class: i === 0 ? 'freeze' : '', style: 'text-align:left', text: h })))]));
   const tbody = el('tbody', {});
   for (const r of pageRows) {
+    // show a share/tax value as a percentage: 0.03 -> "3%", "0.15" -> "15%",
+    // "18%" stays "18%", blank -> "—".
+    const showPct = (v) => {
+      if (v == null || String(v).trim() === '' || String(v).trim() === '-') return '—';
+      const s = String(v).trim();
+      if (s.includes('%')) return s;                 // already a percent
+      let n = Number(s);
+      if (Number.isNaN(n)) return s;                 // non-numeric, show as-is
+      if (n > 0 && n <= 1) n = n * 100;              // 0.03 -> 3 (decimals)
+      // trim trailing zeros: 3.0 -> 3, 12.50 -> 12.5
+      return `${Math.round(n * 100) / 100}%`;
+    };
     const show = (v) => (v != null && v !== '' ? String(v) : '—');
     tbody.append(el('tr', {}, [
       el('td', { class: 'freeze', style: 'text-align:left', text: r.property_id != null ? String(r.property_id) : '—' }),
       el('td', { style: 'text-align:left', text: r.vista_name || '—' }),
       el('td', { style: 'text-align:left', text: r.kam || '—' }),
       el('td', { style: 'text-align:left', text: r.squad || '—' }),
-      el('td', { style: 'text-align:left', text: show(r.gcf) }),
-      el('td', { style: 'text-align:left', text: show(r.fnbOwner) }),
-      el('td', { style: 'text-align:left', text: show(r.fnbVista) }),
-      el('td', { style: 'text-align:left', text: show(r.gst) }),
+      el('td', { style: 'text-align:left', text: showPct(r.gcf) }),
+      el('td', { style: 'text-align:left', text: showPct(r.fnbOwner) }),
+      el('td', { style: 'text-align:left', text: showPct(r.fnbVista) }),
+      el('td', { style: 'text-align:left', text: showPct(r.gst) }),
       el('td', { style: 'text-align:left', text: r.initiatedBy || '—' }),
       el('td', { style: 'text-align:left', text: r.reason || '—' }),
       el('td', { style: 'text-align:left', text: r.delistDate ? String(r.delistDate).slice(0, 10) : '—' }),
