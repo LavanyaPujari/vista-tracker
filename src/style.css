@@ -1600,3 +1600,8 @@ a.hero-churn .ext { font-size: 12px; opacity: .5; }
 }
 .pg-btn:disabled { opacity: 0.4; cursor: default; }
 .pg-info { font-size: 12px; color: var(--muted); }
+
+/* churn table: keep columns full-width and scroll sideways so all are reachable */
+.churn-table-scroll { min-width: 1000px; }
+.churn-table-scroll table.grid { width: 100%; }
+.churn-table-scroll th, .churn-table-scroll td { white-space: nowrap; padding-right: 18px; }

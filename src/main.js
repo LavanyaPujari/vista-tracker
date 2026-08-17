@@ -1445,6 +1445,16 @@ function viewOverview(allRows) {
   return frag;
 }
 
+// Normalize a property id for joining across tables: strip whitespace, a
+// trailing ".0" (numbers stored as floats), and lowercase. So "3257", "3257.0",
+// " 3257 " all match.
+function pidKey(v) {
+  if (v === null || v === undefined) return '';
+  let s = String(v).trim().replace(/\s+/g, '');
+  s = s.replace(/\.0+$/, '');   // 3257.0 -> 3257
+  return s.toLowerCase();
+}
+
 /* ==== Churn Analysis module ============================================== */
 
 // Financial year window for churn: 1 Apr 2025 → 31 Mar 2026.
@@ -1560,7 +1570,7 @@ function churnAnalysis(squad, kam, month) {
   const marginal = state.gcfMarginal || [];
 
   const gcfById = {};
-  for (const m of marginal) if (m.property_id != null) gcfById[String(m.property_id).trim()] = m;
+  for (const m of marginal) if (m.property_id != null) gcfById[pidKey(m.property_id)] = m;
 
   const monthNum = month ? MONTH_NAMES.findIndex((mn) => norm(mn) === norm(month)) + 1 : 0;
   const isDelisted = (r) => norm(r.current_status) === 'delisted';
@@ -1577,7 +1587,7 @@ function churnAnalysis(squad, kam, month) {
   for (const r of churn) {
     if (!isDelisted(r) || !matchSquad(r) || !matchKam(r) || !matchMonth(r)) continue;
     if (!inFY(r.delist_date)) continue;   // FY 2025-26 only
-    const id = r.property_id != null ? String(r.property_id).trim() : '';
+    const id = pidKey(r.property_id);
     if (id && seen.has(id)) continue;
     if (id) seen.add(id);
     const g = id ? gcfById[id] : null;
@@ -1863,22 +1873,17 @@ function churnFilterBar(allRows) {
 function churnPropertyTable(rows) {
   if (!rows.length) return el('div', { class: 'state' }, [el('p', { text: 'No churned properties in this scope.' })]);
 
-  const PER_PAGE = 25;
-  const pageCount = Math.ceil(rows.length / PER_PAGE);
-  let page = state.cdPage || 1;
-  if (page > pageCount) page = pageCount;
-  if (page < 1) page = 1;
-  const start = (page - 1) * PER_PAGE;
-  const pageRows = rows.slice(start, start + PER_PAGE);
+  const { wrap: pagerEl, page } = pager(rows.length);
+  const pageRows = rows.slice((page - 1) * PAGE_ROWS, page * PAGE_ROWS);
 
+  const head = ['Property ID', 'Name', 'KAM', 'Squad', 'GCF', 'F&B', 'Initiated by', 'Reason', 'Delist date'];
   const table = el('table', { class: 'grid' });
-  table.append(el('thead', {}, [el('tr', {}, [
-    'Property ID', 'Name', 'KAM', 'Squad', 'GCF', 'F&B', 'Initiated by', 'Reason', 'Delist date',
-  ].map((h) => el('th', { style: 'text-align:left', text: h })))]));
+  table.append(el('thead', {}, [el('tr', {}, head.map((h, i) =>
+    el('th', { class: i === 0 ? 'freeze' : '', style: 'text-align:left', text: h })))]));
   const tbody = el('tbody', {});
   for (const r of pageRows) {
     tbody.append(el('tr', {}, [
-      el('td', { style: 'text-align:left', text: r.property_id != null ? String(r.property_id) : '—' }),
+      el('td', { class: 'freeze', style: 'text-align:left', text: r.property_id != null ? String(r.property_id) : '—' }),
       el('td', { style: 'text-align:left', text: r.vista_name || '—' }),
       el('td', { style: 'text-align:left', text: r.kam || '—' }),
       el('td', { style: 'text-align:left', text: r.squad || '—' }),
@@ -1891,24 +1896,10 @@ function churnPropertyTable(rows) {
   }
   table.append(tbody);
 
-  const parts = [el('div', { class: 'panel-body', style: 'padding:0' }, [table])];
-
-  // pagination controls (Prev / page x of y / Next), only if >1 page
-  if (pageCount > 1) {
-    const pager = el('div', { class: 'pager' });
-    const prev = el('button', { type: 'button', class: 'pg-btn', text: '‹ Prev' });
-    if (page <= 1) prev.disabled = true;
-    prev.addEventListener('click', () => { state.cdPage = page - 1; render(); });
-    const next = el('button', { type: 'button', class: 'pg-btn', text: 'Next ›' });
-    if (page >= pageCount) next.disabled = true;
-    next.addEventListener('click', () => { state.cdPage = page + 1; render(); });
-    pager.append(prev,
-      el('span', { class: 'pg-info', text: `Page ${page} of ${pageCount} · ${fmtInt(rows.length)} total` }),
-      next);
-    parts.push(pager);
-  }
-
-  return el('div', { class: 'panel' }, parts);
+  return el('div', { class: 'panel' }, [
+    el('div', { class: 'table-wrap' }, [el('div', { class: 'churn-table-scroll' }, [table])]),
+    pagerEl,
+  ]);
 }
 
 /* ---- Squad-wise / KAM-wise: cards on top, property list below ------------ */
