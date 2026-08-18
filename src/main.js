@@ -2956,11 +2956,25 @@ function renderActiveFilters() {
 
 function onFiltersChanged() {
   state.page = {};
-  state.focus = false;      // touching a filter leaves the drilled-in view
   state.returnTo = null;
+
+  // If a filter is active, take the user straight to the property list instead
+  // of a summary page full of mostly-empty cards. Changing another filter while
+  // there keeps them on the list (it just updates). Churn pages keep their own
+  // bar and are left alone.
+  const onChurnPage = CHURN_VIEWS_WITH_BAR.includes(state.view);
+  if (!onChurnPage) {
+    if (hasAnyFilter()) {
+      state.focus = true;
+      state.view = 'properties';
+    } else {
+      state.focus = false;   // filters cleared → back to the normal summary
+    }
+  }
+
   syncUrl();
   renderSidebar();
-  updateFilters();
+  renderFilters();
   renderView();
 }
 
