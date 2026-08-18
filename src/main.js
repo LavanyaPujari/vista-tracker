@@ -1540,6 +1540,21 @@ function dcrwCounts(squad, kam) {
   return { yes, no };
 }
 
+// ONE source of truth for "what squad/kam/status/search/month is active right
+// now". Every list view uses this, so filters behave identically everywhere and
+// a new view/card automatically respects them. Prefers the live top filter bar,
+// falling back to any churn-drill scope.
+function activeScope() {
+  const cdf = state.cdFilters || {};
+  return {
+    squad: cdf.squad || (state.filters.squads.length === 1 ? state.filters.squads[0] : null) || state.caSquad || null,
+    kam: cdf.kam || (state.filters.kams.length === 1 ? state.filters.kams[0] : null) || state.caKam || null,
+    status: state.filters.statuses.length === 1 ? state.filters.statuses[0] : null,
+    search: norm(state.search || ''),
+    month: state.caMonth || null,
+  };
+}
+
 /* ==== Churn Analysis module ============================================== */
 
 // Financial year window for churn: 1 Apr 2025 → 31 Mar 2026.
@@ -1903,8 +1918,9 @@ function viewChurnRate() {
 }
 
 function viewChurnDetail() {
-  const squad = state.caSquad || null;
-  const kam = state.caKam || null;
+  // ONE shared scope helper — same filters everywhere.
+  const sc = activeScope();
+  const squad = sc.squad, kam = sc.kam, topSearch = sc.search;
   const cd = state.cd || {};
 
   const frag = el('div', {}, []);
@@ -1915,7 +1931,9 @@ function viewChurnDetail() {
   frag.append(back);
 
   // build the churned rows, then apply the card's filter + any user filters
-  let rows = churnAnalysis(squad, kam, state.caMonth || null).rows;
+  let rows = churnAnalysis(squad, kam, sc.month).rows;
+  // live top filter bar: free-text search also narrows the list
+  if (topSearch) rows = rows.filter((r) => norm(`${r.property_id} ${r.vista_name} ${r.squad} ${r.kam}`).includes(topSearch));
   const f = state.cdFilters || {};
 
   // The card filter applies UNLESS the user picked a value for the same field in
@@ -1949,9 +1967,6 @@ function viewChurnDetail() {
   if (cd.reason) bits.push(cd.reason);
   const scope = kam ? `${kam} · ${squad}` : squad ? squad : 'all squads';
   frag.append(pageHead('Churned properties', `${scope}${bits.length ? ' · ' + bits.join(' · ') : ''}`));
-
-  // ---- filter bar (Squad, KAM, F&B, reason, initiated-by, GCF range) ----
-  frag.append(churnFilterBar(churnAnalysis(squad, kam, state.caMonth || null).rows));
 
   frag.append(sectionHead('Results', `${fmtInt(rows.length)} properties`));
   frag.append(churnPropertyTable(rows));
@@ -2216,11 +2231,9 @@ function viewMasterList() {
   back.addEventListener('click', () => goBackHistory('overview'));
   frag.append(back);
 
-  // Scope comes from the LIVE top filter bar (so changing Squad/KAM up top
-  // updates this list immediately) — not a frozen snapshot from the click.
-  const squad = state.filters.squads.length === 1 ? state.filters.squads[0] : null;
-  const kam = state.filters.kams.length === 1 ? state.filters.kams[0] : null;
-  const search = norm(state.search || '');
+  // Scope comes from the shared activeScope helper — same filters everywhere.
+  const sc = activeScope();
+  const squad = sc.squad, kam = sc.kam, search = sc.search;
 
   let rows = (state.gcfMarginal || []).slice();
   if (squad) rows = rows.filter((r) => norm(r.squad) === norm(squad));
@@ -2672,6 +2685,99 @@ const FILTER_FIELDS = {
   statuses: { field: '__status', skip: 'status', key: 'status', label: 'Status' },
 };
 
+// Churn pages get their OWN top filter bar (no agreement Status/Search that
+// don't apply to churned data). Same visual style as the agreement bar.
+// Filters: Months, Years, Squad, KAM, F&B, Reason, Initiated-by, GCF, Search.
+const CHURN_VIEWS_WITH_BAR = ['churned', 'churn-detail', 'churn-rate', 'master-list'];
+
+function renderChurnTopBar() {
+  const bar = $('#filter-bar');
+  if (!bar) return;
+  bar.replaceChildren();
+  const row = el('div', { class: 'filter-row' });
+
+  // universe of churn rows to populate dropdown options
+  const all = (state.churnAnalysis || []).map((r) => ({
+    squad: r.squad, kam: r.kam,
+    reason: r.reason_bucket || 'Unspecified',
+    initiatedBy: norm(r.delist_initiated_by) === 'ho' ? 'Home Owner' : norm(r.delist_initiated_by) === 'sv' ? 'StayVista' : (r.delist_initiated_by || 'Unknown'),
+  }));
+  const uniq = (key) => [...new Set(all.map((r) => r[key]).filter(Boolean))].sort();
+  const f = state.cdFilters || {};
+
+  // Months + Years — same style/behaviour as the agreement bar
+  const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+  const monthSel = el('select', { class: 'period-select', 'aria-label': 'Month' }, [
+    el('option', { value: '', text: 'All months' }),
+    ...MONTHS.map((m, i) => el('option', { value: String(i + 1), text: m })),
+  ]);
+  monthSel.value = state.period.month;
+  monthSel.classList.toggle('active', !!state.period.month);
+  monthSel.addEventListener('change', () => {
+    state.period.month = monthSel.value;
+    state.caMonth = monthSel.value ? MONTH_NAMES[Number(monthSel.value) - 1] : null;
+    state.cdPage = 1; syncUrl(); render();
+  });
+
+  const years = [...new Set((state.rows || []).map((r) => r.__liveDateObj && r.__liveDateObj.getFullYear()).filter(Boolean))].sort((a, b) => b - a);
+  const yearSel = el('select', { class: 'period-select', 'aria-label': 'Year' }, [
+    el('option', { value: '', text: 'All years' }),
+    ...years.map((y) => el('option', { value: String(y), text: String(y) })),
+  ]);
+  yearSel.value = state.period.year;
+  yearSel.classList.toggle('active', !!state.period.year);
+  yearSel.addEventListener('change', () => { state.period.year = yearSel.value; state.cdPage = 1; syncUrl(); render(); });
+
+  row.append(monthSel, yearSel);
+
+  // the churn dropdowns
+  const addSelect = (label, key, options) => {
+    const sel = el('select', { class: 'flt' });
+    sel.classList.toggle('active', !!f[key]);
+    sel.append(el('option', { value: '', text: label }));
+    for (const o of options) {
+      const opt = el('option', { value: o, text: o });
+      if (f[key] === o) opt.selected = true;
+      sel.append(opt);
+    }
+    sel.addEventListener('change', () => {
+      state.cdFilters = { ...(state.cdFilters || {}), [key]: sel.value || null };
+      state.cdPage = 1; render();
+    });
+    row.append(sel);
+  };
+  addSelect('All squads', 'squad', uniq('squad'));
+  addSelect('All KAMs', 'kam', uniq('kam'));
+  addSelect('All F&B bands', 'fnb', FNB_BUCKETS);
+  addSelect('All reasons', 'reason', uniq('reason'));
+  addSelect('All initiated-by', 'initiatedBy', uniq('initiatedBy'));
+  addSelect('All GCF ranges', 'gcfRange', ['<5%', '5-10%', '>10%']);
+
+  // search box (same style as agreement)
+  const search = el('input', {
+    class: 'filter-search', type: 'search',
+    placeholder: 'Search property, KAM or squad…', 'aria-label': 'Search',
+    value: state.search,
+  });
+  let t;
+  search.addEventListener('input', () => {
+    clearTimeout(t);
+    t = setTimeout(() => { state.search = search.value.trim(); state.cdPage = 1; render(); }, 180);
+  });
+  row.append(search);
+
+  const anyChurnFilter = (state.cdFilters && Object.values(state.cdFilters).some(Boolean)) || state.period.month || state.period.year || state.search;
+  const reset = el('button', { type: 'button', class: 'reset-btn', text: 'Reset filters', disabled: !anyChurnFilter });
+  reset.addEventListener('click', () => {
+    state.cdFilters = {}; state.period = { month: '', year: '' }; state.caMonth = null; state.search = '';
+    state.cdPage = 1; syncUrl(); render();
+  });
+  row.append(reset);
+
+  bar.append(row);
+  filterUI.built = false;   // force agreement bar to rebuild when we leave churn views
+}
+
 function renderFilters() {
   const bar = $('#filter-bar');
   if (!bar) return;
@@ -2682,6 +2788,14 @@ function renderFilters() {
     filterUI.controls = {};
     return;
   }
+
+  // Churn pages get their own top filter bar (Months/Years/Squad/KAM/F&B/
+  // Reason/Initiated-by/GCF/Search) — the agreement Status/Search bar is hidden.
+  if (CHURN_VIEWS_WITH_BAR.includes(state.view)) {
+    renderChurnTopBar();
+    return;
+  }
+
   if (filterUI.built && bar.firstChild) { updateFilters(); return; }
 
   bar.replaceChildren();
