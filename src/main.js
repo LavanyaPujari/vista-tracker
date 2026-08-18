@@ -568,7 +568,6 @@ const VIEWS = [
   { id: 'squad',           label: 'Squad-wise',         group: 'Summary' },
   { id: 'kam',             label: 'KAM-wise',           group: 'Summary' },
   { id: 'properties',      label: 'Property Details',   group: 'Detail'  },
-  { id: 'diagnostics',     label: 'Connection check',   group: 'Setup'   },
 ];
 
 /* Counts and Valid % tabs are gone — every summary is card-based now. */
@@ -618,7 +617,7 @@ const state = {
   page: {}, // per view: current page of the property list
 };
 
-const EXTRA_VIEWS = ['churned', 'churn-detail', 'churn-rate'];
+const EXTRA_VIEWS = ['churned', 'churn-detail', 'churn-rate', 'diagnostics'];
 const validView = (v) => (v === 'live-properties') ? 'overview'
   : (VIEWS.some((x) => x.id === v) || EXTRA_VIEWS.includes(v)) ? v : 'overview';
 
@@ -1469,6 +1468,20 @@ function marriottCounts(squad, kam) {
   return { under, notUnder };
 }
 
+// DCRW (Damage cover & Refund waiver) Yes/No count across all master properties,
+// optional squad/kam scope.
+function dcrwCounts(squad, kam) {
+  let yes = 0, no = 0;
+  for (const m of (state.gcfMarginal || [])) {
+    if (squad && norm(m.squad) !== norm(squad)) continue;
+    if (kam && norm(m.kam) !== norm(kam)) continue;
+    const v = norm(m.dcrw);
+    if (v === 'yes') yes += 1;
+    else if (v === 'no') no += 1;
+  }
+  return { yes, no };
+}
+
 /* ==== Churn Analysis module ============================================== */
 
 // Financial year window for churn: 1 Apr 2025 → 31 Mar 2026.
@@ -1624,6 +1637,7 @@ function churnAnalysis(squad, kam, month) {
       fnb: g ? g.fnb_owner : null,   // F&B bucket uses owner's food share
       gst: g ? g.gst : null,
       marriott: g ? g.marriott_cost : null,
+      dcrw: g ? g.dcrw : null,
     });
   }
 
@@ -1683,7 +1697,7 @@ function viewChurned() {
   const frag = el('div', {}, []);
 
   // back button to return to the dashboard
-  const back = el('button', { type: 'button', class: 'back-btn' }, [el('span', { class: 'back-arrow', text: '‹' }), 'Back']);
+  const back = el('button', { type: 'button', class: 'back-btn' }, [el('span', { class: 'back-arrow', text: '‹' }), 'Go back']);
   back.addEventListener('click', () => go('overview'));
   frag.append(back);
 
@@ -1749,7 +1763,7 @@ function viewChurnRate() {
   const scope = kam ? `${kam} · ${squad || ''}` : squad ? squad : 'All India';
 
   const frag = el('div', {}, []);
-  const back = el('button', { type: 'button', class: 'back-btn' }, [el('span', { class: 'back-arrow', text: '‹' }), 'Back']);
+  const back = el('button', { type: 'button', class: 'back-btn' }, [el('span', { class: 'back-arrow', text: '‹' }), 'Go back to previous page']);
   back.addEventListener('click', () => go(state.cdReturn || 'overview'));
   frag.append(back);
 
@@ -1802,7 +1816,7 @@ function viewChurnDetail() {
   const frag = el('div', {}, []);
 
   // back button → return to where we came from (squad or kam tab)
-  const back = el('button', { type: 'button', class: 'back-btn' }, [el('span', { class: 'back-arrow', text: '‹' }), 'Back']);
+  const back = el('button', { type: 'button', class: 'back-btn' }, [el('span', { class: 'back-arrow', text: '‹' }), 'Go back to previous page']);
   back.addEventListener('click', () => go(state.cdReturn || 'squad'));
   frag.append(back);
 
@@ -2050,6 +2064,14 @@ function churnSection(dimension, focused) {
     el('div', { class: 'stat' }, [el('div', { class: 's-label', text: 'Not under Marriott' }), el('div', { class: 's-value', text: fmtInt(mc.notUnder) })]),
   ]));
 
+  // DCRW — Damage cover & Refund waiver, Yes/No count across all properties
+  const dc = dcrwCounts(squad, kam);
+  wrap.append(sectionHead('DCRW', 'Damage cover & Refund waiver · charged per booking · all properties'));
+  wrap.append(el('div', { class: 'stat-grid' }, [
+    el('div', { class: 'stat' }, [el('div', { class: 's-label', text: 'DCRW — Yes' }), el('div', { class: 's-value', text: fmtInt(dc.yes) })]),
+    el('div', { class: 'stat' }, [el('div', { class: 's-label', text: 'DCRW — No' }), el('div', { class: 's-value', text: fmtInt(dc.no) })]),
+  ]));
+
   // Monthly churn rate (from MIS Table 3) — flag months > 1%, click to filter by month
   const monthly = misMonthly(squad);
   if (monthly.length) {
@@ -2129,17 +2151,20 @@ function viewProperties(rows) {
     ),
   ]);
 
-  if (!drilled) {
+  const oneSquad = state.filters.squads.length === 1 ? state.filters.squads[0] : null;
+  const oneKam = state.filters.kams.length === 1 ? state.filters.kams[0] : null;
+
+  // Agreement cards: show on the full summary AND when drilled into a single
+  // squad/KAM (they update to that scope). Only hide for a pure status drill.
+  if (!drilled || oneSquad || oneKam) {
     frag.append(
-      sectionHead('Agreement summary', `${fmtInt(rows.length)} properties in scope`),
-      statusCards(rows),
+      sectionHead('Agreement status', `${fmtInt(rows.filter((r) => r.__live === true).length)} live properties in scope`),
+      statusCards(rows.filter((r) => r.__live === true), { live: true }),
     );
   }
 
   // When the drill-in is for a single squad or KAM, show the churn cards here
   // too (so the filtered view has the same churn metrics as the Squad/KAM tab).
-  const oneSquad = state.filters.squads.length === 1 ? state.filters.squads[0] : null;
-  const oneKam = state.filters.kams.length === 1 ? state.filters.kams[0] : null;
   if (!singleStatus && !state.filters.newNoAgreement && (oneSquad || oneKam)) {
     frag.append(churnSection(oneKam ? 'kam' : 'squad', oneKam || oneSquad));
   }
@@ -2684,10 +2709,13 @@ function renderView() {
   const rows = activeRows();
 
   // Back button for a drilled-in (focused) view — top-left, returns to origin.
-  if (state.focus) {
+  // Churn views (churned/churn-detail/churn-rate) render their own back button,
+  // so skip the global one there to avoid duplicates.
+  const churnViews = ['churned', 'churn-detail', 'churn-rate'];
+  if (state.focus && !churnViews.includes(state.view)) {
     const back = el('button', { type: 'button', class: 'back-btn' }, [
       el('span', { class: 'back-arrow', text: '‹' }),
-      'Back',
+      'Go back',
     ]);
     back.addEventListener('click', goBack);
     root.append(back);
