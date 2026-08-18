@@ -2175,16 +2175,24 @@ function viewMasterList() {
   back.addEventListener('click', () => go(state.mlReturn || 'overview'));
   frag.append(back);
 
-  // filter the master rows
+  // Scope comes from the LIVE top filter bar (so changing Squad/KAM up top
+  // updates this list immediately) — not a frozen snapshot from the click.
+  const squad = state.filters.squads.length === 1 ? state.filters.squads[0] : null;
+  const kam = state.filters.kams.length === 1 ? state.filters.kams[0] : null;
+  const search = norm(state.search || '');
+
   let rows = (state.gcfMarginal || []).slice();
-  if (f.squad) rows = rows.filter((r) => norm(r.squad) === norm(f.squad));
-  if (f.kam) rows = rows.filter((r) => norm(r.kam) === norm(f.kam));
+  if (squad) rows = rows.filter((r) => norm(r.squad) === norm(squad));
+  if (kam) rows = rows.filter((r) => norm(r.kam) === norm(kam));
+  // the card that opened this view (marriott / dcrw)
   if (f.marriott === 'yes') rows = rows.filter((r) => { const v = r.marriott_cost; return v != null && String(v).trim() !== '' && String(v).trim() !== '-'; });
   if (f.marriott === 'no') rows = rows.filter((r) => { const v = r.marriott_cost; return !(v != null && String(v).trim() !== '' && String(v).trim() !== '-'); });
   if (f.dcrw === 'yes') rows = rows.filter((r) => norm(r.dcrw) === 'yes');
   if (f.dcrw === 'no') rows = rows.filter((r) => norm(r.dcrw) === 'no');
+  // free-text search on id / squad / kam
+  if (search) rows = rows.filter((r) => norm(`${r.property_id} ${r.squad} ${r.kam}`).includes(search));
 
-  const scope = f.kam ? `${f.kam} · ${f.squad || ''}` : f.squad ? f.squad : 'all properties';
+  const scope = kam ? `${kam} · ${squad || ''}` : squad ? squad : 'all properties';
   frag.append(pageHead(f.label || 'Properties', `${scope}`));
   frag.append(sectionHead('Results', `${fmtInt(rows.length)} properties`));
 
@@ -2193,12 +2201,9 @@ function viewMasterList() {
     return frag;
   }
 
-  // 25-per-page pagination (same pager style)
-  const PER = 25;
-  const pageCount = Math.ceil(rows.length / PER);
-  let page = state.mlPage || 1;
-  if (page > pageCount) page = pageCount;
-  const pageRows = rows.slice((page - 1) * PER, page * PER);
+  // numbered pager (same style as the property list)
+  const { wrap: pagerEl, page } = pager(rows.length);
+  const pageRows = rows.slice((page - 1) * PAGE_ROWS, page * PAGE_ROWS);
 
   const showPct = (v) => {
     if (v == null || String(v).trim() === '' || String(v).trim() === '-') return '—';
@@ -2228,17 +2233,10 @@ function viewMasterList() {
   }
   table.append(tb);
 
-  const parts = [el('div', { class: 'table-wrap' }, [el('div', { class: 'churn-table-scroll' }, [table])])];
-  if (pageCount > 1) {
-    const pgr = el('div', { class: 'pager' });
-    const prev = el('button', { type: 'button', class: 'pg-btn', text: '‹ Prev' }); if (page <= 1) prev.disabled = true;
-    prev.addEventListener('click', () => { state.mlPage = page - 1; render(); });
-    const next = el('button', { type: 'button', class: 'pg-btn', text: 'Next ›' }); if (page >= pageCount) next.disabled = true;
-    next.addEventListener('click', () => { state.mlPage = page + 1; render(); });
-    pgr.append(prev, el('span', { class: 'pg-info', text: `Page ${page} of ${pageCount} · ${fmtInt(rows.length)} total` }), next);
-    parts.push(pgr);
-  }
-  frag.append(el('div', { class: 'panel' }, parts));
+  frag.append(el('div', { class: 'panel' }, [
+    el('div', { class: 'table-wrap' }, [el('div', { class: 'churn-table-scroll' }, [table])]),
+    pagerEl,
+  ]));
   return frag;
 }
 
