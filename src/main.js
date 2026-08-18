@@ -437,6 +437,23 @@ async function listTables() {
   }
 }
 
+// fetch that gives up after `ms` so a stalled request shows an error instead
+// of spinning on "Loading" forever.
+async function fetchWithTimeout(url, options = {}, ms = 30000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      throw new Error(`The request to Supabase took longer than ${Math.round(ms / 1000)}s and was stopped. The table may be very large or the connection is slow — try Refresh, or check your network.`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function probeTable(name) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/${encodeURIComponent(name)}?select=*&limit=1`, {
     headers: authHeaders(),
@@ -530,12 +547,12 @@ async function fetchAllRows(diag) {
   let from = 0;
 
   for (let guard = 0; guard < 60; guard++) {
-    const res = await fetch(endpoint, {
+    const res = await fetchWithTimeout(endpoint, {
       headers: {
         ...authHeaders(),
         'Range-Unit': 'items',
         Range: `${from}-${from + PAGE_SIZE - 1}`,
-        Prefer: 'count=exact',
+        Prefer: 'count=planned',
       },
     });
 
@@ -2835,6 +2852,34 @@ function signOut() {
 
 /* 10 -------------------------------------------------------------------- boot */
 
+// ---- data cache (localStorage, shared across tabs, short expiry) ----------
+const DATA_CACHE_KEY = 'vt.datacache.v1';
+const DATA_CACHE_TTL = 10 * 60 * 1000;   // 10 minutes
+
+function readDataCache() {
+  try {
+    const raw = localStorage.getItem(DATA_CACHE_KEY);
+    if (!raw) return null;
+    const obj = JSON.parse(raw);
+    if (!obj || !obj.t || (Date.now() - obj.t) > DATA_CACHE_TTL) {
+      localStorage.removeItem(DATA_CACHE_KEY);
+      return null;
+    }
+    return obj.d;
+  } catch {
+    return null;
+  }
+}
+
+function writeDataCache(data) {
+  try {
+    localStorage.setItem(DATA_CACHE_KEY, JSON.stringify({ t: Date.now(), d: data }));
+  } catch {
+    // too big for storage, or private mode — skip caching, no harm done
+    try { localStorage.removeItem(DATA_CACHE_KEY); } catch { /* ignore */ }
+  }
+}
+
 async function boot(isRefresh = false) {
   if (state.refreshing) return;
   state.refreshing = true;
@@ -2847,13 +2892,32 @@ async function boot(isRefresh = false) {
   if (state.loading) render();
 
   try {
-    const raw = await fetchAllRows(state.diag);
+    const cached = !isRefresh ? readDataCache() : null;
+    let raw, churnRef, churnAnalysis, gcfMarginal, misSquad, misMonthly;
+
+    if (cached) {
+      // reuse recently-fetched data — makes a new tab / revisit load instantly
+      ({ raw, churnRef, churnAnalysis, gcfMarginal, misSquad, misMonthly } = cached);
+    } else {
+      raw = await fetchAllRows(state.diag);
+      // The five churn/GCF/MIS tables are independent of each other — load them
+      // all at once (parallel) instead of one-after-another, which is far faster.
+      [churnRef, churnAnalysis, gcfMarginal, misSquad, misMonthly] = await Promise.all([
+        fetchChurnRef(),
+        fetchTable('churn_analysis'),
+        fetchTable('gcf_marginal'),
+        fetchTable('mis_squad_churn'),
+        fetchTable('mis_monthly_churn'),
+      ]);
+      writeDataCache({ raw, churnRef, churnAnalysis, gcfMarginal, misSquad, misMonthly });
+    }
+
     state.raw = raw;
-    state.churnRef = await fetchChurnRef();
-    state.churnAnalysis = await fetchTable('churn_analysis');
-    state.gcfMarginal = await fetchTable('gcf_marginal');
-    state.misSquadChurn = await fetchTable('mis_squad_churn');
-    state.misMonthlyChurn = await fetchTable('mis_monthly_churn');
+    state.churnRef = churnRef;
+    state.churnAnalysis = churnAnalysis;
+    state.gcfMarginal = gcfMarginal;
+    state.misSquadChurn = misSquad;
+    state.misMonthlyChurn = misMonthly;
     state.cols = resolveColumns(raw[0]);
 
     // names can't separate the two status columns — the data can
