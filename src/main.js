@@ -617,6 +617,9 @@ const state = {
   cdFilters: {},
   cdReturn: 'squad',
   cdPage: 1,
+  mlFilter: {},
+  mlReturn: 'overview',
+  mlPage: 1,
   cols: {},
   diag: {},
   loading: true,
@@ -634,7 +637,7 @@ const state = {
   page: {}, // per view: current page of the property list
 };
 
-const EXTRA_VIEWS = ['churned', 'churn-detail', 'churn-rate', 'diagnostics'];
+const EXTRA_VIEWS = ['churned', 'churn-detail', 'churn-rate', 'master-list', 'diagnostics'];
 const validView = (v) => (v === 'live-properties') ? 'overview'
   : (VIEWS.some((x) => x.id === v) || EXTRA_VIEWS.includes(v)) ? v : 'overview';
 
@@ -1377,7 +1380,7 @@ function heroStats(scopeRows, { label } = {}) {
   }
 
   const churnInner = [
-    el('div', { class: 's-label' }, ['Delisting rate', churnClickable ? el('span', { class: 'ext', text: ' ↗' }) : null]),
+    el('div', { class: 's-label' }, ['Churn rate', churnClickable ? el('span', { class: 'ext', text: ' ↗' }) : null]),
     el('div', { class: 'hero-num', text: fmtPct(churn) }),
     el('div', { class: 's-sub', text: churnSub }),
   ];
@@ -1386,7 +1389,7 @@ function heroStats(scopeRows, { label } = {}) {
   let churnCard;
   if (churnClickable) {
     churnCard = el('a', { class: 'hero-churn', href: '?view=churn-rate', target: DETAIL_TAB,
-      title: 'Click to see how the delisting rate is calculated' }, churnInner);
+      title: 'Click to see how the churn rate is calculated' }, churnInner);
     churnCard.addEventListener('click', (e) => {
       if (e.ctrlKey || e.metaKey) return;
       e.preventDefault();
@@ -1785,37 +1788,70 @@ function viewChurnRate() {
   frag.append(back);
 
   const dr = delistingRate(squad, kam, month);
-  frag.append(pageHead('Delisting rate', `How the rate is calculated · ${scope} · FY 2025-26${month ? ' · ' + month : ''}`));
+  frag.append(pageHead('Churn rate', `How the rate is calculated · ${scope} · FY 2025-26${month ? ' · ' + month : ''}`));
 
-  // the reconciliation
-  frag.append(sectionHead('The calculation', 'Delisting rate = churned ÷ (live + churned) × 100'));
+  // the reconciliation (Denominator card removed — it was just live+churned)
+  frag.append(sectionHead('The calculation', 'Churn rate = churned ÷ (live + churned) × 100'));
+
+  // Live card → opens the live property list for this scope
+  const liveCard = el('a', { class: 'stat stat-link', href: '#', title: 'Click to see the live properties' }, [
+    el('div', { class: 's-label' }, ['Live properties', el('span', { class: 'ext', text: ' ↗' })]),
+    el('div', { class: 's-value', text: fmtInt(dr.live) }),
+  ]);
+  liveCard.addEventListener('click', (e) => {
+    e.preventDefault();
+    state.returnTo = { view: state.view, filters: JSON.parse(JSON.stringify(state.filters)), search: state.search };
+    if (squad) state.filters.squads = [squad];
+    if (kam) state.filters.kams = [kam];
+    state.filters.statuses = [];
+    state.focus = true; state.page = {};
+    go('properties');
+  });
+
+  // Churned card → opens the churned list for this scope
+  const churnedCard = el('a', { class: 'stat stat-link', href: '#', title: 'Click to see the churned properties' }, [
+    el('div', { class: 's-label' }, ['Churned (FY25-26)', el('span', { class: 'ext', text: ' ↗' })]),
+    el('div', { class: 's-value', text: fmtInt(dr.churned) }),
+  ]);
+  churnedCard.addEventListener('click', (e) => {
+    e.preventDefault();
+    state.caSquad = squad || null; state.caKam = kam || null;
+    state.cd = {}; state.cdFilters = {}; state.cdReturn = 'churn-rate'; state.cdPage = 1;
+    go('churn-detail');
+  });
+
   frag.append(el('div', { class: 'stat-grid' }, [
-    el('div', { class: 'stat' }, [el('div', { class: 's-label', text: 'Live properties' }), el('div', { class: 's-value', text: fmtInt(dr.live) })]),
-    el('div', { class: 'stat' }, [el('div', { class: 's-label', text: 'Churned (FY25-26)' }), el('div', { class: 's-value', text: fmtInt(dr.churned) })]),
-    el('div', { class: 'stat' }, [el('div', { class: 's-label', text: 'Denominator (live + churned)' }), el('div', { class: 's-value', text: fmtInt(dr.denom) })]),
-    el('div', { class: 'stat tone-danger' }, [el('div', { class: 's-label', text: 'Delisting rate' }), el('div', { class: 's-value', text: dr.rate !== null ? fmtPct(dr.rate) : '—' })]),
+    liveCard,
+    churnedCard,
+    el('div', { class: 'stat tone-danger' }, [el('div', { class: 's-label', text: 'Churn rate' }), el('div', { class: 's-value', text: dr.rate !== null ? fmtPct(dr.rate) : '—' })]),
   ]));
 
-  // squad breakdown (only at all-India level)
+  // squad breakdown (only at all-India level) — each row clickable
   if (!squad && !kam) {
     const squads = [...new Set((state.churnAnalysis || []).map((r) => r.squad).filter(Boolean))].sort();
-    frag.append(sectionHead('By squad', 'Delisting rate per squad · FY25-26'));
+    frag.append(sectionHead('By squad', 'Churn rate per squad · FY25-26 · click a row for that squad\'s churned properties'));
     const table = el('table', { class: 'grid' });
-    table.append(el('thead', {}, [el('tr', {}, ['Squad', 'Live', 'Churned', 'Delisting rate'].map((h) => el('th', { style: 'text-align:left', text: h })))]));
+    table.append(el('thead', {}, [el('tr', {}, ['Squad', 'Live', 'Churned', 'Churn rate'].map((h) => el('th', { style: 'text-align:left', text: h })))]));
     const tb = el('tbody', {});
     for (const s of squads) {
       const d = delistingRate(s, null, month);
-      tb.append(el('tr', {}, [
+      const tr = el('tr', { class: 'row-click', title: `Click for ${s}'s churned properties` }, [
         el('td', { style: 'text-align:left', text: s }),
         el('td', { style: 'text-align:left', text: fmtInt(d.live) }),
         el('td', { style: 'text-align:left', text: fmtInt(d.churned) }),
         el('td', { style: 'text-align:left' }, [
           el('span', { class: d.rate !== null && d.rate > 1 ? 'flag-dot' : '', text: d.rate !== null ? fmtPct(d.rate) : '—' }),
         ]),
-      ]));
+      ]);
+      tr.addEventListener('click', () => {
+        state.caSquad = s; state.caKam = null;
+        state.cd = {}; state.cdFilters = {}; state.cdReturn = 'churn-rate'; state.cdPage = 1;
+        go('churn-detail');
+      });
+      tb.append(tr);
     }
     table.append(tb);
-    frag.append(el('div', { class: 'panel' }, [el('div', { class: 'panel-body', style: 'padding:0' }, [table])]));
+    frag.append(el('div', { class: 'panel' }, [el('div', { class: 'table-wrap' }, [table])]));
   }
 
   // the churned property list behind the number
@@ -2039,7 +2075,7 @@ function churnSection(dimension, focused) {
     ? `${fmtInt(dr.churned)} ÷ (${fmtInt(dr.live)} live + ${fmtInt(dr.churned)}) · FY25-26${month ? ' · ' + month : ''}`
     : 'no data';
   const rateCard = el('div', { class: `stat ${flagged ? 'tone-danger' : ''}` }, [
-    el('div', { class: 's-label' }, ['Delisting rate', flagged ? el('span', { class: 'flag-dot', title: 'Above 1%', text: ' ●' }) : null]),
+    el('div', { class: 's-label' }, ['Churn rate', flagged ? el('span', { class: 'flag-dot', title: 'Above 1%', text: ' ●' }) : null]),
     el('div', { class: 's-value', text: rate !== null ? fmtPct(rate) : '—' }),
     el('div', { class: 's-sub', text: rateSub }),
   ]);
@@ -2077,16 +2113,16 @@ function churnSection(dimension, focused) {
   const mc = marriottCounts(squad, kam);
   wrap.append(sectionHead('Marriott', 'Properties under Marriott vs not · all properties'));
   wrap.append(el('div', { class: 'stat-grid' }, [
-    el('div', { class: 'stat' }, [el('div', { class: 's-label', text: 'Under Marriott' }), el('div', { class: 's-value', text: fmtInt(mc.under) })]),
-    el('div', { class: 'stat' }, [el('div', { class: 's-label', text: 'Not under Marriott' }), el('div', { class: 's-value', text: fmtInt(mc.notUnder) })]),
+    masterListCard('Under Marriott', mc.under, { marriott: 'yes' }, squad, kam),
+    masterListCard('Not under Marriott', mc.notUnder, { marriott: 'no' }, squad, kam),
   ]));
 
   // DCRW — Damage cover & Refund waiver, Yes/No count across all properties
   const dc = dcrwCounts(squad, kam);
   wrap.append(sectionHead('DCRW', 'Damage cover & Refund waiver · charged per booking · all properties'));
   wrap.append(el('div', { class: 'stat-grid' }, [
-    el('div', { class: 'stat' }, [el('div', { class: 's-label', text: 'DCRW — Yes' }), el('div', { class: 's-value', text: fmtInt(dc.yes) })]),
-    el('div', { class: 'stat' }, [el('div', { class: 's-label', text: 'DCRW — No' }), el('div', { class: 's-value', text: fmtInt(dc.no) })]),
+    masterListCard('DCRW — Yes', dc.yes, { dcrw: 'yes' }, squad, kam),
+    masterListCard('DCRW — No', dc.no, { dcrw: 'no' }, squad, kam),
   ]));
 
   // Monthly churn rate (from MIS Table 3) — flag months > 1%, click to filter by month
@@ -2114,6 +2150,98 @@ function churnSection(dimension, focused) {
 }
 
 /** A churn metric card that opens the filtered churned-property list on click. */
+// A card that opens a filtered list of MASTER properties (from gcf_marginal),
+// e.g. under Marriott / DCRW Yes. These cover all properties, not just churned.
+function masterListCard(label, value, filter, squad, kam) {
+  const card = el('a', { class: 'stat stat-link', href: '#',
+    title: 'Click to see these properties · 25 per page' }, [
+    el('div', { class: 's-label' }, [label, el('span', { class: 'ext', text: ' ↗' })]),
+    el('div', { class: 's-value', text: fmtInt(value) }),
+  ]);
+  card.addEventListener('click', (e) => {
+    e.preventDefault();
+    state.mlFilter = { ...filter, squad: squad || null, kam: kam || null, label };
+    state.mlReturn = state.view;
+    state.mlPage = 1;
+    go('master-list');
+  });
+  return card;
+}
+
+function viewMasterList() {
+  const f = state.mlFilter || {};
+  const frag = el('div', {}, []);
+  const back = el('button', { type: 'button', class: 'back-btn' }, [el('span', { class: 'back-arrow', text: '‹' }), 'Go back to previous page']);
+  back.addEventListener('click', () => go(state.mlReturn || 'overview'));
+  frag.append(back);
+
+  // filter the master rows
+  let rows = (state.gcfMarginal || []).slice();
+  if (f.squad) rows = rows.filter((r) => norm(r.squad) === norm(f.squad));
+  if (f.kam) rows = rows.filter((r) => norm(r.kam) === norm(f.kam));
+  if (f.marriott === 'yes') rows = rows.filter((r) => { const v = r.marriott_cost; return v != null && String(v).trim() !== '' && String(v).trim() !== '-'; });
+  if (f.marriott === 'no') rows = rows.filter((r) => { const v = r.marriott_cost; return !(v != null && String(v).trim() !== '' && String(v).trim() !== '-'); });
+  if (f.dcrw === 'yes') rows = rows.filter((r) => norm(r.dcrw) === 'yes');
+  if (f.dcrw === 'no') rows = rows.filter((r) => norm(r.dcrw) === 'no');
+
+  const scope = f.kam ? `${f.kam} · ${f.squad || ''}` : f.squad ? f.squad : 'all properties';
+  frag.append(pageHead(f.label || 'Properties', `${scope}`));
+  frag.append(sectionHead('Results', `${fmtInt(rows.length)} properties`));
+
+  if (!rows.length) {
+    frag.append(el('div', { class: 'state' }, [el('p', { text: 'No properties in this scope.' })]));
+    return frag;
+  }
+
+  // 25-per-page pagination (same pager style)
+  const PER = 25;
+  const pageCount = Math.ceil(rows.length / PER);
+  let page = state.mlPage || 1;
+  if (page > pageCount) page = pageCount;
+  const pageRows = rows.slice((page - 1) * PER, page * PER);
+
+  const showPct = (v) => {
+    if (v == null || String(v).trim() === '' || String(v).trim() === '-') return '—';
+    const s = String(v).trim();
+    if (s.includes('%')) return s;
+    let n = Number(s); if (Number.isNaN(n)) return s;
+    if (n > 0 && n <= 1) n = n * 100;
+    return `${Math.round(n * 100) / 100}%`;
+  };
+
+  const table = el('table', { class: 'grid' });
+  const head = ['Property ID', 'Squad', 'KAM', 'GCF', 'F&B Owner', 'F&B Vista', 'GST', 'Marriott', 'DCRW'];
+  table.append(el('thead', {}, [el('tr', {}, head.map((h, i) => el('th', { class: i === 0 ? 'freeze' : '', style: 'text-align:left', text: h })))]));
+  const tb = el('tbody', {});
+  for (const r of pageRows) {
+    tb.append(el('tr', {}, [
+      el('td', { class: 'freeze', style: 'text-align:left', text: r.property_id != null ? String(r.property_id) : '—' }),
+      el('td', { style: 'text-align:left', text: r.squad || '—' }),
+      el('td', { style: 'text-align:left', text: r.kam || '—' }),
+      el('td', { style: 'text-align:left', text: showPct(r.gcf_current) }),
+      el('td', { style: 'text-align:left', text: showPct(r.fnb_owner) }),
+      el('td', { style: 'text-align:left', text: showPct(r.fnb_vista) }),
+      el('td', { style: 'text-align:left', text: showPct(r.gst) }),
+      el('td', { style: 'text-align:left', text: (r.marriott_cost != null && String(r.marriott_cost).trim() !== '' && String(r.marriott_cost).trim() !== '-') ? String(r.marriott_cost) : '—' }),
+      el('td', { style: 'text-align:left', text: r.dcrw || '—' }),
+    ]));
+  }
+  table.append(tb);
+
+  const parts = [el('div', { class: 'table-wrap' }, [el('div', { class: 'churn-table-scroll' }, [table])])];
+  if (pageCount > 1) {
+    const pgr = el('div', { class: 'pager' });
+    const prev = el('button', { type: 'button', class: 'pg-btn', text: '‹ Prev' }); if (page <= 1) prev.disabled = true;
+    prev.addEventListener('click', () => { state.mlPage = page - 1; render(); });
+    const next = el('button', { type: 'button', class: 'pg-btn', text: 'Next ›' }); if (page >= pageCount) next.disabled = true;
+    next.addEventListener('click', () => { state.mlPage = page + 1; render(); });
+    pgr.append(prev, el('span', { class: 'pg-info', text: `Page ${page} of ${pageCount} · ${fmtInt(rows.length)} total` }), next);
+    parts.push(pgr);
+  }
+  frag.append(el('div', { class: 'panel' }, parts));
+  return frag;
+}
+
 function clickableChurnCard(label, value, filter, squad, kam) {
   const p = new URLSearchParams();
   p.set('view', 'churn-detail');
@@ -2777,6 +2905,9 @@ function renderView() {
       break;
     case 'churn-rate':
       root.append(viewChurnRate());
+      break;
+    case 'master-list':
+      root.append(viewMasterList());
       break;
     default:
       root.append(viewOverview(rows));

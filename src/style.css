@@ -1605,3 +1605,7 @@ a.hero-churn .ext { font-size: 12px; opacity: .5; }
 .churn-table-scroll { min-width: 1200px; }
 .churn-table-scroll table.grid { width: 100%; }
 .churn-table-scroll th, .churn-table-scroll td { white-space: nowrap; padding-right: 18px; }
+
+/* clickable table rows */
+tr.row-click { cursor: pointer; }
+tr.row-click:hover td { background: var(--surface-2); }
