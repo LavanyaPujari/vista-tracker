@@ -699,6 +699,41 @@ function syncUrl() {
   history.replaceState(null, '', urlFor(state.view, state.sub));
 }
 
+// Simple navigation history so "back" always returns to the actual previous
+// page, however deep you drill. Each entry captures the view + the scope needed
+// to reconstruct it (filters, churn drill state, master-list filter).
+const navStack = [];
+
+function pushNav() {
+  navStack.push({
+    view: state.view,
+    filters: JSON.parse(JSON.stringify(state.filters)),
+    search: state.search,
+    focus: state.focus,
+    caSquad: state.caSquad, caKam: state.caKam, caMonth: state.caMonth,
+    cd: state.cd ? { ...state.cd } : {},
+    cdFilters: state.cdFilters ? { ...state.cdFilters } : {},
+    mlFilter: state.mlFilter ? { ...state.mlFilter } : {},
+  });
+  if (navStack.length > 50) navStack.shift();   // keep it bounded
+}
+
+function goBackHistory(fallback = 'overview') {
+  const prev = navStack.pop();
+  if (!prev) { go(fallback); return; }
+  state.filters = prev.filters;
+  state.search = prev.search;
+  state.focus = prev.focus;
+  state.caSquad = prev.caSquad; state.caKam = prev.caKam; state.caMonth = prev.caMonth;
+  state.cd = prev.cd; state.cdFilters = prev.cdFilters; state.mlFilter = prev.mlFilter;
+  state.page = {};
+  state.view = validView(prev.view);
+  state.sub = defaultSub(state.view);
+  syncUrl();
+  render();
+  window.scrollTo({ top: 0, behavior: 'auto' });
+}
+
 function go(view, sub) {
   if (view !== state.view) state.page = {};
   state.view = validView(view);
@@ -711,6 +746,8 @@ function go(view, sub) {
 
 /** Return from a drilled-in card view to wherever the click came from. */
 function goBack() {
+  // prefer the navigation history stack (reliable for deep drills)
+  if (navStack.length) { goBackHistory('overview'); return; }
   const r = state.returnTo;
   state.focus = false;
   state.returnTo = null;
@@ -967,6 +1004,7 @@ function cardClickHandler(filter) {
     e.preventDefault();
 
     state.returnTo = { view: state.view, filters: JSON.parse(JSON.stringify(state.filters)), search: state.search };
+    pushNav();
     if (filter.status) state.filters.statuses = [filter.status];
     if (filter.squad)  state.filters.squads = [filter.squad];
     if (filter.kam)    state.filters.kams = [filter.kam];
@@ -1393,7 +1431,7 @@ function heroStats(scopeRows, { label } = {}) {
     churnCard.addEventListener('click', (e) => {
       if (e.ctrlKey || e.metaKey) return;
       e.preventDefault();
-      state.cdReturn = state.view;
+      pushNav();
       go('churn-rate');
     });
   } else {
@@ -1784,7 +1822,7 @@ function viewChurnRate() {
 
   const frag = el('div', {}, []);
   const back = el('button', { type: 'button', class: 'back-btn' }, [el('span', { class: 'back-arrow', text: '‹' }), 'Go back to previous page']);
-  back.addEventListener('click', () => go(state.cdReturn || 'overview'));
+  back.addEventListener('click', () => goBackHistory('overview'));
   frag.append(back);
 
   const dr = delistingRate(squad, kam, month);
@@ -1805,6 +1843,7 @@ function viewChurnRate() {
     if (kam) state.filters.kams = [kam];
     state.filters.statuses = [];
     state.focus = true; state.page = {};
+    pushNav();
     go('properties');
   });
 
@@ -1816,7 +1855,8 @@ function viewChurnRate() {
   churnedCard.addEventListener('click', (e) => {
     e.preventDefault();
     state.caSquad = squad || null; state.caKam = kam || null;
-    state.cd = {}; state.cdFilters = {}; state.cdReturn = 'churn-rate'; state.cdPage = 1;
+    state.cd = {}; state.cdFilters = {}; state.cdPage = 1;
+    pushNav();
     go('churn-detail');
   });
 
@@ -1845,7 +1885,8 @@ function viewChurnRate() {
       ]);
       tr.addEventListener('click', () => {
         state.caSquad = s; state.caKam = null;
-        state.cd = {}; state.cdFilters = {}; state.cdReturn = 'churn-rate'; state.cdPage = 1;
+        state.cd = {}; state.cdFilters = {}; state.cdPage = 1;
+        pushNav();
         go('churn-detail');
       });
       tb.append(tr);
@@ -1870,7 +1911,7 @@ function viewChurnDetail() {
 
   // back button → return to where we came from (squad or kam tab)
   const back = el('button', { type: 'button', class: 'back-btn' }, [el('span', { class: 'back-arrow', text: '‹' }), 'Go back to previous page']);
-  back.addEventListener('click', () => go(state.cdReturn || 'squad'));
+  back.addEventListener('click', () => goBackHistory('squad'));
   frag.append(back);
 
   // build the churned rows, then apply the card's filter + any user filters
@@ -2161,8 +2202,8 @@ function masterListCard(label, value, filter, squad, kam) {
   card.addEventListener('click', (e) => {
     e.preventDefault();
     state.mlFilter = { ...filter, squad: squad || null, kam: kam || null, label };
-    state.mlReturn = state.view;
     state.mlPage = 1;
+    pushNav();
     go('master-list');
   });
   return card;
@@ -2172,7 +2213,7 @@ function viewMasterList() {
   const f = state.mlFilter || {};
   const frag = el('div', {}, []);
   const back = el('button', { type: 'button', class: 'back-btn' }, [el('span', { class: 'back-arrow', text: '‹' }), 'Go back to previous page']);
-  back.addEventListener('click', () => go(state.mlReturn || 'overview'));
+  back.addEventListener('click', () => goBackHistory('overview'));
   frag.append(back);
 
   // Scope comes from the LIVE top filter bar (so changing Squad/KAM up top
@@ -2263,8 +2304,8 @@ function clickableChurnCard(label, value, filter, squad, kam) {
     state.caKam = kam || null;
     state.cd = { gcfLow: !!filter.gcfLow, initiatedBy: filter.initiatedBy || null, fnb: filter.fnb || null, reason: filter.reason || null };
     state.cdFilters = {};   // clear any leftover dropdown filters from a previous card
-    state.cdReturn = state.view;
     state.cdPage = 1;
+    pushNav();
     go('churn-detail');
   });
   return card;
