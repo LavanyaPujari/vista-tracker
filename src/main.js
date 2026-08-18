@@ -2351,17 +2351,18 @@ function viewProperties(rows) {
   const oneSquad = state.filters.squads.length === 1 ? state.filters.squads[0] : null;
   const oneKam = state.filters.kams.length === 1 ? state.filters.kams[0] : null;
 
-  // Agreement cards: show on the full summary AND when drilled into a single
-  // squad/KAM (they update to that scope). Only hide for a pure status drill.
-  if (!drilled || oneSquad || oneKam) {
+  // Agreement cards show ONLY on the unfiltered summary. Once any filter is
+  // active (drilled view), we show just the property list — so the card count
+  // and the list count can never disagree.
+  if (!drilled) {
     frag.append(
       sectionHead('Agreement status', `${fmtInt(rows.filter((r) => r.__live === true).length)} live properties in scope`),
       statusCards(rows.filter((r) => r.__live === true), { live: true }),
     );
   }
 
-  // When the drill-in is for a single squad or KAM, show the churn cards here
-  // too (so the filtered view has the same churn metrics as the Squad/KAM tab).
+  // Churn cards: only when a single squad/KAM is selected (not for a status
+  // filter), so the filtered view has that squad/KAM's churn metrics.
   if (!singleStatus && !state.filters.newNoAgreement && (oneSquad || oneKam)) {
     frag.append(churnSection(oneKam ? 'kam' : 'squad', oneKam || oneSquad));
   }
