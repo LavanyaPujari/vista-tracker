@@ -1876,3 +1876,30 @@ tr.row-click:hover td { background: var(--surface-2); }
   .panel, .stat, .kpi, .group-card, .act-card { break-inside: avoid; box-shadow: none; }
   table.grid thead th { position: static; }
 }
+
+/* prominent filtered property count (feature 4) */
+.count-badge{font-size:13px;color:var(--muted,#8a8378);white-space:nowrap}
+.count-badge strong{font-family:'Marcellus',Georgia,serif;font-size:20px;color:var(--ink,#1e1e1e);font-weight:400;margin-right:2px}
+.count-badge.filtered{background:var(--sky,#9CCDFB);color:#0f3552;padding:5px 13px;border-radius:999px}
+.count-badge.filtered strong{color:#0f3552}
+.count-badge .count-sub{opacity:.8}
+
+/* keyboard shortcuts (feature 1) */
+.shortcuts-btn{display:inline-flex;align-items:center;gap:3px;border:1px solid var(--line,#e8e0d5);background:var(--surface,#fff);border-radius:999px;padding:6px 11px;font-size:12.5px;cursor:pointer;font-family:inherit;color:var(--ink-2,#4a4640)}
+.shortcuts-btn:hover{background:var(--surface-2,#f4efe8)}
+@media(max-width:720px){.shortcuts-btn .sc-text{display:none}}
+.shortcuts-pop{position:fixed;top:60px;right:18px;z-index:60;background:var(--surface,#fff);border:1px solid var(--line,#e8e0d5);border-radius:14px;box-shadow:0 12px 40px rgba(0,0,0,.16);padding:14px 16px;min-width:260px;max-width:320px}
+.shortcuts-pop .sc-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.shortcuts-pop .sc-head strong{font-family:'Marcellus',Georgia,serif;font-size:16px;font-weight:400}
+.shortcuts-pop .sc-close{border:0;background:none;font-size:20px;line-height:1;cursor:pointer;color:var(--muted,#8a8378)}
+.shortcuts-pop .sc-row{display:flex;align-items:center;gap:11px;padding:5px 0;font-size:13px;color:var(--ink-2,#4a4640)}
+.shortcuts-pop kbd{font-family:ui-monospace,monospace;background:var(--surface-2,#f4efe8);border:1px solid var(--line,#e8e0d5);border-bottom-width:2px;border-radius:5px;padding:2px 7px;font-size:11.5px;min-width:64px;text-align:center;color:var(--ink,#1e1e1e)}
+
+/* monthly churn table (feature 2) */
+.monthly-churn .mc-cell.click{cursor:pointer}
+.monthly-churn .mc-cell.click:hover{background:var(--surface-2,#f4efe8)}
+.monthly-churn .mc-cell.empty{color:var(--muted-2,#b3a99c)}
+.monthly-churn .mc-cell.flag span{color:var(--bad,#c0392b);font-weight:600}
+/* KAM vs Property distinct highlight in detail (feature 2) */
+td.hl-kam{color:#7a4fc0;font-weight:700}
+td.hl-prop{color:#1e6f5c;font-weight:700}

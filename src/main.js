@@ -584,6 +584,7 @@ const VIEWS = [
   { id: 'overview',        label: 'Live Properties',    group: 'Summary' },
   { id: 'squad',           label: 'Squad-wise',         group: 'Summary' },
   { id: 'kam',             label: 'KAM-wise',           group: 'Summary' },
+  { id: 'monthly-churn',   label: 'Monthly churn',      group: 'Summary' },
   { id: 'properties',      label: 'Property Details',   group: 'Detail'  },
 ];
 
@@ -620,6 +621,8 @@ const state = {
   mlFilter: {},
   mlReturn: 'overview',
   mlPage: 1,
+  mcSquad: null,
+  mcMonth: null,
   cols: {},
   diag: {},
   loading: true,
@@ -637,7 +640,7 @@ const state = {
   page: {}, // per view: current page of the property list
 };
 
-const EXTRA_VIEWS = ['churned', 'churn-detail', 'churn-rate', 'master-list', 'diagnostics'];
+const EXTRA_VIEWS = ['churned', 'churn-detail', 'churn-rate', 'master-list', 'monthly-churn', 'monthly-churn-detail', 'diagnostics'];
 const validView = (v) => (v === 'live-properties') ? 'overview'
   : (VIEWS.some((x) => x.id === v) || EXTRA_VIEWS.includes(v)) ? v : 'overview';
 
@@ -794,6 +797,7 @@ function filterRows(skip = null) {
     (skip === 'squad'  || !squads.length   || squads.includes(r.__squad)) &&
     (skip === 'kam'    || !kams.length     || kams.includes(r.__kam)) &&
     (skip === 'status' || !statuses.length || statuses.includes(r.__status)) &&
+    (!state.filters.liveOnly || r.__live === true) &&
     (skip === 'newna'  || !state.filters.newNoAgreement || r.__newNoAgreement) &&
     (skip === 'period' || inPeriod(r)) &&
     (skip === 'search' || matchesSearch(r, state.search))
@@ -1005,7 +1009,10 @@ function cardClickHandler(filter) {
 
     state.returnTo = { view: state.view, filters: JSON.parse(JSON.stringify(state.filters)), search: state.search };
     pushNav();
-    if (filter.status) state.filters.statuses = [filter.status];
+    if (filter.status) {
+      state.filters.statuses = [filter.status];
+      state.filters.liveOnly = true;   // agreement-status views show LIVE properties only
+    }
     if (filter.squad)  state.filters.squads = [filter.squad];
     if (filter.kam)    state.filters.kams = [filter.kam];
     state.filters.newNoAgreement = !!filter.newNoAgreement;
@@ -1196,10 +1203,15 @@ function propertyList(rows, opts = {}) {
     el('tbody', {}, body.length ? body : [el('tr', {}, [el('td', { colspan: head.length, class: 'freeze', text: 'No properties match the current filters.' })])]),
   ]);
 
+  const anyFilter = state.filters.squads.length || state.filters.kams.length || state.filters.statuses.length || state.filters.liveOnly || state.search || state.period.month || state.period.year;
   return el('div', { class: 'panel' }, [
     el('div', { class: 'panel-head' }, [
       el('h3', { text: opts.title || 'Property details' }),
-      el('span', { class: 'hint right', text: `${fmtInt(rows.length)} properties · ${PAGE_ROWS} per page` }),
+      el('span', { class: `count-badge${anyFilter ? ' filtered' : ''}` }, [
+        el('strong', { text: fmtInt(rows.length) }),
+        el('span', { text: rows.length === 1 ? ' property' : ' properties' }),
+        anyFilter ? el('span', { class: 'count-sub', text: ' found' }) : null,
+      ]),
     ]),
     el('div', { class: 'table-wrap stacked-wrap' }, [table]),
     pagerEl,
@@ -2294,6 +2306,122 @@ function viewMasterList() {
   return frag;
 }
 
+// Monthly churn computed from the churn list (delist dates), per squad.
+// Rate for a squad+month = that month's churned ÷ (squad live + squad total FY churned) × 100.
+// Same denominator as the main churn rate, so figures reconcile.
+function churnedInSquadMonth(squad, monthNum) {
+  const seen = new Set();
+  const out = [];
+  for (const r of (state.churnAnalysis || [])) {
+    if (norm(r.current_status) !== 'delisted') continue;
+    if (squad && norm(r.squad) !== norm(squad)) continue;
+    if (!inFY(r.delist_date)) continue;
+    const d = r.delist_date ? new Date(r.delist_date) : null;
+    if (!d || (d.getMonth() + 1) !== monthNum) continue;
+    const id = pidKey(r.property_id);
+    if (id && seen.has(id)) continue;
+    if (id) seen.add(id);
+    out.push(r);
+  }
+  return out;
+}
+
+function squadMonthRate(squad, monthNum) {
+  const churnedThisMonth = churnedInSquadMonth(squad, monthNum).length;
+  const dr = delistingRate(squad, null, null);   // squad's live + total FY churned
+  const denom = dr.live + dr.churned;
+  return { count: churnedThisMonth, rate: denom ? (churnedThisMonth * 100 / denom) : null };
+}
+
+function viewMonthlyChurn() {
+  const frag = el('div', {}, []);
+  const back = el('button', { type: 'button', class: 'back-btn' }, [el('span', { class: 'back-arrow', text: '‹' }), 'Go back to previous page']);
+  back.addEventListener('click', () => goBackHistory('overview'));
+  frag.append(back);
+
+  frag.append(pageHead('Monthly churn by squad', 'Churn rate per squad, per month · FY 2025-26 · click any cell for that month\'s churned properties'));
+
+  const squads = [...new Set((state.churnAnalysis || []).map((r) => r.squad).filter(Boolean))].sort();
+  // FY month order: Apr(4) … Dec(12), Jan(1) … Mar(3)
+  const fyMonths = [4,5,6,7,8,9,10,11,12,1,2,3];
+  const shortName = (n) => ['','Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][n];
+
+  const table = el('table', { class: 'grid monthly-churn' });
+  table.append(el('thead', {}, [el('tr', {}, [
+    el('th', { class: 'freeze', style: 'text-align:left', text: 'Squad' }),
+    ...fyMonths.map((n) => el('th', { style: 'text-align:center', text: shortName(n) })),
+  ])]));
+  const tb = el('tbody', {});
+  for (const s of squads) {
+    const cells = [el('td', { class: 'freeze', style: 'text-align:left', text: s })];
+    for (const n of fyMonths) {
+      const { count, rate } = squadMonthRate(s, n);
+      if (!count) {
+        cells.push(el('td', { class: 'mc-cell empty', style: 'text-align:center', text: '·' }));
+      } else {
+        const flagged = rate !== null && rate > 1;
+        const td = el('td', { class: `mc-cell click${flagged ? ' flag' : ''}`, style: 'text-align:center',
+          title: `${s} · ${shortName(n)} · ${count} churned` },
+          [el('span', { text: rate !== null ? fmtPct(rate) : '—' })]);
+        td.addEventListener('click', () => {
+          state.mcSquad = s; state.mcMonth = n;
+          pushNav();
+          go('monthly-churn-detail');
+        });
+        cells.push(td);
+      }
+    }
+    tb.append(el('tr', {}, cells));
+  }
+  table.append(tb);
+  frag.append(el('div', { class: 'panel' }, [el('div', { class: 'table-wrap' }, [el('div', { class: 'churn-table-scroll', style: 'min-width:900px' }, [table])])]));
+  return frag;
+}
+
+function viewMonthlyChurnDetail() {
+  const squad = state.mcSquad, monthNum = state.mcMonth;
+  const shortName = (n) => ['','January','February','March','April','May','June','July','August','September','October','November','December'][n];
+  const frag = el('div', {}, []);
+  const back = el('button', { type: 'button', class: 'back-btn' }, [el('span', { class: 'back-arrow', text: '‹' }), 'Go back to previous page']);
+  back.addEventListener('click', () => goBackHistory('monthly-churn'));
+  frag.append(back);
+
+  const props = churnedInSquadMonth(squad, monthNum);
+  const { rate } = squadMonthRate(squad, monthNum);
+  frag.append(pageHead(`${squad} · ${shortName(monthNum)}`, `Churned properties this month · rate ${rate !== null ? fmtPct(rate) : '—'} · FY 2025-26`));
+  frag.append(sectionHead('Churned properties', `${fmtInt(props.length)} in ${squad} · ${shortName(monthNum)}`));
+
+  if (!props.length) {
+    frag.append(el('div', { class: 'state' }, [el('p', { text: 'No churned properties in this month.' })]));
+    return frag;
+  }
+
+  // join gcf for extra fields
+  const gcfById = {};
+  for (const m of (state.gcfMarginal || [])) if (m.property_id != null) gcfById[pidKey(m.property_id)] = m;
+
+  const table = el('table', { class: 'grid' });
+  const head = ['Property ID', 'Property', 'Squad', 'KAM', 'Churn month', 'Initiated by', 'Reason', 'Delist date'];
+  table.append(el('thead', {}, [el('tr', {}, head.map((h, i) => el('th', { class: i === 0 ? 'freeze' : '', style: 'text-align:left', text: h })))]));
+  const tb = el('tbody', {});
+  for (const r of props) {
+    const by = norm(r.delist_initiated_by) === 'ho' ? 'Home Owner' : norm(r.delist_initiated_by) === 'sv' ? 'StayVista' : (r.delist_initiated_by || '—');
+    tb.append(el('tr', {}, [
+      el('td', { class: 'freeze', style: 'text-align:left', text: r.property_id != null ? String(r.property_id) : '—' }),
+      el('td', { class: 'hl-prop', style: 'text-align:left', text: r.vista_name || '—' }),
+      el('td', { style: 'text-align:left', text: r.squad || '—' }),
+      el('td', { class: 'hl-kam', style: 'text-align:left', text: r.kam || '—' }),
+      el('td', { style: 'text-align:left', text: shortName(monthNum) }),
+      el('td', { style: 'text-align:left', text: by }),
+      el('td', { style: 'text-align:left', text: r.reason_bucket || '—' }),
+      el('td', { style: 'text-align:left', text: r.delist_date ? String(r.delist_date).slice(0, 10) : '—' }),
+    ]));
+  }
+  table.append(tb);
+  frag.append(el('div', { class: 'panel' }, [el('div', { class: 'table-wrap' }, [el('div', { class: 'churn-table-scroll', style: 'min-width:1000px' }, [table])])]));
+  return frag;
+}
+
 function clickableChurnCard(label, value, filter, squad, kam) {
   const p = new URLSearchParams();
   p.set('view', 'churn-detail');
@@ -2831,7 +2959,12 @@ function renderFilters() {
       label: cfg.label,
       options: uniqueValues(cfg.field, cfg.skip),
       selected: state.filters[stateKey].slice(),
-      onChange: (vals) => { state.filters[stateKey] = vals; onFiltersChanged(); },
+      onChange: (vals) => {
+        state.filters[stateKey] = vals;
+        // liveOnly is only the status-card shortcut; a manual filter change drops it
+        state.filters.liveOnly = false;
+        onFiltersChanged();
+      },
     });
     filterUI.controls[stateKey] = ms;
     row.append(ms);
@@ -3077,6 +3210,12 @@ function renderView() {
     case 'master-list':
       root.append(viewMasterList());
       break;
+    case 'monthly-churn':
+      root.append(viewMonthlyChurn());
+      break;
+    case 'monthly-churn-detail':
+      root.append(viewMonthlyChurnDetail());
+      break;
     default:
       root.append(viewOverview(rows));
   }
@@ -3282,6 +3421,92 @@ function paintRefresh() {
   }
 }
 
+const SHORTCUTS = [
+  ['←  /  Backspace', 'Go back to the previous page'],
+  ['H', 'Go to Home (Live Properties)'],
+  ['L', 'Go to Live Properties'],
+  ['Esc', 'Clear all active filters'],
+  ['R', 'Refresh data from Supabase'],
+  ['F', 'Focus the search / filter bar'],
+  ['?', 'Show this shortcuts list'],
+];
+
+function clearAllFilters() {
+  state.filters = { squads: [], kams: [], statuses: [], newNoAgreement: false, liveOnly: false };
+  state.period = { month: '', year: '' };
+  state.search = '';
+  state.cdFilters = {};
+  if (typeof onFiltersChanged === 'function') onFiltersChanged(); else render();
+}
+
+function setupShortcuts() {
+  // header button
+  const right = document.querySelector('.topbar-right');
+  if (right && !document.getElementById('shortcuts-btn')) {
+    const btn = el('button', { id: 'shortcuts-btn', class: 'shortcuts-btn', type: 'button',
+      title: 'Keyboard shortcuts (?)', 'aria-label': 'Keyboard shortcuts' }, ['⌨', el('span', { class: 'sc-text', text: ' Shortcuts' })]);
+    btn.addEventListener('click', toggleShortcutsPopup);
+    // place it just before the theme toggle if present, else at start
+    const themeBtn = document.getElementById('theme-toggle');
+    right.insertBefore(btn, themeBtn || right.firstChild);
+  }
+
+  document.addEventListener('keydown', (e) => {
+    // never hijack typing in inputs/textareas or with modifier keys
+    const tag = (e.target.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea' || tag === 'select' || e.metaKey || e.ctrlKey || e.altKey) {
+      if (e.key === 'Escape' && (tag === 'input' || tag === 'textarea')) e.target.blur();
+      return;
+    }
+    // ignore if login screen is up
+    if (!document.getElementById('app') || document.getElementById('app').classList.contains('hidden')) return;
+
+    switch (e.key) {
+      case 'Backspace':
+      case 'ArrowLeft':
+        e.preventDefault(); goBack(); break;
+      case 'h': case 'H':
+        e.preventDefault(); go('overview'); break;
+      case 'l': case 'L':
+        e.preventDefault(); go('overview'); break;
+      case 'r': case 'R':
+        e.preventDefault(); boot(true); break;
+      case 'f': case 'F': {
+        e.preventDefault();
+        const s = document.querySelector('.filter-search');
+        if (s) { s.focus(); } else { document.querySelector('.sticky-controls')?.scrollIntoView({ behavior: 'smooth' }); }
+        break;
+      }
+      case 'Escape':
+        clearAllFilters(); closeShortcutsPopup(); break;
+      case '?':
+        e.preventDefault(); toggleShortcutsPopup(); break;
+      default: break;
+    }
+  });
+}
+
+function toggleShortcutsPopup() {
+  const existing = document.getElementById('shortcuts-pop');
+  if (existing) { existing.remove(); return; }
+  const pop = el('div', { id: 'shortcuts-pop', class: 'shortcuts-pop', role: 'dialog', 'aria-label': 'Keyboard shortcuts' }, [
+    el('div', { class: 'sc-head' }, [el('strong', { text: 'Keyboard shortcuts' }),
+      (() => { const x = el('button', { class: 'sc-close', type: 'button', 'aria-label': 'Close', text: '×' }); x.addEventListener('click', closeShortcutsPopup); return x; })()]),
+    ...SHORTCUTS.map(([k, d]) => el('div', { class: 'sc-row' }, [el('kbd', { text: k }), el('span', { text: d })])),
+  ]);
+  document.body.appendChild(pop);
+  // close on outside click
+  setTimeout(() => document.addEventListener('click', outsideCloseSc), 0);
+}
+function outsideCloseSc(e) {
+  const pop = document.getElementById('shortcuts-pop');
+  if (pop && !pop.contains(e.target) && e.target.id !== 'shortcuts-btn' && !e.target.closest('#shortcuts-btn')) closeShortcutsPopup();
+}
+function closeShortcutsPopup() {
+  document.getElementById('shortcuts-pop')?.remove();
+  document.removeEventListener('click', outsideCloseSc);
+}
+
 function init() {
   console.log('%cVista Tracker build: EXPIRED-READS-COLUMN-v2', 'font-weight:bold;color:#2f7d5b');
   readUrl();
@@ -3300,6 +3525,7 @@ function init() {
   });
   $('#scrim')?.addEventListener('click', closeDrawer);
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDrawer(); });
+  setupShortcuts();
   window.addEventListener('resize', () => { if (window.innerWidth > 980) closeDrawer(); });
   window.addEventListener('popstate', () => { readUrl(); render(); });
 
