@@ -1421,7 +1421,7 @@ function heroStats(scopeRows, { label } = {}) {
   if (dr.rate !== null) {
     churn = dr.rate;
     const who = selectedKam ? selectedKam : selectedSquad ? selectedSquad : 'All India';
-    churnSub = `${fmtInt(dr.churned)} ÷ (${fmtInt(dr.live)} + ${fmtInt(dr.churned)}) · ${who} · FY25-26`;
+    churnSub = `${fmtInt(dr.churned)} churned ÷ ${fmtInt(dr.live)} live at FY start · ${who} · FY25-26`;
     churnClickable = true;
   } else {
     churn = null;
@@ -1581,13 +1581,43 @@ function inFY(dateStr) {
 }
 
 // Count of LIVE properties (Current Status = "Live") in the main table, scoped
-// to an optional squad / KAM. This is the denominator's live component.
+// to an optional squad / KAM. (Current live — used for reference/display.)
 function liveCount(squad, kam) {
   let n = 0;
   for (const r of (state.rows || [])) {
     if (r.__live !== true) continue;
     if (squad && norm(r.__squad) !== norm(squad)) continue;
     if (kam && norm(r.__kam) !== norm(kam)) continue;
+    n += 1;
+  }
+  return n;
+}
+
+// Properties that were LIVE on 1 Apr 2025 (FY start), scoped. A property counts if
+// it went live before FY start AND had not churned before FY start. That is:
+//   (a) still live now and went live before Apr 2025, PLUS
+//   (b) churned during the FY (delist date on/after Apr 2025) — they were live at start.
+function liveAtFYStart(squad, kam) {
+  let n = 0;
+  // (a) current-live properties that went live before FY start
+  for (const r of (state.rows || [])) {
+    if (r.__live !== true) continue;
+    if (squad && norm(r.__squad) !== norm(squad)) continue;
+    if (kam && norm(r.__kam) !== norm(kam)) continue;
+    const ld = r.__liveDateObj;
+    if (ld && ld < FY_START) n += 1;      // was already live at FY start
+    else if (!ld) n += 1;                 // no live date on record → count it (already on books)
+  }
+  // (b) FY-churned properties were live at FY start too (deduped by id)
+  const seen = new Set();
+  for (const r of (state.churnAnalysis || [])) {
+    if (norm(r.current_status) !== 'delisted') continue;
+    if (squad && norm(r.squad) !== norm(squad)) continue;
+    if (kam && norm(r.kam) !== norm(kam)) continue;
+    if (!inFY(r.delist_date)) continue;
+    const id = pidKey(r.property_id);
+    if (id && seen.has(id)) continue;
+    if (id) seen.add(id);
     n += 1;
   }
   return n;
@@ -1615,13 +1645,13 @@ function churnedCountFY(squad, kam, month) {
   return n;
 }
 
-// Delisting rate = churned / (live + churned) * 100, all in the same scope.
-// Returns { rate, churned, live } so the detail view can reconcile the number.
+// Churn rate = churned (FYTD) / live-at-FY-start * 100, same scope.
+// Returns { rate, churned, live } so detail views can reconcile the number.
+// `live` here is the FY-start live count (the denominator).
 function delistingRate(squad, kam, month) {
   const churned = churnedCountFY(squad, kam, month);
-  const live = liveCount(squad, kam);
-  const denom = live + churned;
-  return { rate: denom ? (churned * 100 / denom) : null, churned, live, denom };
+  const live = liveAtFYStart(squad, kam);     // denominator = live at FY start
+  return { rate: live ? (churned * 100 / live) : null, churned, live, denom: live };
 }
 
 
@@ -1856,11 +1886,11 @@ function viewChurnRate() {
   frag.append(pageHead('Churn rate', `How the rate is calculated · ${scope} · FY 2025-26${month ? ' · ' + month : ''}`));
 
   // the reconciliation (Denominator card removed — it was just live+churned)
-  frag.append(sectionHead('The calculation', 'Churn rate = churned ÷ (live + churned) × 100'));
+  frag.append(sectionHead('The calculation', 'Churn rate = churned (FYTD) ÷ live at FY start × 100'));
 
   // Live card → opens the live property list for this scope
   const liveCard = el('a', { class: 'stat stat-link', href: '#', title: 'Click to see the live properties' }, [
-    el('div', { class: 's-label' }, ['Live properties', el('span', { class: 'ext', text: ' ↗' })]),
+    el('div', { class: 's-label' }, ['Live at FY start', el('span', { class: 'ext', text: ' ↗' })]),
     el('div', { class: 's-value', text: fmtInt(dr.live) }),
   ]);
   liveCard.addEventListener('click', (e) => {
@@ -2140,7 +2170,7 @@ function churnSection(dimension, focused) {
   // headline churn rate, flagged red if > 1%
   const flagged = rate !== null && rate > 1;
   const rateSub = rate !== null
-    ? `${fmtInt(dr.churned)} ÷ (${fmtInt(dr.live)} live + ${fmtInt(dr.churned)}) · FY25-26${month ? ' · ' + month : ''}`
+    ? `${fmtInt(dr.churned)} churned ÷ ${fmtInt(dr.live)} live at FY start · FY25-26${month ? ' · ' + month : ''}`
     : 'no data';
   const rateCard = el('div', { class: `stat ${flagged ? 'tone-danger' : ''}` }, [
     el('div', { class: 's-label' }, ['Churn rate', flagged ? el('span', { class: 'flag-dot', title: 'Above 1%', text: ' ●' }) : null]),
@@ -2328,8 +2358,7 @@ function churnedInSquadMonth(squad, monthNum) {
 
 function squadMonthRate(squad, monthNum) {
   const churnedThisMonth = churnedInSquadMonth(squad, monthNum).length;
-  const dr = delistingRate(squad, null, null);   // squad's live + total FY churned
-  const denom = dr.live + dr.churned;
+  const denom = liveAtFYStart(squad, null);   // live at FY start (same denominator as all rates)
   return { count: churnedThisMonth, rate: denom ? (churnedThisMonth * 100 / denom) : null };
 }
 
