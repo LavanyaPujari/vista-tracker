@@ -3422,7 +3422,7 @@ function paintRefresh() {
 }
 
 const SHORTCUTS = [
-  ['←  /  Backspace', 'Go back to the previous page'],
+  ['Backspace', 'Go back to the previous page'],
   ['H', 'Go to Home (Live Properties)'],
   ['L', 'Go to Live Properties'],
   ['Esc', 'Clear all active filters'],
@@ -3463,7 +3463,6 @@ function setupShortcuts() {
 
     switch (e.key) {
       case 'Backspace':
-      case 'ArrowLeft':
         e.preventDefault(); goBack(); break;
       case 'h': case 'H':
         e.preventDefault(); go('overview'); break;
