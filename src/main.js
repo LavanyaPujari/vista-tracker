@@ -1556,6 +1556,41 @@ function dcrwCounts(squad, kam) {
 // now". Every list view uses this, so filters behave identically everywhere and
 // a new view/card automatically respects them. Prefers the live top filter bar,
 // falling back to any churn-drill scope.
+// ONE shared churn-row filter. Every churn view runs its rows through this so
+// the churn dropdowns (F&B, reason, initiated-by, GCF) + search always apply,
+// consistently, on every current and future churn page. `cd` is the optional
+// card filter (from clicking a card); dropdowns override the card per-field.
+function applyChurnFilters(rows, cd = {}) {
+  const f = state.cdFilters || {};
+  const sc = activeScope();
+
+  // top filter bar: squad / kam / search
+  if (sc.squad) rows = rows.filter((r) => norm(r.squad) === norm(sc.squad));
+  if (sc.kam) rows = rows.filter((r) => norm(r.kam) === norm(sc.kam));
+  if (sc.search) rows = rows.filter((r) => norm(`${r.property_id} ${r.vista_name} ${r.squad} ${r.kam}`).includes(sc.search));
+
+  // card filter applies unless a dropdown overrides the same field
+  if (cd.gcfLow && !f.gcfRange) rows = rows.filter((r) => { const n = pctToNumber(r.gcf); return n !== null && n < 5; });
+  if (cd.initiatedBy && !f.initiatedBy) rows = rows.filter((r) => norm(r.initiatedBy).includes(norm(cd.initiatedBy)));
+  if (cd.fnb && !f.fnb) rows = rows.filter((r) => fnbBucket(r.fnb) === cd.fnb);
+  if (cd.reason && !f.reason) rows = rows.filter((r) => norm(r.reason) === norm(cd.reason));
+
+  // churn dropdown filters
+  if (f.fnb) rows = rows.filter((r) => fnbBucket(r.fnb) === f.fnb);
+  if (f.reason) rows = rows.filter((r) => norm(r.reason) === norm(f.reason));
+  if (f.initiatedBy) rows = rows.filter((r) => norm(r.initiatedBy).includes(norm(f.initiatedBy)));
+  if (f.gcfRange) {
+    rows = rows.filter((r) => {
+      const n = pctToNumber(r.gcf); if (n === null) return false;
+      if (f.gcfRange === '<5%') return n < 5;
+      if (f.gcfRange === '5-10%') return n >= 5 && n <= 10;
+      if (f.gcfRange === '>10%') return n > 10;
+      return true;
+    });
+  }
+  return rows;
+}
+
 function activeScope() {
   const cdf = state.cdFilters || {};
   return {
@@ -1707,7 +1742,7 @@ function fnbBucket(v) {
   return '21%+';
 }
 
-function churnAnalysis(squad, kam, month) {
+function churnAnalysis(squad, kam, month, opts = {}) {
   const churn = state.churnAnalysis || [];
   const marginal = state.gcfMarginal || [];
 
@@ -1768,7 +1803,14 @@ function churnAnalysis(squad, kam, month) {
   const fnbCounts = Object.fromEntries(FNB_BUCKETS.map((b) => [b, 0]));
   for (const r of rows) { const b = fnbBucket(r.fnb); if (b) fnbCounts[b] += 1; }
 
-  return { rows, total, lowGcf,
+  // FOOLPROOF FILTERING: by default, the returned row list has the active churn
+  // filters (F&B/reason/initiated-by/GCF + search) applied, so no view can ever
+  // display unfiltered churn rows by accident. Metric aggregates below are kept
+  // on the unfiltered set so summary cards stay stable; a caller that needs the
+  // truly raw rows (e.g. those cards) passes { raw: true }.
+  const outRows = opts.raw ? rows : applyChurnFilters(rows, opts.cd || {});
+
+  return { rows: outRows, total, lowGcf,
     initiatedBy: byBucket(rows, (r) => r.initiatedBy),
     reasons: byBucket(rows, (r) => r.reason),
     fnbCounts };
@@ -1972,34 +2014,8 @@ function viewChurnDetail() {
   back.addEventListener('click', () => goBackHistory('squad'));
   frag.append(back);
 
-  // build the churned rows, then apply the card's filter + any user filters
-  let rows = churnAnalysis(squad, kam, sc.month).rows;
-  // live top filter bar: free-text search also narrows the list
-  if (topSearch) rows = rows.filter((r) => norm(`${r.property_id} ${r.vista_name} ${r.squad} ${r.kam}`).includes(topSearch));
-  const f = state.cdFilters || {};
-
-  // The card filter applies UNLESS the user picked a value for the same field in
-  // the dropdowns (the dropdown then takes over — they never stack/conflict).
-  if (cd.gcfLow && !f.gcfRange) rows = rows.filter((r) => { const n = pctToNumber(r.gcf); return n !== null && n < 5; });
-  if (cd.initiatedBy && !f.initiatedBy) rows = rows.filter((r) => norm(r.initiatedBy).includes(norm(cd.initiatedBy)));
-  if (cd.fnb && !f.fnb) rows = rows.filter((r) => fnbBucket(r.fnb) === cd.fnb);
-  if (cd.reason && !f.reason) rows = rows.filter((r) => norm(r.reason) === norm(cd.reason));
-
-  // user dropdown filters
-  if (f.squad) rows = rows.filter((r) => norm(r.squad) === norm(f.squad));
-  if (f.kam) rows = rows.filter((r) => norm(r.kam) === norm(f.kam));
-  if (f.fnb) rows = rows.filter((r) => fnbBucket(r.fnb) === f.fnb);
-  if (f.reason) rows = rows.filter((r) => norm(r.reason) === norm(f.reason));
-  if (f.initiatedBy) rows = rows.filter((r) => norm(r.initiatedBy).includes(norm(f.initiatedBy)));
-  if (f.gcfRange) {
-    rows = rows.filter((r) => {
-      const n = pctToNumber(r.gcf); if (n === null) return false;
-      if (f.gcfRange === '<5%') return n < 5;
-      if (f.gcfRange === '5-10%') return n >= 5 && n <= 10;
-      if (f.gcfRange === '>10%') return n > 10;
-      return true;
-    });
-  }
+  // build the churned rows, then apply all churn filters via the shared rule
+  const rows = churnAnalysis(squad, kam, sc.month, { cd }).rows;
 
   // title describing the active card filter
   const bits = [];
@@ -2165,7 +2181,7 @@ function churnSection(dimension, focused) {
   }
 
   // all metric computations respect the selected month
-  const m2 = churnAnalysis(squad, kam, month);
+  const m2 = churnAnalysis(squad, kam, month, { raw: true });
 
   // headline churn rate, flagged red if > 1%
   const flagged = rate !== null && rate > 1;
@@ -2287,6 +2303,19 @@ function viewMasterList() {
   if (f.dcrw === 'no') rows = rows.filter((r) => norm(r.dcrw) === 'no');
   // free-text search on id / squad / kam
   if (search) rows = rows.filter((r) => norm(`${r.property_id} ${r.squad} ${r.kam}`).includes(search));
+
+  // churn dropdowns that also make sense for master rows: F&B band + GCF range.
+  // (reason / initiated-by are churn-only fields and don't exist here, so they're
+  //  intentionally not applied to the master property list.)
+  const cdf = state.cdFilters || {};
+  if (cdf.fnb) rows = rows.filter((r) => fnbBucket(r.fnb_owner) === cdf.fnb);
+  if (cdf.gcfRange) rows = rows.filter((r) => {
+    const n = pctToNumber(r.gcf_current); if (n === null) return false;
+    if (cdf.gcfRange === '<5%') return n < 5;
+    if (cdf.gcfRange === '5-10%') return n >= 5 && n <= 10;
+    if (cdf.gcfRange === '>10%') return n > 10;
+    return true;
+  });
 
   const scope = kam ? `${kam} · ${squad || ''}` : squad ? squad : 'all properties';
   frag.append(pageHead(f.label || 'Properties', `${scope}`));
