@@ -127,24 +127,26 @@ function resolveColumns(sample) {
   const is  = (...names) => (c) => names.includes(c.n);
 
   return {
-    // POC comes from the Owner Facing columns first — the sync writes them into
-    // `poc`, but reading them directly means the dashboard works either way.
+    // KAM = the dedicated `kam` column the sync now writes (from "Owner Facing
+    // AM"), separate from POC. Falls back to Owner Facing headers if reading a
+    // sheet directly, but NEVER to POC.
     kam: pick([
+      is('kam'),                                 // dedicated Supabase column
+      is('ownerfacingam'),                       // "Owner Facing AM" (exact)
+      has('ownerfacing', 'am'),
       is('ownerfacingaccountmanager'),
       has('ownerfacing', 'accountmanager'),
       has('ownerfacing', 'manager'),
-      has('ownerfacing', 'poc'),
       has('ownerfacing'),
-      is('poc'),
-      has('account', 'manager'),
-      is('kam', 'kamname', 'accountmanager'),
+      is('kamname'),
+      has('key', 'accountmanager'),
     ]),
-    // secondary Owner Facing column, used to fill blanks in the primary
+    // secondary Owner Facing column, used only to fill blanks in the primary.
+    // (Also never POC.)
     kamAlt: pick([
       has('ownerfacing', 'ops'),
       has('ownerfacing', 'secondary'),
       has('ownerfacing', 'backup'),
-      is('poc'),
     ]),
     squad: pick([
       is('squad'),
