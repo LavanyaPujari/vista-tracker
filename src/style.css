@@ -1903,3 +1903,9 @@ tr.row-click:hover td { background: var(--surface-2); }
 /* KAM vs Property distinct highlight in detail (feature 2) */
 td.hl-kam{color:#7a4fc0;font-weight:700}
 td.hl-prop{color:#1e6f5c;font-weight:700}
+
+/* monthly churn FY toggle */
+.fy-toggle{display:inline-flex;gap:6px;margin:0 0 14px;background:var(--surface-2,#f4efe8);border:1px solid var(--line,#e8e0d5);border-radius:999px;padding:4px}
+.fy-btn{border:0;background:none;border-radius:999px;padding:6px 16px;font-size:13px;font-family:inherit;cursor:pointer;color:var(--ink-2,#4a4640)}
+.fy-btn.active{background:var(--ink,#1e1e1e);color:#fff}
+.monthly-churn th{white-space:nowrap}
