@@ -302,9 +302,26 @@ function detectStatusColumns(raw) {
 }
 
 const DAY = 86400000;
+// Parse a date value that may be: a real date string ('2025-06-15'),
+// a spreadsheet SERIAL NUMBER ('45254' = days since 1899-12-30), or blank.
+// Serial numbers must be handled explicitly — new Date('45254') wrongly yields
+// the YEAR 45254, which silently drops the row from FY windows.
 function parseDate(v) {
-  if (!v) return null;
-  const d = new Date(v);
+  if (v === null || v === undefined || v === '') return null;
+  const s = String(v).trim();
+  if (s === '') return null;
+  // pure number (optionally "45254.0") = spreadsheet serial date
+  if (/^[0-9]+(\.0+)?$/.test(s)) {
+    const serial = Math.floor(Number(s));
+    // plausible serial-date range (~1900-01-01 to ~2100); avoids treating a real
+    // 4-digit year or an id as a serial by mistake
+    if (serial >= 1 && serial <= 80000) {
+      const ms = Date.UTC(1899, 11, 30) + serial * 86400000;
+      const d = new Date(ms);
+      return Number.isNaN(d.getTime()) ? null : d;
+    }
+  }
+  const d = new Date(s);
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
@@ -1423,7 +1440,7 @@ function heroStats(scopeRows, { label } = {}) {
   if (dr.rate !== null) {
     churn = dr.rate;
     const who = selectedKam ? selectedKam : selectedSquad ? selectedSquad : 'All India';
-    churnSub = `${fmtInt(dr.churned)} churned ÷ ${fmtInt(dr.live)} live at FY start · ${who} · FY25-26`;
+    churnSub = `${fmtInt(dr.churned)} churned ÷ (${fmtInt(dr.live)} live + ${fmtInt(dr.churned)}) · ${who} · FY25-26`;
     churnClickable = true;
   } else {
     churn = null;
@@ -1610,11 +1627,16 @@ function activeScope() {
 const FY_START = new Date(2025, 3, 1);        // Apr 1, 2025
 const FY_END   = new Date(2026, 2, 31, 23, 59, 59); // Mar 31, 2026
 
+// A property is CHURNED if its current status is Delisted, TAC, or Paused.
+const CHURNED_STATUSES = ['delisted', 'tac', 'paused'];
+function isChurned(status) {
+  return CHURNED_STATUSES.includes(norm(status));
+}
+
 // Is a delist date inside FY 2025-26?
 function inFY(dateStr) {
-  if (!dateStr) return false;
-  const d = new Date(dateStr);
-  return !Number.isNaN(d.getTime()) && d >= FY_START && d <= FY_END;
+  const d = parseDate(dateStr);
+  return !!d && d >= FY_START && d <= FY_END;
 }
 
 // Count of LIVE properties (Current Status = "Live") in the main table, scoped
@@ -1648,7 +1670,7 @@ function liveAtFYStart(squad, kam) {
   // (b) FY-churned properties were live at FY start too (deduped by id)
   const seen = new Set();
   for (const r of (state.churnAnalysis || [])) {
-    if (norm(r.current_status) !== 'delisted') continue;
+    if (!isChurned(r.current_status)) continue;
     if (squad && norm(r.squad) !== norm(squad)) continue;
     if (kam && norm(r.kam) !== norm(kam)) continue;
     if (!inFY(r.delist_date)) continue;
@@ -1666,12 +1688,12 @@ function churnedCountFY(squad, kam, month) {
   let n = 0;
   const monthNum = month ? MONTH_NAMES.findIndex((mn) => norm(mn) === norm(month)) + 1 : 0;
   for (const r of (state.churnAnalysis || [])) {
-    if (norm(r.current_status) !== 'delisted') continue;
+    if (!isChurned(r.current_status)) continue;
     if (squad && norm(r.squad) !== norm(squad)) continue;
     if (kam && norm(r.kam) !== norm(kam)) continue;
     if (!inFY(r.delist_date)) continue;
     if (monthNum) {
-      const d = r.delist_date ? new Date(r.delist_date) : null;
+      const d = parseDate(r.delist_date);
       if (!(d && (d.getMonth() + 1) === monthNum)) continue;
     }
     const id = r.property_id != null ? String(r.property_id).trim() : '';
@@ -1687,8 +1709,9 @@ function churnedCountFY(squad, kam, month) {
 // `live` here is the FY-start live count (the denominator).
 function delistingRate(squad, kam, month) {
   const churned = churnedCountFY(squad, kam, month);
-  const live = liveAtFYStart(squad, kam);     // denominator = live at FY start
-  return { rate: live ? (churned * 100 / live) : null, churned, live, denom: live };
+  const live = liveCount(squad, kam);          // current live properties
+  const denom = live + churned;                // live + churned
+  return { rate: denom ? (churned * 100 / denom) : null, churned, live, denom };
 }
 
 
@@ -1752,12 +1775,12 @@ function churnAnalysis(squad, kam, month, opts = {}) {
   for (const m of marginal) if (m.property_id != null) gcfById[pidKey(m.property_id)] = m;
 
   const monthNum = month ? MONTH_NAMES.findIndex((mn) => norm(mn) === norm(month)) + 1 : 0;
-  const isDelisted = (r) => norm(r.current_status) === 'delisted';
+  const isDelisted = (r) => isChurned(r.current_status);
   const matchSquad = (r) => !squad || norm(r.squad) === norm(squad);
   const matchKam = (r) => !kam || norm(r.kam) === norm(kam);
   const matchMonth = (r) => {
     if (!monthNum) return true;
-    const d = r.delist_date ? new Date(r.delist_date) : null;
+    const d = parseDate(r.delist_date);
     return d && !Number.isNaN(d.getTime()) && (d.getMonth() + 1) === monthNum;
   };
 
@@ -1821,7 +1844,7 @@ function churnAnalysis(squad, kam, month, opts = {}) {
 function churnSquads() {
   const m = {};
   for (const r of (state.churnAnalysis || [])) {
-    if (norm(r.current_status) !== 'delisted') continue;
+    if (!isChurned(r.current_status)) continue;
     const s = r.squad || '—';
     (m[s] = m[s] || new Set());
     if (r.property_id != null) m[s].add(String(r.property_id).trim());
@@ -1832,7 +1855,7 @@ function churnSquads() {
 function churnKams(squad) {
   const m = {};
   for (const r of (state.churnAnalysis || [])) {
-    if (norm(r.current_status) !== 'delisted') continue;
+    if (!isChurned(r.current_status)) continue;
     if (squad && norm(r.squad) !== norm(squad)) continue;
     const k = r.kam || '—';
     (m[k] = m[k] || new Set());
@@ -1930,7 +1953,7 @@ function viewChurnRate() {
   frag.append(pageHead('Churn rate', `How the rate is calculated · ${scope} · FY 2025-26${month ? ' · ' + month : ''}`));
 
   // the reconciliation (Denominator card removed — it was just live+churned)
-  frag.append(sectionHead('The calculation', 'Churn rate = churned (FYTD) ÷ live at FY start × 100'));
+  frag.append(sectionHead('The calculation', 'Churn rate = churned ÷ (live + churned) × 100'));
 
   // Live card → opens the live property list for this scope
   const liveCard = el('a', { class: 'stat stat-link', href: '#', title: 'Click to see the live properties' }, [
@@ -2188,7 +2211,7 @@ function churnSection(dimension, focused) {
   // headline churn rate, flagged red if > 1%
   const flagged = rate !== null && rate > 1;
   const rateSub = rate !== null
-    ? `${fmtInt(dr.churned)} churned ÷ ${fmtInt(dr.live)} live at FY start · FY25-26${month ? ' · ' + month : ''}`
+    ? `${fmtInt(dr.churned)} churned ÷ (${fmtInt(dr.live)} live + ${fmtInt(dr.churned)}) · FY25-26${month ? ' · ' + month : ''}`
     : 'no data';
   const rateCard = el('div', { class: `stat ${flagged ? 'tone-danger' : ''}` }, [
     el('div', { class: 's-label' }, ['Churn rate', flagged ? el('span', { class: 'flag-dot', title: 'Above 1%', text: ' ●' }) : null]),
@@ -2374,10 +2397,10 @@ function churnedInSquadMonth(squad, monthNum) {
   const seen = new Set();
   const out = [];
   for (const r of (state.churnAnalysis || [])) {
-    if (norm(r.current_status) !== 'delisted') continue;
+    if (!isChurned(r.current_status)) continue;
     if (squad && norm(r.squad) !== norm(squad)) continue;
     if (!inFY(r.delist_date)) continue;
-    const d = r.delist_date ? new Date(r.delist_date) : null;
+    const d = parseDate(r.delist_date);
     if (!d || (d.getMonth() + 1) !== monthNum) continue;
     const id = pidKey(r.property_id);
     if (id && seen.has(id)) continue;
@@ -2389,7 +2412,8 @@ function churnedInSquadMonth(squad, monthNum) {
 
 function squadMonthRate(squad, monthNum) {
   const churnedThisMonth = churnedInSquadMonth(squad, monthNum).length;
-  const denom = liveAtFYStart(squad, null);   // live at FY start (same denominator as all rates)
+  const dr = delistingRate(squad, null, null);   // squad's current live + total churned
+  const denom = dr.live + dr.churned;
   return { count: churnedThisMonth, rate: denom ? (churnedThisMonth * 100 / denom) : null };
 }
 
