@@ -31,7 +31,7 @@ const SUPABASE_TABLE = ENV.VITE_SUPABASE_TABLE || 'agreement track';
 
 
 
-const PAGE_SIZE = 1000; // Supabase returns at most 1000 rows per request
+const PAGE_SIZE = 500; // rows per request — smaller chunks load faster and avoid timeouts
 
 /* How many days before agreement_end_date counts as "To Expire". */
 const EXPIRY_WINDOW_DAYS = Number(ENV.VITE_EXPIRY_WINDOW_DAYS) || 90;
@@ -458,7 +458,7 @@ async function listTables() {
 
 // fetch that gives up after `ms` so a stalled request shows an error instead
 // of spinning on "Loading" forever.
-async function fetchWithTimeout(url, options = {}, ms = 30000) {
+async function fetchWithTimeout(url, options = {}, ms = 45000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ms);
   try {
@@ -471,6 +471,21 @@ async function fetchWithTimeout(url, options = {}, ms = 30000) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+// Fetch one page, retrying a couple of times if a chunk times out or hiccups,
+// so a single slow moment doesn't fail the whole load.
+async function fetchPageWithRetry(url, options, attempts = 3) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fetchWithTimeout(url, options);
+    } catch (e) {
+      lastErr = e;
+      if (i < attempts - 1) await new Promise((r) => setTimeout(r, 800 * (i + 1)));
+    }
+  }
+  throw lastErr;
 }
 
 async function probeTable(name) {
@@ -503,28 +518,7 @@ async function fetchTable(tableName) {
   }
 }
 
-async function fetchChurnRef() {
-  // Best-effort: if the churn_ref table isn't there yet, return [] so the
-  // dashboard still works and falls back to simple churn.
-  if (!SUPABASE_URL || !SUPABASE_KEY) return [];
-  try {
-    const out = [];
-    let from = 0;
-    for (let guard = 0; guard < 30; guard++) {
-      const res = await fetch(`${SUPABASE_URL}/rest/v1/churn_ref?select=*`, {
-        headers: { ...authHeaders(), 'Range-Unit': 'items', Range: `${from}-${from + PAGE_SIZE - 1}` },
-      });
-      if (!res.ok) return out;              // table missing or blocked → give up quietly
-      const batch = await res.json();
-      out.push(...batch);
-      if (batch.length < PAGE_SIZE) break;
-      from += PAGE_SIZE;
-    }
-    return out;
-  } catch {
-    return [];
-  }
-}
+
 
 async function fetchAllRows(diag) {
   if (!SUPABASE_URL || !SUPABASE_KEY) {
@@ -565,8 +559,8 @@ async function fetchAllRows(diag) {
   const out = [];
   let from = 0;
 
-  for (let guard = 0; guard < 60; guard++) {
-    const res = await fetchWithTimeout(endpoint, {
+  for (let guard = 0; guard < 120; guard++) {
+    const res = await fetchPageWithRetry(endpoint, {
       headers: {
         ...authHeaders(),
         'Range-Unit': 'items',
@@ -605,6 +599,7 @@ const VIEWS = [
   { id: 'kam',             label: 'KAM-wise',           group: 'Summary' },
   { id: 'monthly-churn',   label: 'Monthly churn',      group: 'Summary' },
   { id: 'properties',      label: 'Property Details',   group: 'Detail'  },
+  { id: 'help',            label: 'Help & How it works', group: 'Detail'  },
 ];
 
 /* Counts and Valid % tabs are gone — every summary is card-based now. */
@@ -625,11 +620,8 @@ const state = {
   user: null,
   rows: [],
   raw: [],
-  churnRef: [],
   churnAnalysis: [],
   gcfMarginal: [],
-  misSquadChurn: [],
-  misMonthlyChurn: [],
   caSquad: null,
   caMonth: null,
   caKam: null,
@@ -1278,102 +1270,6 @@ const MS_DAY = 86400000;
 
 function monthStart(d = new Date()) { return new Date(d.getFullYear(), d.getMonth(), 1); }
 
-/**
- * Financial-year churn, mirroring the sheet formula exactly.
- *
- *   churn % = (properties whose Consol DelistPaused Date falls between Apr 1 of
- *             the financial year and the end of the selected month)
- *           / (properties whose Live Date is before Apr 1 AND whose Consol
- *             Delist date is on/after Apr 1 — the base at FY start)
- *
- * FY runs April–March: months Apr–Dec use the selected year, Jan–Mar use the
- * previous year. Squad filters when one squad is selected, else all squads.
- * Returns null when churn_ref isn't available so the caller can hide the card.
- */
-function churnRateFY(squad) {
-  const ref = state.churnRef || [];
-  if (!ref.length) return null;
-
-  // month/year from the period filter, else today
-  const now = new Date();
-  const monthNum = state.period.month ? Number(state.period.month) : (now.getMonth() + 1);
-  const pickedYear = state.period.year ? Number(state.period.year) : now.getFullYear();
-
-  // FY start: if selected month is Apr(4) or later, FY started this year, else last year
-  const fyStartYear = monthNum >= 4 ? pickedYear : pickedYear - 1;
-  const fyStart = new Date(fyStartYear, 3, 1);                 // Apr 1
-  const monthEnd = new Date(pickedYear, monthNum, 0);          // last day of selected month
-
-  const parse = (v) => {
-    if (!v) return null;
-    const d = new Date(v);
-    return Number.isNaN(d.getTime()) ? null : d;
-  };
-  const sameSquad = (r) => !squad || norm(r.squad) === norm(squad);
-
-  let numerator = 0;
-  let denominator = 0;
-
-  for (const r of ref) {
-    if (!sameSquad(r)) continue;
-
-    const leave = parse(r.consol_delist_paused_date);   // column I
-    const live = parse(r.live_date);                    // column D
-    const consolDelist = parse(r.consol_delist);        // column J
-
-    // numerator: churned within the FY window up to the selected month-end
-    if (leave && leave >= fyStart && leave <= monthEnd) numerator += 1;
-
-    // denominator: live before FY start AND still around on/after FY start
-    if (live && live < fyStart && consolDelist && consolDelist >= fyStart) denominator += 1;
-  }
-
-  if (!denominator) return null;
-  return numerator * 100 / denominator;
-}
-
-/**
- * The actual properties that churned this financial year (up to the selected
- * month) — the numerator rows behind churnRateFY. Joined with the main table by
- * Property ID so each shows a name and KAM, not just an ID.
- */
-function churnedRowsFY(squad) {
-  const ref = state.churnRef || [];
-  if (!ref.length) return [];
-
-  const now = new Date();
-  const monthNum = state.period.month ? Number(state.period.month) : (now.getMonth() + 1);
-  const pickedYear = state.period.year ? Number(state.period.year) : now.getFullYear();
-  const fyStartYear = monthNum >= 4 ? pickedYear : pickedYear - 1;
-  const fyStart = new Date(fyStartYear, 3, 1);
-  const monthEnd = new Date(pickedYear, monthNum, 0);
-
-  const parse = (v) => { if (!v) return null; const d = new Date(v); return Number.isNaN(d.getTime()) ? null : d; };
-  const sameSquad = (r) => !squad || norm(r.squad) === norm(squad);
-
-  // index main rows by Property ID for the join
-  const byId = {};
-  for (const r of state.rows) if (r.__code) byId[String(r.__code).trim()] = r;
-
-  const out = [];
-  for (const r of ref) {
-    if (!sameSquad(r)) continue;
-    const leave = parse(r.consol_delist_paused_date);
-    if (!(leave && leave >= fyStart && leave <= monthEnd)) continue;
-    const main = byId[String(r.prop_id).trim()];
-    out.push({
-      __code: r.prop_id,
-      __property: main ? main.__property : `Property ${r.prop_id}`,
-      __squad: r.squad || (main ? main.__squad : ''),
-      __kam: main ? main.__kam : '—',
-      __leaveDate: r.consol_delist_paused_date || '',
-    });
-  }
-  // most recent churn first
-  out.sort((a, b) => String(b.__leaveDate).localeCompare(String(a.__leaveDate)));
-  return out;
-}
-
 /** Live agreements whose end date is within the next `days` days. */
 function expiringWithin(rows, days) {
   const now = new Date();
@@ -1749,38 +1645,10 @@ function delistingRate(squad, kam, month) {
 }
 
 
-// Read the pre-calculated churn rate (%) for a squad from the MIS squad table.
-// Pass null/undefined for the overall "India" total.
-function misChurnRate(squad) {
-  const rows = state.misSquadChurn || [];
-  if (!rows.length) return null;
-  const target = squad ? norm(squad) : 'india';
-  const row = rows.find((r) => norm(r.squad) === target);
-  if (!row || row.churn_rate == null || row.churn_rate === '') return null;
-  const n = pctToNumber(row.churn_rate);
-  return n;
-}
-
 // The full MIS squad row (churned count, HO, SV, etc.) for a squad.
-function misSquadRow(squad) {
-  const rows = state.misSquadChurn || [];
-  const target = squad ? norm(squad) : 'india';
-  return rows.find((r) => norm(r.squad) === target) || null;
-}
+
 
 // Monthly churn rates for a squad, as [{month, rate}] in FY order (Apr→Mar).
-const FY_MONTHS = ['april','may','june','july','august','september','october','november','december','january','february','march'];
-function misMonthly(squad) {
-  const rows = state.misMonthlyChurn || [];
-  const target = squad ? norm(squad) : 'india';
-  const row = rows.find((r) => norm(r.squad) === target);
-  if (!row) return [];
-  return FY_MONTHS
-    .filter((m) => row[m] != null && String(row[m]).trim() !== '')
-    .map((m) => ({ month: m.charAt(0).toUpperCase() + m.slice(1), rate: pctToNumber(row[m]) }));
-}
-
-
 const FNB_BUCKETS = ['0%', '1-10%', '11-20%', '21%+'];
 const MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
 
@@ -1900,68 +1768,7 @@ function churnKams(squad) {
 
 /* ---- Churned properties (drill-in from the churn card) ------------------- */
 
-function viewChurned() {
-  const selectedSquad = state.filters.squads.length === 1 ? state.filters.squads[0] : null;
-  const churned = churnedRowsFY(selectedSquad);
 
-  const now = new Date();
-  const monthNum = state.period.month ? Number(state.period.month) : (now.getMonth() + 1);
-  const pickedYear = state.period.year ? Number(state.period.year) : now.getFullYear();
-  const monthName = ['January','February','March','April','May','June','July','August','September','October','November','December'][monthNum - 1];
-  const scope = selectedSquad ? selectedSquad : 'all squads';
-
-  const frag = el('div', {}, []);
-
-  // back button to return to the dashboard
-  const back = el('button', { type: 'button', class: 'back-btn' }, [el('span', { class: 'back-arrow', text: '‹' }), 'Go back']);
-  back.addEventListener('click', () => go('overview'));
-  frag.append(back);
-
-  frag.append(pageHead('Churned properties',
-    `Properties that churned this financial year up to ${monthName} ${pickedYear} · ${scope}.`));
-
-  if (!churned.length) {
-    frag.append(el('div', { class: 'state' }, [
-      el('h3', { text: 'No churned properties in this period' }),
-      el('p', { text: 'Nothing matched the selected month, year and squad.' }),
-    ]));
-    return frag;
-  }
-
-  frag.append(el('div', { class: 'panel' }, [
-    el('div', { class: 'panel-head' }, [
-      el('h3', { text: `${fmtInt(churned.length)} churned` }),
-      el('span', { class: 'hint right', text: `FYTD · ${scope}` }),
-    ]),
-    el('div', { class: 'panel-body', style: 'padding:0' }, [
-      (() => {
-        const table = el('table', { class: 'grid' });
-        table.append(el('thead', {}, [el('tr', {}, [
-          el('th', { style: 'text-align:left', text: 'Property' }),
-          el('th', { style: 'text-align:left', text: 'Squad' }),
-          el('th', { style: 'text-align:left', text: 'KAM' }),
-          el('th', { style: 'text-align:left', text: 'Churn date' }),
-        ])]));
-        const tbody = el('tbody', {});
-        for (const r of churned) {
-          tbody.append(el('tr', {}, [
-            el('td', { style: 'text-align:left' }, [
-              el('div', { text: r.__property }),
-              r.__code ? el('div', { class: 'row-sub', text: String(r.__code) }) : null,
-            ]),
-            el('td', { style: 'text-align:left', text: r.__squad || '—' }),
-            el('td', { style: 'text-align:left', text: r.__kam || '—' }),
-            el('td', { style: 'text-align:left', text: r.__leaveDate ? String(r.__leaveDate).slice(0, 10) : '—' }),
-          ]));
-        }
-        table.append(tbody);
-        return table;
-      })(),
-    ]),
-  ]));
-
-  return frag;
-}
 
 /* ---- Churn Analysis: Squad -> KAM drill-down ---------------------------- */
 
@@ -2253,10 +2060,8 @@ function churnSection(dimension, focused) {
     el('div', { class: 's-sub', text: rateSub }),
   ]);
 
-  const misRow = misSquadRow(squad);
   // Counts come from the ACTUAL churn rows (m2) so every card matches the list
-  // that opens when you click it. (The churn RATE above still comes from MIS,
-  // since that's a trusted percentage, not a row count.)
+  // that opens when you click it.
   const churnedCount = m2.total;
 
   wrap.append(sectionHead('Churn', `Delisted properties · ${scope}${month ? ' · ' + month : ''}`));
@@ -2297,27 +2102,6 @@ function churnSection(dimension, focused) {
     masterListCard('DCRW — Yes', dc.yes, { dcrw: 'yes' }, squad, kam),
     masterListCard('DCRW — No', dc.no, { dcrw: 'no' }, squad, kam),
   ]));
-
-  // Monthly churn rate (from MIS Table 3) — flag months > 1%, click to filter by month
-  const monthly = misMonthly(squad);
-  if (monthly.length) {
-    wrap.append(sectionHead('Monthly churn rate', `FY Apr–Mar · ${scope} · red = above 1% · click a month to filter`));
-    wrap.append(el('div', { class: 'stat-grid' },
-      monthly.map((mm) => {
-        const selected = norm(state.caMonth || '') === norm(mm.month);
-        const card = el('a', { class: `stat stat-link ${mm.rate > 1 ? 'tone-danger' : ''} ${selected ? 'month-active' : ''}`, href: '#',
-          title: 'Click to filter this section to ' + mm.month }, [
-          el('div', { class: 's-label', text: mm.month }),
-          el('div', { class: 's-value', text: fmtPct(mm.rate) }),
-        ]);
-        card.addEventListener('click', (e) => {
-          e.preventDefault();
-          state.caMonth = selected ? null : mm.month;   // toggle on/off
-          render();
-        });
-        return card;
-      })));
-  }
 
   return wrap;
 }
@@ -2685,6 +2469,93 @@ function diagnosticsText() {
     ...(d.statusMap || []).map((s) => `  "${s.raw}" -> ${s.bucket}  [via ${s.source || 'nothing matched'}]  (${s.count})`),
   ];
   return lines.filter((l) => l !== null).join('\n');
+}
+
+function viewHelp() {
+  const frag = el('div', {}, []);
+  frag.append(pageHead('Help & How it works', 'A plain-language guide to Vista Tracker — for anyone on the team.'));
+
+  const section = (title, children) =>
+    el('div', { class: 'help-card' }, [el('h3', { class: 'help-h', text: title }), ...children]);
+  const p = (text) => el('p', { class: 'help-p', text });
+  const steps = (items) => el('ol', { class: 'help-steps' }, items.map((t) => el('li', { text: t })));
+  const rows = (pairs) => el('div', { class: 'help-table' },
+    pairs.map(([k, v]) => el('div', { class: 'help-row' }, [el('div', { class: 'help-k', text: k }), el('div', { class: 'help-v', text: v })])));
+
+  // What it is
+  frag.append(section('What this dashboard is', [
+    p('Vista Tracker is a read-only view of our property, agreement, and churn data. It does not change any data — it only shows what is already in our Google Sheets. Think of it as a live window onto the sheets, organised for quick answers.'),
+  ]));
+
+  // Where the data comes from
+  frag.append(section('Where the numbers come from (the data journey)', [
+    p('The data flows in one direction, automatically, once a day:'),
+    steps([
+      'Our Google Sheets hold the master data (properties, agreements, churn).',
+      'A small automatic script (Apps Script) copies the sheets into a database (Supabase) every hour.',
+      'The dashboard reads from that database and shows it here.',
+    ]),
+    p('So if a number looks wrong, the fix is almost always in the Google Sheet, not the dashboard. The dashboard faithfully shows whatever the sheet contains.'),
+  ]));
+
+  // The tabs
+  frag.append(section('What each tab shows', [
+    rows([
+      ['Live Properties', 'The headline view: how many properties are live, the churn rate, and what needs action.'],
+      ['Squad-wise', 'The same numbers broken down by squad.'],
+      ['KAM-wise', 'Broken down by each Key Account Manager (from the “Owner Facing AM” column).'],
+      ['Monthly churn', 'Churn rate for each squad, month by month. Use the FY toggle to switch financial years. Click any cell to see the exact properties that churned that month.'],
+      ['Property Details', 'The full searchable list of properties, with filters.'],
+    ]),
+  ]));
+
+  // Key definitions
+  frag.append(section('How the key numbers are defined', [
+    rows([
+      ['Live property', 'A property whose Current Status is “Live”.'],
+      ['Churned property', 'A property whose status is Delisted, TAC, or Paused.'],
+      ['Churn rate', 'Churned ÷ (current live + churned) × 100.'],
+      ['Time window', 'Churn is counted from April 2025 up to today, and moves forward automatically.'],
+      ['KAM', 'The “Owner Facing AM” from the sheet (a different person from the POC).'],
+    ]),
+  ]));
+
+  // Refreshing
+  frag.append(section('Keeping it up to date', [
+    p('The data syncs automatically every hour. To pull the very latest at any moment, click the “Refresh” button at the top right. The time next to it shows when the data was last loaded.'),
+  ]));
+
+  // Troubleshooting — the main ask
+  frag.append(section('If something looks wrong or won’t load', [
+    p('Most problems fall into a few simple buckets. Try these in order before escalating:'),
+    el('div', { class: 'help-trouble' }, [
+      el('div', { class: 'help-tr' }, [
+        el('strong', { text: '“The dashboard could not load” / it spins forever' }),
+        p('Usually a slow connection or a sync still running. Click “Try again”, check your internet, and if a sync was just started, wait a minute and retry. It now retries slow loads on its own, so this should be rare.'),
+      ]),
+      el('div', { class: 'help-tr' }, [
+        el('strong', { text: 'The totals suddenly dropped (e.g. far fewer properties than usual)' }),
+        p('This usually means the hourly sync did not finish. Ask whoever manages the Apps Script to run “syncSheetToSupabase” again and let it finish. The dashboard is showing the database honestly — the database is just incomplete.'),
+      ]),
+      el('div', { class: 'help-tr' }, [
+        el('strong', { text: 'A specific number doesn’t match our sheet' }),
+        p('The dashboard mirrors the sheet, so the difference is almost always in the data: a duplicate row, a blank date, or a status typed differently (e.g. “T.A.C.” vs “TAC”). Check the sheet for that property.'),
+      ]),
+      el('div', { class: 'help-tr' }, [
+        el('strong', { text: 'A name looks wrong (e.g. KAM shows the wrong person)' }),
+        p('Check the matching column in the source sheet for that property. If the sheet is right but the dashboard is wrong, note it down and pass it to whoever maintains the dashboard.'),
+      ]),
+    ]),
+    p('For anything technical, open the “Connection check” page (it appears on the error screen) and share it with the tech team — it has the details they need.'),
+  ]));
+
+  // Who to contact
+  frag.append(section('Who maintains this', [
+    p('This dashboard was built and is maintained internally. Keep a note here of who to contact when something breaks, so the team always knows where to turn:'),
+    p('Maintainer: Lavanya Pujari (lavanya.pujari@stayvista.co.in). Tech/database questions: the team managing Supabase and the Apps Script sync.'),
+  ]));
+
+  return frag;
 }
 
 function viewDiagnostics() {
@@ -3251,6 +3122,10 @@ function renderView() {
   const root = $('#view-root');
   root.replaceChildren();
 
+  // Help page is always available — even mid-error or while loading — so the
+  // team can read the guide whenever they need it.
+  if (state.view === 'help') { root.append(viewHelp()); return; }
+
   if (state.loading) {
     root.append(el('div', { class: 'state' }, [
       el('div', { class: 'spinner' }),
@@ -3265,11 +3140,45 @@ function renderView() {
     retry.addEventListener('click', boot);
     const details = el('button', { type: 'button', text: 'Connection check' });
     details.addEventListener('click', () => go('diagnostics'));
+    const help = el('button', { type: 'button', text: 'Open Help page' });
+    help.addEventListener('click', () => go('help'));
+
+    // Translate the technical error into plain words + what to do.
+    const raw = state.error || '';
+    let plain, steps;
+    if (/took longer|timed out|slow|network/i.test(raw)) {
+      plain = 'The dashboard could not finish loading the data in time. This is usually a slow internet connection, or the data is still syncing in the background.';
+      steps = ['Wait about a minute, then click “Try again”.',
+               'Check your internet connection.',
+               'If a data sync was just started, let it finish first, then try again.'];
+    } else if (/row level security|empty|zero rows|SELECT policy/i.test(raw)) {
+      plain = 'The dashboard connected, but no data came back. This is almost always a Supabase permission setting.';
+      steps = ['This one needs the tech team — it is a Supabase “Row Level Security” policy.',
+               'Share this screen with them; the Connection check page has the details they need.'];
+    } else if (/Missing VITE_|Environment Variables/i.test(raw)) {
+      plain = 'The dashboard is missing its connection settings (the keys that let it reach the database).';
+      steps = ['This needs the tech team — the Supabase keys need to be set in Vercel.',
+               'Share this screen and the Connection check page with them.'];
+    } else if (/returned 4|returned 5|status/i.test(raw)) {
+      plain = 'The database answered with an error instead of the data.';
+      steps = ['Click “Try again” once.',
+               'If it keeps happening, share this screen and the Connection check page with the tech team.'];
+    } else {
+      plain = 'Something stopped the dashboard from loading its data.';
+      steps = ['Click “Try again”.',
+               'If it keeps happening, open the Connection check page and share it with the tech team.'];
+    }
+
     root.append(el('div', { class: 'state error' }, [
-      el('h3', { text: 'Could not load the data' }),
-      el('p', { text: state.error }),
-      el('p', { html: 'If the table is found but comes back empty, it is almost always Row Level Security — add a <code>SELECT</code> policy on the table in Supabase.' }),
-      el('div', { style: 'display:flex; gap:8px; flex-wrap:wrap; justify-content:center' }, [retry, details]),
+      el('h3', { text: 'The dashboard could not load right now' }),
+      el('p', { class: 'err-plain', text: plain }),
+      el('p', { class: 'err-do-label', text: 'What to do:' }),
+      el('ol', { class: 'err-steps' }, steps.map((t) => el('li', { text: t }))),
+      el('details', { class: 'err-tech' }, [
+        el('summary', { text: 'Technical details (for the tech team)' }),
+        el('p', { text: raw }),
+      ]),
+      el('div', { style: 'display:flex; gap:8px; flex-wrap:wrap; justify-content:center; margin-top:6px' }, [retry, details, help]),
     ]));
     if (state.view === 'diagnostics') root.append(viewDiagnostics());
     return;
@@ -3322,6 +3231,9 @@ function renderView() {
     case 'diagnostics':
       root.append(viewDiagnostics());
       return;
+    case 'help':
+      root.append(viewHelp());
+      return;
     case 'squad':
       root.append(viewGroup(rows, '__squad', 'squad', 'Squad-wise summary',
         'Agreement position by squad. Cards open filtered property details in another tab of this browser.'));
@@ -3334,8 +3246,6 @@ function renderView() {
       root.append(viewProperties(rows));
       break;
     case 'churned':
-      root.append(viewChurned());
-      break;
     case 'churn-detail':
       root.append(viewChurnDetail());
       break;
@@ -3466,31 +3376,24 @@ async function boot(isRefresh = false) {
 
   try {
     const cached = !isRefresh ? readDataCache() : null;
-    let raw, churnRef, churnAnalysis, gcfMarginal, misSquad, misMonthly;
+    let raw, churnAnalysis, gcfMarginal;
 
     if (cached) {
       // reuse recently-fetched data — makes a new tab / revisit load instantly
-      ({ raw, churnRef, churnAnalysis, gcfMarginal, misSquad, misMonthly } = cached);
+      ({ raw, churnAnalysis, gcfMarginal } = cached);
     } else {
       raw = await fetchAllRows(state.diag);
-      // The five churn/GCF/MIS tables are independent of each other — load them
-      // all at once (parallel) instead of one-after-another, which is far faster.
-      [churnRef, churnAnalysis, gcfMarginal, misSquad, misMonthly] = await Promise.all([
-        fetchChurnRef(),
+      // The churn and GCF tables are independent — load them in parallel.
+      [churnAnalysis, gcfMarginal] = await Promise.all([
         fetchTable('churn_analysis'),
         fetchTable('gcf_marginal'),
-        fetchTable('mis_squad_churn'),
-        fetchTable('mis_monthly_churn'),
       ]);
-      writeDataCache({ raw, churnRef, churnAnalysis, gcfMarginal, misSquad, misMonthly });
+      writeDataCache({ raw, churnAnalysis, gcfMarginal });
     }
 
     state.raw = raw;
-    state.churnRef = churnRef;
     state.churnAnalysis = churnAnalysis;
     state.gcfMarginal = gcfMarginal;
-    state.misSquadChurn = misSquad;
-    state.misMonthlyChurn = misMonthly;
     state.cols = resolveColumns(raw[0]);
 
     // names can't separate the two status columns — the data can
