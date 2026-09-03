@@ -1441,6 +1441,44 @@ function pidKey(v) {
   return s.toLowerCase();
 }
 
+// Average owner / Vista F&B food share across churned properties in scope.
+// Values are stored as decimals (0.8 = 80%); blanks and error values are skipped.
+function fnbAverages(squad, kam) {
+  let ownerSum = 0, ownerN = 0, vistaSum = 0, vistaN = 0;
+  const churn = churnAnalysis(squad, kam, state.caMonth || null, { raw: true }).rows;
+  for (const r of churn) {
+    const o = pctToNumber(r.fnbOwner);
+    const v = pctToNumber(r.fnbVista);
+    if (o !== null) { ownerSum += o; ownerN += 1; }
+    if (v !== null) { vistaSum += v; vistaN += 1; }
+  }
+  return {
+    owner: ownerN ? ownerSum / ownerN : null,
+    vista: vistaN ? vistaSum / vistaN : null,
+  };
+}
+
+// A card showing an average F&B % that opens the churned list (both F&B columns
+// visible) when clicked, respecting the active squad/KAM/filters.
+function fnbAverageCard(label, value, squad, kam) {
+  const card = el('a', { class: 'stat stat-link', href: '#',
+    title: 'Click to see these properties with both F&B shares' }, [
+    el('div', { class: 's-label' }, [label, el('span', { class: 'ext', text: ' ↗' })]),
+    el('div', { class: 's-value', text: value === null ? '—' : fmtPct(value) }),
+  ]);
+  card.addEventListener('click', (e) => {
+    e.preventDefault();
+    state.caSquad = squad || null;
+    state.caKam = kam || null;
+    state.cd = {};
+    state.cdFilters = {};
+    state.cdPage = 1;
+    pushNav();
+    go('churn-detail');
+  });
+  return card;
+}
+
 // Count of properties under Marriott (any value in marriott_cost) vs not,
 // across ALL properties in the master (gcf_marginal). Optional squad/kam scope.
 function marriottCounts(squad, kam) {
@@ -2082,10 +2120,15 @@ function churnSection(dimension, focused) {
     clickableChurnCard('StayVista', sv || 0, { initiatedBy: 'StayVista' }, squad, kam),
   ]));
 
-  // F&B ranges — clickable
-  wrap.append(sectionHead('F&B share ranges', 'Owner F&B share of churned properties'));
-  wrap.append(el('div', { class: 'stat-grid' },
-    FNB_BUCKETS.map((b) => clickableChurnCard(b, m2.fnbCounts[b], { fnb: b }, squad, kam))));
+  // F&B — average owner share and average Vista share (clicking opens the list
+  // showing both F&B columns, respecting active filters). Ranges removed: owner
+  // and vista shares roughly sum to 100%, so bucketing them wasn't meaningful.
+  const fnbAvg = fnbAverages(squad, kam);
+  wrap.append(sectionHead('F&B share', 'Average owner vs Vista food share · click to see the properties'));
+  wrap.append(el('div', { class: 'stat-grid' }, [
+    fnbAverageCard("Avg owner's F&B share", fnbAvg.owner, squad, kam),
+    fnbAverageCard("Avg Vista's F&B share", fnbAvg.vista, squad, kam),
+  ]));
 
   // Under Marriott vs not (across ALL properties in the master, this scope)
   const mc = marriottCounts(squad, kam);
