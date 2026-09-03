@@ -1024,11 +1024,13 @@ function cardClickHandler(filter) {
     pushNav();
     if (filter.status) {
       state.filters.statuses = [filter.status];
-      state.filters.liveOnly = true;   // agreement-status views show LIVE properties only
     }
     if (filter.squad)  state.filters.squads = [filter.squad];
     if (filter.kam)    state.filters.kams = [filter.kam];
     state.filters.newNoAgreement = !!filter.newNoAgreement;
+    // If the card is a live-only metric (status cards, new-no-agreement, etc.),
+    // force the list to live-only too so its count matches the card's count.
+    state.filters.liveOnly = !!filter.live;
     state.focus = true;
     state.page = {};
     go('properties');   // the drilled-in list lives on Property Details
