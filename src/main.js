@@ -1,4 +1,4 @@
-/* VISTA-TRACKER BUILD MARKER: EXPIRED-READS-COLUMN-v2 — if you see 209 Expired, this file is live */
+/* VISTA-TRACKER BUILD MARKER: CHURN-YEAR-FILTER-v3 — if you see 209 Expired, this file is live */
 /* ==========================================================================
    Vista Tracker — application logic
    --------------------------------------------------------------------------
@@ -3643,7 +3643,7 @@ function closeShortcutsPopup() {
 }
 
 function init() {
-  console.log('%cVista Tracker build: EXPIRED-READS-COLUMN-v2', 'font-weight:bold;color:#2f7d5b');
+  console.log('%cVista Tracker build: CHURN-YEAR-FILTER-v3', 'font-weight:bold;color:#2f7d5b');
   readUrl();
 
   $('#login-btn')?.addEventListener('click', handleLogin);
