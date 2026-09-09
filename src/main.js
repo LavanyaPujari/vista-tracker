@@ -644,7 +644,7 @@ const state = {
   error: null,
   view: 'overview',
   sub: 'snapshot',
-  filters: { squads: [], kams: [], statuses: [], newNoAgreement: false },
+  filters: { squads: [], kams: [], statuses: [], newNoAgreement: false, expiring30: false },
   period: { month: '', year: '' },   // filter on live_date
   search: '',
   focus: false,        // drilled-in view: back button shown, summary cards hidden
@@ -686,6 +686,7 @@ function readUrl() {
   state.search = p.get('q') || '';
   state.focus = p.get('focus') === '1';
   state.filters.newNoAgreement = p.get('newna') === '1';
+  state.filters.expiring30 = p.get('exp30') === '1';
   state.caSquad = p.get('casquad') || null;
   state.caKam = p.get('cakam') || null;
   state.cd = {
@@ -709,6 +710,7 @@ function urlFor(view, sub) {
   if (state.search) p.set('q', state.search);
   if (state.focus) p.set('focus', '1');
   if (state.filters.newNoAgreement) p.set('newna', '1');
+  if (state.filters.expiring30) p.set('exp30', '1');
   if (state.caSquad) p.set('casquad', state.caSquad);
   if (state.caKam) p.set('cakam', state.caKam);
   const qs = p.toString();
@@ -816,6 +818,7 @@ function filterRows(skip = null) {
     (skip === 'status' || !statuses.length || statuses.includes(r.__status)) &&
     (!state.filters.liveOnly || r.__live === true) &&
     (skip === 'newna'  || !state.filters.newNoAgreement || r.__newNoAgreement) &&
+    (!state.filters.expiring30 || (r.__live === true && r.__endDateObj && r.__endDateObj >= new Date() && r.__endDateObj <= new Date(Date.now() + 30 * MS_DAY))) &&
     (skip === 'period' || inPeriod(r)) &&
     (skip === 'search' || matchesSearch(r, state.search))
   );
@@ -825,7 +828,7 @@ function activeRows() { return filterRows(null); }
 
 function hasAnyFilter() {
   const f = state.filters;
-  return !!(f.squads.length || f.kams.length || f.statuses.length || f.newNoAgreement || state.period.month || state.period.year || state.search);
+  return !!(f.squads.length || f.kams.length || f.statuses.length || f.newNoAgreement || f.expiring30 || state.period.month || state.period.year || state.search);
 }
 
 /** All statuses actually present, in MIS order, plus Unmapped only if it occurs. */
@@ -998,10 +1001,11 @@ function statusPill(status) {
 const DETAIL_TAB = 'vista-tracker-details';
 
 /** URL for Property Details pre-filtered by the given dimensions. */
-function detailHref({ status, squad, kam, live, newNoAgreement } = {}) {
+function detailHref({ status, squad, kam, live, newNoAgreement, expiring30 } = {}) {
   const p = new URLSearchParams();
   p.set('view', 'properties');   // drilled-in list always lives on Property Details
   if (newNoAgreement) p.set('newna', '1');
+  if (expiring30) p.set('exp30', '1');
   const squads   = squad ? [squad] : state.filters.squads;
   const kams     = kam   ? [kam]   : state.filters.kams;
   const statuses = status ? [status] : state.filters.statuses;
@@ -1032,6 +1036,7 @@ function cardClickHandler(filter) {
     if (filter.squad)  state.filters.squads = [filter.squad];
     if (filter.kam)    state.filters.kams = [filter.kam];
     state.filters.newNoAgreement = !!filter.newNoAgreement;
+    state.filters.expiring30 = !!filter.expiring30;
     // If the card is a live-only metric (status cards, new-no-agreement, etc.),
     // force the list to live-only too so its count matches the card's count.
     state.filters.liveOnly = !!filter.live;
@@ -1415,7 +1420,7 @@ function actionCards(scopeRows) {
 
   return el('div', { class: 'action-grid' }, [
     card('Not signed', notSigned, 'danger', { status: 'Not Signed', live: true }),
-    card('Expiring in 30 days', expiring, 'warning', { status: 'To Expire', live: true }),
+    card('Expiring in 30 days', expiring, 'warning', { expiring30: true, live: true }),
     card('New — no agreement yet', newNoAgreement, 'sky', { newNoAgreement: true, live: true }),
     card('New live this month', newLive, 'success', null),
   ]);
@@ -3112,7 +3117,7 @@ function renderFilters() {
 
   const reset = el('button', { type: 'button', class: 'reset-btn', text: 'Reset filters', disabled: !hasAnyFilter() });
   reset.addEventListener('click', () => {
-    state.filters = { squads: [], kams: [], statuses: [], newNoAgreement: false };
+    state.filters = { squads: [], kams: [], statuses: [], newNoAgreement: false, expiring30: false };
     state.period = { month: '', year: '' };
     state.search = '';
     onFiltersChanged();
@@ -3200,7 +3205,7 @@ function renderActiveFilters() {
 
   const clearAll = el('button', { class: 'chip-x', type: 'button', 'aria-label': 'Clear all filters', text: '×' });
   clearAll.addEventListener('click', () => {
-    state.filters = { squads: [], kams: [], statuses: [], newNoAgreement: false };
+    state.filters = { squads: [], kams: [], statuses: [], newNoAgreement: false, expiring30: false };
     state.period = { month: '', year: '' };
     state.search = '';
     onFiltersChanged();
@@ -3582,7 +3587,7 @@ const SHORTCUTS = [
 ];
 
 function clearAllFilters() {
-  state.filters = { squads: [], kams: [], statuses: [], newNoAgreement: false, liveOnly: false };
+  state.filters = { squads: [], kams: [], statuses: [], newNoAgreement: false, liveOnly: false, expiring30: false };
   state.period = { month: '', year: '' };
   state.search = '';
   state.cdFilters = {};
