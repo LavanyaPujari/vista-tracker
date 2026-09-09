@@ -1716,13 +1716,17 @@ function churnAnalysis(squad, kam, month, opts = {}) {
   for (const m of marginal) if (m.property_id != null) gcfById[pidKey(m.property_id)] = m;
 
   const monthNum = month ? MONTH_NAMES.findIndex((mn) => norm(mn) === norm(month)) + 1 : 0;
+  const yearNum = state.period.year ? Number(state.period.year) : 0;
   const isDelisted = (r) => isChurned(r.current_status);
   const matchSquad = (r) => !squad || norm(r.squad) === norm(squad);
   const matchKam = (r) => !kam || norm(r.kam) === norm(kam);
   const matchMonth = (r) => {
-    if (!monthNum) return true;
+    if (!monthNum && !yearNum) return true;
     const d = parseDate(r.delist_date);
-    return d && !Number.isNaN(d.getTime()) && (d.getMonth() + 1) === monthNum;
+    if (!d || Number.isNaN(d.getTime())) return false;
+    if (monthNum && (d.getMonth() + 1) !== monthNum) return false;   // month must match
+    if (yearNum && d.getFullYear() !== yearNum) return false;         // year must match
+    return true;
   };
 
   const seen = new Set();
@@ -2915,7 +2919,15 @@ function renderChurnTopBar() {
     state.cdPage = 1; syncUrl(); render();
   });
 
-  const years = [...new Set((state.rows || []).map((r) => r.__liveDateObj && r.__liveDateObj.getFullYear()).filter(Boolean))].sort((a, b) => b - a);
+  // Churn years come from the churn window (Apr 2025 → today), not property
+  // live dates — so we don't offer irrelevant years like 2017.
+  const churnYearSet = new Set();
+  for (const r of (state.churnAnalysis || [])) {
+    if (!isChurned(r.current_status)) continue;
+    const d = parseDate(r.delist_date);
+    if (d && !Number.isNaN(d.getTime()) && d >= FY_START && d <= FY_END) churnYearSet.add(d.getFullYear());
+  }
+  const years = [...churnYearSet].sort((a, b) => b - a);
   const yearSel = el('select', { class: 'period-select', 'aria-label': 'Year' }, [
     el('option', { value: '', text: 'All years' }),
     ...years.map((y) => el('option', { value: String(y), text: String(y) })),
