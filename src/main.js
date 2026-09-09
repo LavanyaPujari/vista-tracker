@@ -1338,13 +1338,19 @@ function heroStats(scopeRows, { label } = {}) {
   // FY 2025-26, scoped to the selected squad/KAM. Single source of truth.
   const selectedSquad = state.filters.squads.length === 1 ? state.filters.squads[0] : null;
   const selectedKam = state.filters.kams.length === 1 ? state.filters.kams[0] : null;
-  const dr = delistingRate(selectedSquad, selectedKam, null);
+  const month = state.caMonth || null;
+  const dr = delistingRate(selectedSquad, selectedKam, month);
+
+  // period label reflects the month/year filter (or the full window if none)
+  const periodLabel = (month || state.period.year)
+    ? [month, state.period.year].filter(Boolean).join(' ')
+    : windowLabel();
 
   let churn, churnSub, churnClickable;
   if (dr.rate !== null) {
     churn = dr.rate;
     const who = selectedKam ? selectedKam : selectedSquad ? selectedSquad : 'All India';
-    churnSub = `${fmtInt(dr.churned)} churned ÷ (${fmtInt(dr.live)} live + ${fmtInt(dr.churned)}) · ${who} · ${windowLabel()}`;
+    churnSub = `${fmtInt(dr.churned)} churned ÷ (${fmtInt(dr.live)} live + ${fmtInt(dr.churned)}) · ${who} · ${periodLabel}`;
     churnClickable = true;
   } else {
     churn = null;
