@@ -2831,10 +2831,14 @@ function renderSidebar() {
   nav.replaceChildren();
 
   const rows = activeRows();
+  const liveRows = rows.filter((r) => r.__live === true);
   const countFor = {
-    overview: rows.filter((r) => r.__live === true).length,
-    squad: new Set(rows.map((r) => r.__squad)).size,
-    kam: new Set(rows.map((r) => r.__kam)).size,
+    // squad/KAM pages show LIVE properties only, so count distinct squads/KAMs
+    // among live properties — otherwise the badge (all rows) wouldn't match the
+    // number of cards on the page (live only).
+    overview: liveRows.length,
+    squad: new Set(liveRows.map((r) => r.__squad)).size,
+    kam: new Set(liveRows.map((r) => r.__kam)).size,
     properties: rows.length,
   };
 
