@@ -1831,6 +1831,21 @@ function viewChurnRate() {
   frag.append(back);
 
   const dr = delistingRate(squad, kam, month);
+
+  // When the user is searching or has any churn filter active, they want to find
+  // specific properties — so show ONLY the matching list, not the summary cards
+  // or the by-squad table (those are clutter during a search).
+  const anyFilterActive = !!(state.search
+    || (state.cdFilters && Object.values(state.cdFilters).some(Boolean)));
+
+  if (anyFilterActive) {
+    frag.append(pageHead('Churned properties', `Search results · ${scope}`));
+    const rows = churnAnalysis(squad, kam, month).rows;   // churnAnalysis auto-applies filters+search
+    frag.append(sectionHead('Results', `${fmtInt(rows.length)} ${rows.length === 1 ? 'property' : 'properties'}`));
+    frag.append(churnPropertyTable(rows));
+    return frag;
+  }
+
   frag.append(pageHead('Churn rate', `How the rate is calculated · ${scope} · ${windowLabel()}${month ? ' · ' + month : ''}`));
 
   // the reconciliation (Denominator card removed — it was just live+churned)
@@ -2870,6 +2885,10 @@ const FILTER_FIELDS = {
 // Filters: Months, Years, Squad, KAM, F&B, Reason, Initiated-by, GCF, Search.
 const CHURN_VIEWS_WITH_BAR = ['churned', 'churn-detail', 'churn-rate', 'master-list'];
 
+// Tracks whether the churn search box was focused, so we can restore focus and
+// cursor position after the bar re-renders (fixes losing focus after 1 char).
+const churnSearchFocus = { active: false, pos: null };
+
 function renderChurnTopBar() {
   const bar = $('#filter-bar');
   if (!bar) return;
@@ -2942,7 +2961,16 @@ function renderChurnTopBar() {
   let t;
   search.addEventListener('input', () => {
     clearTimeout(t);
-    t = setTimeout(() => { state.search = search.value.trim(); state.cdPage = 1; render(); }, 180);
+    // remember that the search is focused + where the cursor is, so we can
+    // restore it after render() rebuilds this bar (otherwise focus is lost
+    // after every keystroke).
+    t = setTimeout(() => {
+      churnSearchFocus.active = true;
+      churnSearchFocus.pos = search.selectionStart;
+      state.search = search.value.trim();
+      state.cdPage = 1;
+      render();
+    }, 180);
   });
   row.append(search);
 
@@ -2956,6 +2984,15 @@ function renderChurnTopBar() {
 
   bar.append(row);
   filterUI.built = false;   // force agreement bar to rebuild when we leave churn views
+
+  // Restore focus + cursor to the search box if the user was typing in it, so a
+  // re-render doesn't kick them out after each character.
+  if (churnSearchFocus.active) {
+    search.focus();
+    const p = churnSearchFocus.pos == null ? search.value.length : churnSearchFocus.pos;
+    try { search.setSelectionRange(p, p); } catch { /* type=search may not support it in all browsers */ }
+    churnSearchFocus.active = false;
+  }
 }
 
 function renderFilters() {
