@@ -1540,8 +1540,7 @@ function applyChurnFilters(rows, cd = {}) {
     rows = rows.filter((r) => {
       const n = pctToNumber(r.gcf); if (n === null) return false;
       if (f.gcfRange === '<5%') return n < 5;
-      if (f.gcfRange === '5-10%') return n >= 5 && n <= 10;
-      if (f.gcfRange === '>10%') return n > 10;
+      if (f.gcfRange === '5% & above') return n >= 5;
       return true;
     });
   }
@@ -1977,10 +1976,9 @@ function churnFilterBar(allRows) {
 
   addSelect('All squads', 'squad', uniq('squad'));
   addSelect('All KAMs', 'kam', uniq('kam'));
-  addSelect('All F&B bands', 'fnb', FNB_BUCKETS);
   addSelect('All reasons', 'reason', uniq('reason'));
   addSelect('All initiated-by', 'initiatedBy', uniq('initiatedBy'));
-  addSelect('All GCF ranges', 'gcfRange', ['<5%', '5-10%', '>10%']);
+  addSelect('All GCF ranges', 'gcfRange', ['<5%', '5% & above']);
 
   if (state.cdFilters && Object.values(state.cdFilters).some(Boolean)) {
     const clear = el('button', { type: 'button', class: 'reset-btn', text: 'Clear filters' });
@@ -2215,8 +2213,7 @@ function viewMasterList() {
   if (cdf.gcfRange) rows = rows.filter((r) => {
     const n = pctToNumber(r.gcf_current); if (n === null) return false;
     if (cdf.gcfRange === '<5%') return n < 5;
-    if (cdf.gcfRange === '5-10%') return n >= 5 && n <= 10;
-    if (cdf.gcfRange === '>10%') return n > 10;
+    if (cdf.gcfRange === '5% & above') return n >= 5;
     return true;
   });
 
@@ -2947,10 +2944,9 @@ function renderChurnTopBar() {
   };
   addSelect('All squads', 'squad', uniq('squad'));
   addSelect('All KAMs', 'kam', uniq('kam'));
-  addSelect('All F&B bands', 'fnb', FNB_BUCKETS);
   addSelect('All reasons', 'reason', uniq('reason'));
   addSelect('All initiated-by', 'initiatedBy', uniq('initiatedBy'));
-  addSelect('All GCF ranges', 'gcfRange', ['<5%', '5-10%', '>10%']);
+  addSelect('All GCF ranges', 'gcfRange', ['<5%', '5% & above']);
 
   // search box (same style as agreement)
   const search = el('input', {
