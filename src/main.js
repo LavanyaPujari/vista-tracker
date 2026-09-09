@@ -1312,7 +1312,7 @@ function insightCards(scopeRows, { live }) {
   grid.append(statCard({
     label: 'Expiring in 30 days', value: fmtInt(expiringWithin(scopeRows, 30)),
     sub: 'live agreements', accent: 'warn',
-    filter: { status: 'To Expire', live: true },
+    filter: { expiring30: true, live: true },
   }));
   grid.append(statCard({
     label: 'New live this month', value: fmtInt(newLiveThisMonth(scopeRows)),
