@@ -3056,7 +3056,12 @@ function renderFilters() {
   ]);
   monthSel.value = state.period.month;
   monthSel.classList.toggle('active', !!state.period.month);
-  monthSel.addEventListener('change', () => { state.period.month = monthSel.value; onFiltersChanged(); });
+  monthSel.addEventListener('change', () => {
+    state.period.month = monthSel.value;
+    // keep the churn month (caMonth) in sync so churn cards filter by month too
+    state.caMonth = monthSel.value ? MONTHS[Number(monthSel.value) - 1] : null;
+    onFiltersChanged();
+  });
 
   const years = [...new Set(state.rows.map((r) => r.__liveDateObj && r.__liveDateObj.getFullYear()).filter(Boolean))].sort((a, b) => b - a);
   const yearSel = el('select', { class: 'period-select', 'aria-label': 'Year' }, [
