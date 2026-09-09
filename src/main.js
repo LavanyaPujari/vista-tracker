@@ -674,10 +674,14 @@ function readUrl() {
   state.filters.statuses = split(p.get('status'));
   state.period.month = p.get('m') || '';
   state.period.year  = p.get('y') || '';
-  // the top month filter (numeric 1-12) also drives the churn section's month
+  // the top month filter (numeric 1-12) also drives the churn section's month.
+  // Always resync from the URL — including clearing it when no month is set, so
+  // a stale month can't linger on pages where none was chosen.
   if (state.period.month) {
     const n = Number(state.period.month);
-    if (n >= 1 && n <= 12) state.caMonth = MONTH_NAMES[n - 1];
+    state.caMonth = (n >= 1 && n <= 12) ? MONTH_NAMES[n - 1] : null;
+  } else {
+    state.caMonth = null;
   }
   state.search = p.get('q') || '';
   state.focus = p.get('focus') === '1';
@@ -3196,18 +3200,13 @@ function onFiltersChanged() {
   state.page = {};
   state.returnTo = null;
 
-  // If a filter is active, take the user straight to the property list instead
-  // of a summary page full of mostly-empty cards. Changing another filter while
-  // there keeps them on the list (it just updates). Churn pages keep their own
-  // bar and are left alone.
+  // Filters now apply to whatever page the user is on — they no longer get
+  // yanked to Property Details. Each summary page (Live/Squad/KAM) already
+  // respects the active filters, so it just re-renders filtered in place.
+  // `focus` still tracks whether any filter is active (some views use it).
   const onChurnPage = CHURN_VIEWS_WITH_BAR.includes(state.view);
   if (!onChurnPage) {
-    if (hasAnyFilter()) {
-      state.focus = true;
-      state.view = 'properties';
-    } else {
-      state.focus = false;   // filters cleared → back to the normal summary
-    }
+    state.focus = hasAnyFilter();
   }
 
   syncUrl();
