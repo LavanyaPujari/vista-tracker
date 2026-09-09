@@ -1656,14 +1656,17 @@ function churnedCountFY(squad, kam, month) {
   const seen = new Set();
   let n = 0;
   const monthNum = month ? MONTH_NAMES.findIndex((mn) => norm(mn) === norm(month)) + 1 : 0;
+  const yearNum = state.period.year ? Number(state.period.year) : 0;
   for (const r of (state.churnAnalysis || [])) {
     if (!isChurned(r.current_status)) continue;
     if (squad && norm(r.squad) !== norm(squad)) continue;
     if (kam && norm(r.kam) !== norm(kam)) continue;
     if (!inFY(r.delist_date)) continue;
-    if (monthNum) {
+    if (monthNum || yearNum) {
       const d = parseDate(r.delist_date);
-      if (!(d && (d.getMonth() + 1) === monthNum)) continue;
+      if (!d) continue;
+      if (monthNum && (d.getMonth() + 1) !== monthNum) continue;
+      if (yearNum && d.getFullYear() !== yearNum) continue;
     }
     const id = r.property_id != null ? String(r.property_id).trim() : '';
     if (id && seen.has(id)) continue;
@@ -1849,7 +1852,12 @@ function viewChurnRate() {
     return frag;
   }
 
-  frag.append(pageHead('Churn rate', `How the rate is calculated · ${scope} · ${windowLabel()}${month ? ' · ' + month : ''}`));
+  // Label reflects the selected month/year (or the full window if none picked).
+  const periodLabel = (month || state.period.year)
+    ? [month, state.period.year].filter(Boolean).join(' ')
+    : windowLabel();
+
+  frag.append(pageHead('Churn rate', `How the rate is calculated · ${scope} · ${periodLabel}`));
 
   // the reconciliation (Denominator card removed — it was just live+churned)
   frag.append(sectionHead('The calculation', 'Churn rate = churned ÷ (live + churned) × 100'));
@@ -1872,7 +1880,7 @@ function viewChurnRate() {
 
   // Churned card → opens the churned list for this scope
   const churnedCard = el('a', { class: 'stat stat-link', href: '#', title: 'Click to see the churned properties' }, [
-    el('div', { class: 's-label' }, [`Churned (${windowLabel()})`, el('span', { class: 'ext', text: ' ↗' })]),
+    el('div', { class: 's-label' }, [`Churned (${periodLabel})`, el('span', { class: 'ext', text: ' ↗' })]),
     el('div', { class: 's-value', text: fmtInt(dr.churned) }),
   ]);
   churnedCard.addEventListener('click', (e) => {
@@ -1892,7 +1900,7 @@ function viewChurnRate() {
   // squad breakdown (only at all-India level) — each row clickable
   if (!squad && !kam) {
     const squads = [...new Set((state.churnAnalysis || []).map((r) => r.squad).filter(Boolean))].sort();
-    frag.append(sectionHead('By squad', `Churn rate per squad · ${windowLabel()} · click a row for that squad's churned properties`));
+    frag.append(sectionHead('By squad', `Churn rate per squad · ${periodLabel} · click a row for that squad's churned properties`));
     const table = el('table', { class: 'grid' });
     table.append(el('thead', {}, [el('tr', {}, ['Squad', 'Live', 'Churned', 'Churn rate'].map((h) => el('th', { style: 'text-align:left', text: h })))]));
     const tb = el('tbody', {});
