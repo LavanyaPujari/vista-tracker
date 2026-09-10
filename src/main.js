@@ -1,4 +1,4 @@
-/* VISTA-TRACKER BUILD MARKER: CHURN-FY-v7 — if you see 209 Expired, this file is live */
+/* VISTA-TRACKER BUILD MARKER: CHURN-2FY-v8 — if you see 209 Expired, this file is live */
 /* ==========================================================================
    Vista Tracker — application logic
    --------------------------------------------------------------------------
@@ -1379,11 +1379,38 @@ function heroStats(scopeRows, { label } = {}) {
     churnClickable = false;
   }
 
-  const churnInner = [
-    el('div', { class: 's-label' }, ['Churn rate', churnClickable ? el('span', { class: 'ext', text: ' ↗' }) : null]),
-    el('div', { class: 'hero-num', text: fmtPct(churn) }),
-    el('div', { class: 's-sub', text: churnSub }),
-  ];
+  // Two-FY display: current FY big, previous FY small. Only when no specific
+  // month/year is selected (a picked month/year narrows to that period instead).
+  const region = momRegion || 'India';
+  const showTwoFY = !month && !state.period.year && !selectedKam;
+  const curFy = fyStartYear(new Date());
+  const prevFy = curFy - 1;
+
+  let churnInner;
+  if (showTwoFY) {
+    const cur = fyChurnRate(region, curFy);
+    const prev = fyChurnRate(region, prevFy);
+    churnInner = [
+      el('div', { class: 's-label' }, ['Churn rate', el('span', { class: 'ext', text: ' ↗' })]),
+      el('div', { class: 'hero-num', text: cur.rate !== null ? fmtPct(cur.rate) : '—' }),
+      el('div', { class: 's-sub' }, [
+        el('strong', { text: fyLabel(curFy) }),
+        el('span', { text: ' (current) · cumulative to date' }),
+      ]),
+      el('div', { class: 's-sub prev-fy' }, [
+        el('span', { text: `${fyLabel(prevFy)}: ` }),
+        el('strong', { text: prev.rate !== null ? fmtPct(prev.rate) : '—' }),
+        el('span', { text: ' (full year)' }),
+      ]),
+    ];
+    churnClickable = cur.rate !== null || prev.rate !== null;
+  } else {
+    churnInner = [
+      el('div', { class: 's-label' }, ['Churn rate', churnClickable ? el('span', { class: 'ext', text: ' ↗' }) : null]),
+      el('div', { class: 'hero-num', text: fmtPct(churn) }),
+      el('div', { class: 's-sub', text: churnSub }),
+    ];
+  }
 
   // clickable → opens the Churn view (now inside the Squad-wise tab)
   let churnCard;
@@ -1883,66 +1910,64 @@ function viewChurnRate() {
     return frag;
   }
 
-  // Label reflects the selected month/year (or the full window if none picked).
+  // Label reflects the selected month/year (or two-FY view if none picked).
+  const region = kam ? null : (squad || 'India');
+  const showTwoFY = !month && !state.period.year && !kam;
   const periodLabel = (month || state.period.year)
     ? [month, state.period.year].filter(Boolean).join(' ')
-    : windowLabel();
+    : 'FY view';
 
-  frag.append(pageHead('Churn rate', `How the rate is calculated · ${scope} · ${periodLabel}`));
+  frag.append(pageHead('Churn rate', `How the rate is calculated · ${scope}`));
+  frag.append(sectionHead('The calculation', 'Churn rate = churned that month ÷ live at start of month × 100 · cumulative = sum of monthly rates'));
 
-  // the reconciliation (Denominator card removed — it was just live+churned)
-  frag.append(sectionHead('The calculation', 'Churn rate = churned ÷ (live + churned) × 100'));
+  // Headline: two financial years (current big, previous smaller) when no
+  // specific month/year is picked; otherwise the selected period's rate.
+  const curFy = fyStartYear(new Date());
+  const prevFy = curFy - 1;
+  if (showTwoFY && region) {
+    const cur = fyChurnRate(region, curFy);
+    const prev = fyChurnRate(region, prevFy);
+    frag.append(el('div', { class: 'fy-churn-cards' }, [
+      el('div', { class: 'stat fy-current' }, [
+        el('div', { class: 's-label', text: `${fyLabel(curFy)} · current` }),
+        el('div', { class: 's-value big', text: cur.rate !== null ? fmtPct(cur.rate) : '—' }),
+        el('div', { class: 's-sub', text: `${fmtInt(cur.churned)} churned · cumulative to date` }),
+      ]),
+      el('div', { class: 'stat fy-prev' }, [
+        el('div', { class: 's-label', text: `${fyLabel(prevFy)} · previous` }),
+        el('div', { class: 's-value', text: prev.rate !== null ? fmtPct(prev.rate) : '—' }),
+        el('div', { class: 's-sub', text: `${fmtInt(prev.churned)} churned · full year` }),
+      ]),
+    ]));
+  } else {
+    // single-period: the selected month/year's rate
+    const p = region ? primaryMonthRate(region, month, state.period.year || (month ? curFy : null)) : null;
+    const rate = month ? (p ? p.rate : null) : (region ? momRate(region, null, state.period.year || null) : null);
+    const churned = month && p ? p.churned : null;
+    frag.append(el('div', { class: 'stat-grid' }, [
+      el('div', { class: 'stat tone-danger' }, [
+        el('div', { class: 's-label', text: `Churn rate · ${periodLabel}` }),
+        el('div', { class: 's-value', text: rate !== null && rate !== undefined ? fmtPct(rate) : '—' }),
+        churned !== null ? el('div', { class: 's-sub', text: `${fmtInt(churned)} churned` }) : null,
+      ]),
+    ]));
+  }
 
-  // Live card → opens the live property list for this scope
-  const liveCard = el('a', { class: 'stat stat-link', href: '#', title: 'Click to see the live properties' }, [
-    el('div', { class: 's-label' }, ['Live at FY start', el('span', { class: 'ext', text: ' ↗' })]),
-    el('div', { class: 's-value', text: fmtInt(dr.live) }),
-  ]);
-  liveCard.addEventListener('click', (e) => {
-    e.preventDefault();
-    state.returnTo = { view: state.view, filters: JSON.parse(JSON.stringify(state.filters)), search: state.search };
-    if (squad) state.filters.squads = [squad];
-    if (kam) state.filters.kams = [kam];
-    state.filters.statuses = [];
-    state.focus = true; state.page = {};
-    pushNav();
-    go('properties');
-  });
-
-  // Churned card → opens the churned list for this scope
-  const churnedCard = el('a', { class: 'stat stat-link', href: '#', title: 'Click to see the churned properties' }, [
-    el('div', { class: 's-label' }, [`Churned (${periodLabel})`, el('span', { class: 'ext', text: ' ↗' })]),
-    el('div', { class: 's-value', text: fmtInt(dr.churned) }),
-  ]);
-  churnedCard.addEventListener('click', (e) => {
-    e.preventDefault();
-    state.caSquad = squad || null; state.caKam = kam || null;
-    state.cd = {}; state.cdFilters = {}; state.cdPage = 1;
-    pushNav();
-    go('churn-detail');
-  });
-
-  frag.append(el('div', { class: 'stat-grid' }, [
-    liveCard,
-    churnedCard,
-    el('div', { class: 'stat tone-danger' }, [el('div', { class: 's-label', text: 'Churn rate' }), el('div', { class: 's-value', text: dr.rate !== null ? fmtPct(dr.rate) : '—' })]),
-  ]));
-
-  // squad breakdown (only at all-India level) — each row clickable
+  // squad breakdown (only at all-India level) — each row clickable, new formula
   if (!squad && !kam) {
     const squads = [...new Set((state.churnAnalysis || []).map((r) => r.squad).filter(Boolean))].sort();
-    frag.append(sectionHead('By squad', `Churn rate per squad · ${periodLabel} · click a row for that squad's churned properties`));
+    frag.append(sectionHead('By squad', `Cumulative churn rate per squad · ${fyLabel(curFy)} · click a row for that squad's churned properties`));
     const table = el('table', { class: 'grid' });
-    table.append(el('thead', {}, [el('tr', {}, ['Squad', 'Live', 'Churned', 'Churn rate'].map((h) => el('th', { style: 'text-align:left', text: h })))]));
+    table.append(el('thead', {}, [el('tr', {}, ['Squad', `${fyLabel(prevFy)}`, `${fyLabel(curFy)} (current)`].map((h) => el('th', { style: 'text-align:left', text: h })))]));
     const tb = el('tbody', {});
     for (const s of squads) {
-      const d = delistingRate(s, null, month);
+      const cur = fyChurnRate(s, curFy);
+      const prev = fyChurnRate(s, prevFy);
       const tr = el('tr', { class: 'row-click', title: `Click for ${s}'s churned properties` }, [
         el('td', { style: 'text-align:left', text: s }),
-        el('td', { style: 'text-align:left', text: fmtInt(d.live) }),
-        el('td', { style: 'text-align:left', text: fmtInt(d.churned) }),
+        el('td', { style: 'text-align:left', text: prev.rate !== null ? fmtPct(prev.rate) : '—' }),
         el('td', { style: 'text-align:left' }, [
-          el('span', { class: d.rate !== null && d.rate > 1 ? 'flag-dot' : '', text: d.rate !== null ? fmtPct(d.rate) : '—' }),
+          el('span', { class: cur.rate !== null && cur.rate > 5 ? 'flag-dot' : '', text: cur.rate !== null ? fmtPct(cur.rate) : '—' }),
         ]),
       ]);
       tr.addEventListener('click', () => {
@@ -1957,9 +1982,10 @@ function viewChurnRate() {
     frag.append(el('div', { class: 'panel' }, [el('div', { class: 'table-wrap' }, [table])]));
   }
 
-  // the churned property list behind the number
-  frag.append(sectionHead('Churned properties', `${fmtInt(dr.churned)} in this scope`));
-  frag.append(churnPropertyTable(churnAnalysis(squad, kam, month).rows));
+  // the churned property list behind the number (April 2025 onward via churnAnalysis)
+  const listRows = churnAnalysis(squad, kam, month).rows;
+  frag.append(sectionHead('Churned properties', `${fmtInt(listRows.length)} in this scope`));
+  frag.append(churnPropertyTable(listRows));
 
   return frag;
 }
@@ -2459,6 +2485,26 @@ function MONTH_INDEX(m) {
 //  - a year only          → SUM of that year's monthly rates (cumulative %)
 //  - nothing selected      → SUM of all months' rates up to the current month
 // (Cumulative = simple sum of the monthly percentages, per the agreed definition.)
+// Cumulative churn rate for an entire financial year (Apr startYear → Mar
+// startYear+1), summing each month's rate up to today. Uses the primary
+// (churn-tab) calculation. region = squad or 'India'.
+// Cumulative churn rate for a whole financial year (sum of that FY's monthly
+// rates, up to the current month for the ongoing FY). region = squad or 'India'.
+// Uses the same primary per-month calculation as everywhere else.
+function fyChurnRate(region, fyStart) {
+  const monthNames = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+  const today = new Date();
+  let sum = 0, any = false, churnedTotal = 0;
+  for (let i = 0; i < 12; i++) {
+    const month = ((3 + i) % 12) + 1;              // 4..12,1..3
+    const year = (3 + i) <= 11 ? fyStart : fyStart + 1;
+    if (new Date(year, month - 1, 1) > today) break;   // don't count future months
+    const p = primaryMonthRate(region, monthNames[month - 1], year);
+    if (p && p.rate !== null) { sum += p.rate; churnedTotal += (p.churned || 0); any = true; }
+  }
+  return any ? { rate: sum, churned: churnedTotal } : { rate: null, churned: 0 };
+}
+
 function momRate(region, monthName, year) {
   const smHasData = (state.churnAnalysis || []).some((r) => isChurned(r.current_status) && parseDate(r.delist_date));
   const momHasData = (state.momChurn || []).length > 0;
@@ -3865,7 +3911,7 @@ function closeShortcutsPopup() {
 }
 
 function init() {
-  console.log('%cVista Tracker build: CHURN-FY-v7', 'font-weight:bold;color:#2f7d5b');
+  console.log('%cVista Tracker build: CHURN-2FY-v8', 'font-weight:bold;color:#2f7d5b');
   readUrl();
 
   $('#login-btn')?.addEventListener('click', handleLogin);

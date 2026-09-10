@@ -1946,3 +1946,16 @@ td.hl-prop{color:#1e6f5c;font-weight:700}
 /* keyboard hint kbd and shortcuts kbd already use variables; ensure contrast */
 [data-theme="dark"] kbd,
 [data-theme="dark"] .shortcuts-pop kbd { color: var(--ink); background: var(--surface-3); border-color: var(--line-strong); }
+
+/* two-FY churn display on the hero card */
+.hero-churn .s-sub.prev-fy{margin-top:6px;padding-top:6px;border-top:1px solid var(--line);opacity:.85;font-size:12.5px}
+.hero-churn .s-sub.prev-fy strong{color:var(--ink)}
+[data-theme="dark"] .hero-churn .s-sub.prev-fy strong{color:var(--ink)}
+
+/* churn-rate tab: two-FY cards */
+.fy-churn-cards{display:grid;grid-template-columns:1.3fr 1fr;gap:13px;margin:6px 0 14px}
+.fy-churn-cards .stat.fy-current{background:var(--bad-bg,#f9e9e7);border-color:#ecccc8}
+.fy-churn-cards .s-value.big{font-family:'Marcellus',Georgia,serif;font-size:40px;line-height:1.05}
+.fy-churn-cards .fy-current .s-value{color:var(--bad,#c0392b)}
+.fy-churn-cards .fy-prev{opacity:.9}
+@media(max-width:640px){.fy-churn-cards{grid-template-columns:1fr}}
