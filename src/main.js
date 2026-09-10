@@ -1,4 +1,4 @@
-/* VISTA-TRACKER BUILD MARKER: MOM-CHURN-v4 — if you see 209 Expired, this file is live */
+/* VISTA-TRACKER BUILD MARKER: CHURN-FY-v7 — if you see 209 Expired, this file is live */
 /* ==========================================================================
    Vista Tracker — application logic
    --------------------------------------------------------------------------
@@ -2333,7 +2333,84 @@ function churnedInSquadMonth(squad, monthNum, year) {
 // (mom_churn table). Returns the tab's EXACT churn % and churn count for a
 // region (squad or 'India') in a given month + year. No recalculation.
 // Returns null rate when that region/month/year isn't in the tab.
-// Parse a numeric value from a MOM cell ("100", "13", "3.72%", "0.0372").
+// ---- Churn calculation (PRIMARY source: the churn tab) ---------------------
+// Churn is computed from churn_analysis (the "List of Churned Properties" tab),
+// which has Squad, Current Status, and the delist/pause date. Churned = status
+// Paused/Delisted/TAC, dated by the delist date. The live count at the start of
+// a month is reconstructed backwards from the current live count:
+//   live_at_month_start = current_live + everyone who churned from that month on.
+// Rate = churned that month ÷ live_at_month_start × 100.
+
+function smChurnedList(region) {
+  // churned rows in the CHURN tab for a region (or all if 'india'/null), with a
+  // parsed churn date. Deduped by property_id.
+  const isAll = !region || norm(region) === 'india';
+  const seen = new Set();
+  const out = [];
+  for (const r of (state.churnAnalysis || [])) {
+    if (!isChurned(r.current_status)) continue;              // Paused/Delisted/TAC
+    if (!isAll && norm(r.squad) !== norm(region)) continue;
+    const d = parseDate(r.delist_date);
+    if (!d) continue;                                        // need a churn date
+    if (d < FY_START) continue;                              // churn counts from Apr 2025 onward
+    const id = pidKey(r.property_id);
+    if (id && seen.has(id)) continue;
+    if (id) seen.add(id);
+    out.push({ date: d });
+  }
+  return out;
+}
+
+function smCurrentLive(region) {
+  // current live count for a region from the main table (agreement track)
+  const isAll = !region || norm(region) === 'india';
+  let n = 0;
+  for (const r of (state.rows || [])) {
+    if (r.__live !== true) continue;
+    if (!isAll && norm(r.__squad) !== norm(region)) continue;
+    n += 1;
+  }
+  return n;
+}
+
+// One month's SM-tab churn for a region. year+monthNum identify the month.
+function smMonth(region, monthNum, year) {
+  const churnedRows = smChurnedList(region);
+  const monthStart = new Date(year, monthNum - 1, 1);
+  const monthEnd = new Date(year, monthNum, 1);            // first of next month
+
+  let churnedThisMonth = 0;
+  let churnedFromMonthOnward = 0;                          // for the backwards reconstruction
+  for (const c of churnedRows) {
+    if (c.date >= monthStart && c.date < monthEnd) churnedThisMonth += 1;
+    if (c.date >= monthStart) churnedFromMonthOnward += 1;
+  }
+  // live at the start of this month = today's live + everyone who left since then
+  const liveAtStart = smCurrentLive(region) + churnedFromMonthOnward;
+  const rate = liveAtStart > 0 ? (churnedThisMonth * 100 / liveAtStart) : null;
+  return { churned: churnedThisMonth, liveBegin: liveAtStart, rate };
+}
+
+// Primary monthly rate: SM-tab calculation, with the MOM tab as fallback.
+function primaryMonthRate(region, monthName, year) {
+  const monthNum = MONTH_INDEX(monthName);
+  const sm = smMonth(region, monthNum, year);
+  if (sm.rate !== null && sm.rate !== undefined) {
+    // cross-check against the MOM tab (informational only)
+    const mm = momMonth(region, monthName, year);
+    if (mm && mm.rate !== null && Math.abs(sm.rate - mm.rate) > 1 && !primaryMonthRate._warned) {
+      primaryMonthRate._warned = true;
+      try { console.warn(`Churn cross-check ${region} ${monthName} ${year}: SM ${sm.rate.toFixed(2)}% vs MOM ${mm.rate.toFixed(2)}%`); } catch {}
+    }
+    return { rate: sm.rate, churned: sm.churned, liveBegin: sm.liveBegin, source: 'SM' };
+  }
+  // fallback: MOM tab
+  const mm = momMonth(region, monthName, year);
+  if (mm && mm.rate !== null) return { rate: mm.rate, churned: mm.churned, liveBegin: mm.liveBegin, source: 'MOM' };
+  return null;
+}
+
+// ---- MOM-tab churn (fallback / cross-check) --------------------------------
 function momNum(v) {
   if (v === null || v === undefined || v === '') return null;
   const n = Number(String(v).replace(/[^0-9.-]/g, ''));
@@ -2383,43 +2460,52 @@ function MONTH_INDEX(m) {
 //  - nothing selected      → SUM of all months' rates up to the current month
 // (Cumulative = simple sum of the monthly percentages, per the agreed definition.)
 function momRate(region, monthName, year) {
-  const rows = state.momChurn || [];
-  if (!rows.length) return null;
+  const smHasData = (state.churnAnalysis || []).some((r) => isChurned(r.current_status) && parseDate(r.delist_date));
+  const momHasData = (state.momChurn || []).length > 0;
+  if (!smHasData && !momHasData) return null;
 
   // single month
   if (monthName) {
-    const m = momMonth(region, monthName, year);
-    return m ? m.rate : null;
+    const p = primaryMonthRate(region, monthName, year);
+    return p ? p.rate : null;
   }
 
-  // gather all months for this region (optionally a single year), in date order
-  const tgtRegion = norm(region || 'india');
+  // Build the list of months to sum. Prefer SM-derived months (from churn dates);
+  // fall back to the MOM tab's month rows when SM has nothing.
   const today = new Date();
-  const monthsForRegion = rows
-    .filter((r) => norm(r.region) === tgtRegion)
-    .filter((r) => !year || String(r.year).trim() === String(year))
-    .map((r) => {
-      const paused = momNum(r.paused) || 0;
-      const delTac = momNum(r.delisted_tac) || 0;
-      const liveBegin = momNum(r.live_begin);
-      const rate = (liveBegin && liveBegin > 0) ? ((paused + delTac) * 100 / liveBegin) : null;
-      const y = Number(String(r.year).trim());
-      const mi = MONTH_INDEX(r.month);
-      return { y, mi, rate, date: new Date(y, mi - 1, 1) };
-    })
-    .filter((x) => x.rate !== null && x.date <= today)     // only up to current month
-    .sort((a, b) => a.date - b.date);
+  const monthSet = new Map();   // key "y-m" -> {y, mi}
+  if (smHasData) {
+    for (const r of (state.churnAnalysis || [])) {
+      if (!isChurned(r.current_status)) continue;
+      const d = parseDate(r.delist_date);
+      if (!d || d < FY_START || d > today) continue;
+      monthSet.set(`${d.getFullYear()}-${d.getMonth() + 1}`, { y: d.getFullYear(), mi: d.getMonth() + 1 });
+    }
+  } else {
+    const tgt = norm(region || 'india');
+    for (const r of (state.momChurn || [])) {
+      if (norm(r.region) !== tgt) continue;
+      monthSet.set(`${r.year}-${MONTH_INDEX(r.month)}`, { y: Number(String(r.year).trim()), mi: MONTH_INDEX(r.month) });
+    }
+  }
 
-  if (!monthsForRegion.length) return null;
-  // cumulative = simple sum of monthly percentages
-  return monthsForRegion.reduce((sum, x) => sum + x.rate, 0);
+  const monthNames = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+  let sum = 0, any = false;
+  for (const { y, mi } of monthSet.values()) {
+    if (year && String(y) !== String(year)) continue;
+    if (new Date(y, mi - 1, 1) > today) continue;
+    const p = primaryMonthRate(region, monthNames[mi - 1], y);
+    if (p && p.rate !== null) { sum += p.rate; any = true; }
+  }
+  return any ? sum : null;
 }
 
 // Kept for the monthly table cells: one month's rate + churned count.
+// Uses the SM-tab calculation (primary), MOM tab as fallback.
 function momLookup(region, monthName, year) {
-  const m = momMonth(region, monthName, year);
-  if (!m) return null;
-  return { rate: m.rate, count: m.churned, liveBegin: m.liveBegin };
+  const p = primaryMonthRate(region, monthName, year);
+  if (!p) return null;
+  return { rate: p.rate, count: p.churned, liveBegin: p.liveBegin };
 }
 
 function squadMonthRate(squad, monthNum, year) {
@@ -2452,7 +2538,9 @@ function viewMonthlyChurn() {
     frag.append(toggle);
   }
 
-  const squads = [...new Set((state.momChurn || []).map((r) => r.region).filter((x) => x && norm(x) !== 'india'))].sort();
+  const churnSquads = [...new Set((state.churnAnalysis || []).map((r) => r.squad).filter(Boolean))];
+  const momSquads = [...new Set((state.momChurn || []).map((r) => r.region).filter((x) => x && norm(x) !== 'india'))];
+  const squads = [...new Set([...churnSquads, ...momSquads])].sort();
   const months = fyMonthsList(fy);
   const shortName = (n) => ['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][n];
 
@@ -3566,7 +3654,7 @@ function signOut() {
 /* 10 -------------------------------------------------------------------- boot */
 
 // ---- data cache (localStorage, shared across tabs, short expiry) ----------
-const DATA_CACHE_KEY = 'vt.datacache.v2';   // bumped: v1 caches lacked momChurn
+const DATA_CACHE_KEY = 'vt.datacache.v3';   // bumped: v1 caches lacked momChurn
 const DATA_CACHE_TTL = 10 * 60 * 1000;   // 10 minutes
 
 function readDataCache() {
@@ -3777,7 +3865,7 @@ function closeShortcutsPopup() {
 }
 
 function init() {
-  console.log('%cVista Tracker build: MOM-CHURN-v4', 'font-weight:bold;color:#2f7d5b');
+  console.log('%cVista Tracker build: CHURN-FY-v7', 'font-weight:bold;color:#2f7d5b');
   readUrl();
 
   $('#login-btn')?.addEventListener('click', handleLogin);
