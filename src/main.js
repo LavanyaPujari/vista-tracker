@@ -622,6 +622,7 @@ const state = {
   raw: [],
   churnAnalysis: [],
   gcfMarginal: [],
+  momChurn: [],
   caSquad: null,
   caMonth: null,
   caKam: null,
@@ -1346,16 +1347,31 @@ function heroStats(scopeRows, { label } = {}) {
   const month = state.caMonth || null;
   const dr = delistingRate(selectedSquad, selectedKam, month);
 
+  // Churn RATE now comes from the MOM churn tab, by the agreed formula
+  // (churned ÷ live-at-beginning). Region = the selected squad, else India.
+  // Month selected → that month; year → sum of that year's months; nothing →
+  // sum of all months to date. KAM has no MOM row, so KAM scope shows no rate.
+  const momRegion = selectedKam ? null : (selectedSquad || 'India');
+  const momChurnRate = momRegion ? momRate(momRegion, month, state.period.year || null) : null;
+
   // period label reflects the month/year filter (or the full window if none)
   const periodLabel = (month || state.period.year)
     ? [month, state.period.year].filter(Boolean).join(' ')
-    : windowLabel();
+    : 'to date';
 
   let churn, churnSub, churnClickable;
-  if (dr.rate !== null) {
+  if (momChurnRate !== null && momChurnRate !== undefined) {
+    churn = momChurnRate;
+    const who = selectedSquad ? selectedSquad : 'All India';
+    churnSub = month
+      ? `${who} · ${periodLabel} · churned ÷ live at month start`
+      : `${who} · cumulative monthly churn · ${periodLabel}`;
+    churnClickable = true;
+  } else if (dr.rate !== null) {
+    // fallback (e.g. KAM scope, or MOM tab empty) — old computed rate
     churn = dr.rate;
     const who = selectedKam ? selectedKam : selectedSquad ? selectedSquad : 'All India';
-    churnSub = `${fmtInt(dr.churned)} churned ÷ (${fmtInt(dr.live)} live + ${fmtInt(dr.churned)}) · ${who} · ${periodLabel}`;
+    churnSub = `${fmtInt(dr.churned)} churned · ${who} · ${periodLabel}`;
     churnClickable = true;
   } else {
     churn = null;
@@ -2313,6 +2329,99 @@ function churnedInSquadMonth(squad, monthNum, year) {
   return out;
 }
 
+// Look up the validated monthly churn straight from the "MOM churn" tab
+// (mom_churn table). Returns the tab's EXACT churn % and churn count for a
+// region (squad or 'India') in a given month + year. No recalculation.
+// Returns null rate when that region/month/year isn't in the tab.
+// Parse a numeric value from a MOM cell ("100", "13", "3.72%", "0.0372").
+function momNum(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(String(v).replace(/[^0-9.-]/g, ''));
+  return Number.isNaN(n) ? null : n;
+}
+
+// One month's churn for a region, computed by the agreed formula:
+//   (Paused + Delisted/TAC) ÷ Live Count at Beginning × 100.
+// Also cross-checks against the tab's own "Churn %" and warns (once) on a gap.
+function momMonth(region, monthName, year) {
+  const rows = state.momChurn || [];
+  const tgtRegion = norm(region || 'india');
+  const tgtMonth = norm(monthName || '');
+  const tgtYear = String(year || '');
+  for (const r of rows) {
+    if (norm(r.region) !== tgtRegion) continue;
+    if (tgtMonth && norm(r.month) !== tgtMonth) continue;
+    if (tgtYear && String(r.year).trim() !== tgtYear) continue;
+
+    const paused = momNum(r.paused) || 0;
+    const delTac = momNum(r.delisted_tac) || 0;
+    const liveBegin = momNum(r.live_begin);
+    const churned = paused + delTac;
+    const computed = (liveBegin && liveBegin > 0) ? (churned * 100 / liveBegin) : null;
+
+    // cross-check against the sheet's own Churn % (informational only)
+    const sheetPct = pctToNumber(r.churn_pct);
+    if (computed !== null && sheetPct !== null && Math.abs(computed - sheetPct) > 0.5 && !momMonth._warned) {
+      momMonth._warned = true;
+      try { console.warn(`MOM churn cross-check: ${region} ${monthName} ${year} computed ${computed.toFixed(2)}% vs sheet ${sheetPct.toFixed(2)}%`); } catch {}
+    }
+
+    return { rate: computed, churned, liveBegin: liveBegin || null, sheetPct,
+      ym: `${r.year}-${MONTH_INDEX(r.month)}` };
+  }
+  return null;
+}
+
+function MONTH_INDEX(m) {
+  const i = ['january','february','march','april','may','june','july','august','september','october','november','december'].indexOf(norm(m));
+  return i === -1 ? 0 : i + 1;
+}
+
+// The churn rate to display, honouring the month/year selection:
+//  - a specific month+year → that month's rate
+//  - a year only          → SUM of that year's monthly rates (cumulative %)
+//  - nothing selected      → SUM of all months' rates up to the current month
+// (Cumulative = simple sum of the monthly percentages, per the agreed definition.)
+function momRate(region, monthName, year) {
+  const rows = state.momChurn || [];
+  if (!rows.length) return null;
+
+  // single month
+  if (monthName) {
+    const m = momMonth(region, monthName, year);
+    return m ? m.rate : null;
+  }
+
+  // gather all months for this region (optionally a single year), in date order
+  const tgtRegion = norm(region || 'india');
+  const today = new Date();
+  const monthsForRegion = rows
+    .filter((r) => norm(r.region) === tgtRegion)
+    .filter((r) => !year || String(r.year).trim() === String(year))
+    .map((r) => {
+      const paused = momNum(r.paused) || 0;
+      const delTac = momNum(r.delisted_tac) || 0;
+      const liveBegin = momNum(r.live_begin);
+      const rate = (liveBegin && liveBegin > 0) ? ((paused + delTac) * 100 / liveBegin) : null;
+      const y = Number(String(r.year).trim());
+      const mi = MONTH_INDEX(r.month);
+      return { y, mi, rate, date: new Date(y, mi - 1, 1) };
+    })
+    .filter((x) => x.rate !== null && x.date <= today)     // only up to current month
+    .sort((a, b) => a.date - b.date);
+
+  if (!monthsForRegion.length) return null;
+  // cumulative = simple sum of monthly percentages
+  return monthsForRegion.reduce((sum, x) => sum + x.rate, 0);
+}
+
+// Kept for the monthly table cells: one month's rate + churned count.
+function momLookup(region, monthName, year) {
+  const m = momMonth(region, monthName, year);
+  if (!m) return null;
+  return { rate: m.rate, count: m.churned, liveBegin: m.liveBegin };
+}
+
 function squadMonthRate(squad, monthNum, year) {
   const churnedThisMonth = churnedInSquadMonth(squad, monthNum, year).length;
   const dr = delistingRate(squad, null, null);   // squad's current live + total churned
@@ -2343,7 +2452,7 @@ function viewMonthlyChurn() {
     frag.append(toggle);
   }
 
-  const squads = [...new Set((state.churnAnalysis || []).map((r) => r.squad).filter(Boolean))].sort();
+  const squads = [...new Set((state.momChurn || []).map((r) => r.region).filter((x) => x && norm(x) !== 'india'))].sort();
   const months = fyMonthsList(fy);
   const shortName = (n) => ['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][n];
 
@@ -2356,14 +2465,18 @@ function viewMonthlyChurn() {
   for (const s of squads) {
     const cells = [el('td', { class: 'freeze', style: 'text-align:left', text: s })];
     for (const { year, month } of months) {
-      const { count, rate } = squadMonthRate(s, month, year);
-      if (!count) {
+      const monthName = ['','January','February','March','April','May','June','July','August','September','October','November','December'][month];
+      const mom = momLookup(s, monthName, year);
+      const rate = mom ? mom.rate : null;
+      const count = mom ? mom.count : null;
+      if (rate === null || rate === undefined) {
+        // no data in the MOM churn tab for this squad/month → blank cell
         cells.push(el('td', { class: 'mc-cell empty', style: 'text-align:center', text: '·' }));
       } else {
-        const flagged = rate !== null && rate > 1;
+        const flagged = rate > 1;
         const td = el('td', { class: `mc-cell click${flagged ? ' flag' : ''}`, style: 'text-align:center',
-          title: `${s} · ${shortName(month)} ${year} · ${count} churned` },
-          [el('span', { text: rate !== null ? fmtPct(rate) : '—' })]);
+          title: `${s} · ${shortName(month)} ${year}${count != null ? ' · ' + count + ' churned' : ''}` },
+          [el('span', { text: fmtPct(rate) })]);
         td.addEventListener('click', () => {
           state.mcSquad = s; state.mcMonth = month; state.mcYear = year;
           pushNav();
@@ -3493,24 +3606,26 @@ async function boot(isRefresh = false) {
 
   try {
     const cached = !isRefresh ? readDataCache() : null;
-    let raw, churnAnalysis, gcfMarginal;
+    let raw, churnAnalysis, gcfMarginal, momChurn;
 
     if (cached) {
       // reuse recently-fetched data — makes a new tab / revisit load instantly
-      ({ raw, churnAnalysis, gcfMarginal } = cached);
+      ({ raw, churnAnalysis, gcfMarginal, momChurn } = cached);
     } else {
       raw = await fetchAllRows(state.diag);
       // The churn and GCF tables are independent — load them in parallel.
-      [churnAnalysis, gcfMarginal] = await Promise.all([
+      [churnAnalysis, gcfMarginal, momChurn] = await Promise.all([
         fetchTable('churn_analysis'),
         fetchTable('gcf_marginal'),
+        fetchTable('mom_churn'),
       ]);
-      writeDataCache({ raw, churnAnalysis, gcfMarginal });
+      writeDataCache({ raw, churnAnalysis, gcfMarginal, momChurn });
     }
 
     state.raw = raw;
     state.churnAnalysis = churnAnalysis;
     state.gcfMarginal = gcfMarginal;
+    state.momChurn = momChurn || [];
     state.cols = resolveColumns(raw[0]);
 
     // names can't separate the two status columns — the data can
