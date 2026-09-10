@@ -1,4 +1,4 @@
-/* VISTA-TRACKER BUILD MARKER: CHURN-YEAR-FILTER-v3 — if you see 209 Expired, this file is live */
+/* VISTA-TRACKER BUILD MARKER: MOM-CHURN-v4 — if you see 209 Expired, this file is live */
 /* ==========================================================================
    Vista Tracker — application logic
    --------------------------------------------------------------------------
@@ -3566,7 +3566,7 @@ function signOut() {
 /* 10 -------------------------------------------------------------------- boot */
 
 // ---- data cache (localStorage, shared across tabs, short expiry) ----------
-const DATA_CACHE_KEY = 'vt.datacache.v1';
+const DATA_CACHE_KEY = 'vt.datacache.v2';   // bumped: v1 caches lacked momChurn
 const DATA_CACHE_TTL = 10 * 60 * 1000;   // 10 minutes
 
 function readDataCache() {
@@ -3608,8 +3608,8 @@ async function boot(isRefresh = false) {
     const cached = !isRefresh ? readDataCache() : null;
     let raw, churnAnalysis, gcfMarginal, momChurn;
 
-    if (cached) {
-      // reuse recently-fetched data — makes a new tab / revisit load instantly
+    if (cached && Array.isArray(cached.momChurn)) {
+      // reuse recently-fetched data — but only if it actually includes momChurn
       ({ raw, churnAnalysis, gcfMarginal, momChurn } = cached);
     } else {
       raw = await fetchAllRows(state.diag);
@@ -3777,7 +3777,7 @@ function closeShortcutsPopup() {
 }
 
 function init() {
-  console.log('%cVista Tracker build: CHURN-YEAR-FILTER-v3', 'font-weight:bold;color:#2f7d5b');
+  console.log('%cVista Tracker build: MOM-CHURN-v4', 'font-weight:bold;color:#2f7d5b');
   readUrl();
 
   $('#login-btn')?.addEventListener('click', handleLogin);
