@@ -1,4 +1,4 @@
-/* VISTA-TRACKER BUILD MARKER: LIVE-FILTERS-v9 — if you see 209 Expired, this file is live */
+/* VISTA-TRACKER BUILD MARKER: DATA-ACCURACY-v10 — if you see 209 Expired, this file is live */
 /* ==========================================================================
    Vista Tracker — application logic
    --------------------------------------------------------------------------
@@ -2167,10 +2167,21 @@ function churnSection(dimension, focused) {
   const wrap = el('div', {});
   const scope = kam ? kam : squad ? squad : 'all India';
 
-  // Delisting rate, computed = churned / (live + churned) * 100, same scope,
-  // FY 2025-26. When a month is picked, churned is that month's FY churn.
-  const dr = delistingRate(squad, kam, month);
-  const rate = dr.rate;
+  // Churn rate from the NEW formula (churned ÷ live at month start). Region =
+  // the squad (or India). KAM has no region-level churn row, so KAM scope shows
+  // the squad/India figure it belongs to via the churn list fallback.
+  const region = kam ? null : (squad || 'India');
+  const curFy = fyStartYear(new Date());
+  let rate = null, rateSub = 'no data';
+  if (month) {
+    const p = region ? primaryMonthRate(region, month, state.period.year || curFy) : null;
+    rate = p ? p.rate : null;
+    rateSub = `${scope} · ${month}${state.period.year ? ' ' + state.period.year : ''} · churned ÷ live at month start`;
+  } else if (region) {
+    const fy = fyChurnRate(region, curFy);
+    rate = fy.rate;
+    rateSub = `${scope} · ${fyLabel(curFy)} · cumulative to date`;
+  }
 
   // month banner + clear
   if (month) {
@@ -2188,9 +2199,6 @@ function churnSection(dimension, focused) {
 
   // headline churn rate, flagged red if > 1%
   const flagged = rate !== null && rate > 1;
-  const rateSub = rate !== null
-    ? `${fmtInt(dr.churned)} churned ÷ (${fmtInt(dr.live)} live + ${fmtInt(dr.churned)}) · ${windowLabel()}${month ? ' · ' + month : ''}`
-    : 'no data';
   const rateCard = el('div', { class: `stat ${flagged ? 'tone-danger' : ''}` }, [
     el('div', { class: 's-label' }, ['Churn rate', flagged ? el('span', { class: 'flag-dot', title: 'Above 1%', text: ' ●' }) : null]),
     el('div', { class: 's-value', text: rate !== null ? fmtPct(rate) : '—' }),
@@ -2274,9 +2282,13 @@ function viewMasterList() {
   back.addEventListener('click', () => goBackHistory('overview'));
   frag.append(back);
 
-  // Scope comes from the shared activeScope helper — same filters everywhere.
+  // Scope comes from the card that opened this view (state.mlFilter), so the
+  // list uses the SAME squad/KAM the card counted — not a leftover top-bar
+  // filter. Search still comes from the live filter bar.
   const sc = activeScope();
-  const squad = sc.squad, kam = sc.kam, search = sc.search;
+  const squad = (f.squad !== undefined ? f.squad : sc.squad) || null;
+  const kam = (f.kam !== undefined ? f.kam : sc.kam) || null;
+  const search = sc.search;
 
   // Live properties only — filter values and counts come from Live rows.
   let rows = (state.gcfMarginal || []).filter((r) => norm(r.current_status) === 'live');
@@ -3934,7 +3946,7 @@ function closeShortcutsPopup() {
 }
 
 function init() {
-  console.log('%cVista Tracker build: LIVE-FILTERS-v9', 'font-weight:bold;color:#2f7d5b');
+  console.log('%cVista Tracker build: DATA-ACCURACY-v10', 'font-weight:bold;color:#2f7d5b');
   readUrl();
 
   $('#login-btn')?.addEventListener('click', handleLogin);
