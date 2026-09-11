@@ -1,4 +1,4 @@
-/* VISTA-TRACKER BUILD MARKER: CHURN-2FY-v8 — if you see 209 Expired, this file is live */
+/* VISTA-TRACKER BUILD MARKER: LIVE-FILTERS-v9 — if you see 209 Expired, this file is live */
 /* ==========================================================================
    Vista Tracker — application logic
    --------------------------------------------------------------------------
@@ -1541,28 +1541,43 @@ function fnbAverageCard(label, value, squad, kam) {
 
 // Count of properties under Marriott (any value in marriott_cost) vs not,
 // across ALL properties in the master (gcf_marginal). Optional squad/kam scope.
+// Marriott (Live only): any real % (e.g. 15%) -> Yes; 0% and "-" -> No; blank -> EXCLUDED.
 function marriottCounts(squad, kam) {
   let under = 0, notUnder = 0;
-  for (const m of (state.gcfMarginal || [])) {
-    if (squad && norm(m.squad) !== norm(squad)) continue;
-    if (kam && norm(m.kam) !== norm(kam)) continue;
-    const v = m.marriott_cost;
-    const has = v != null && String(v).trim() !== '' && String(v).trim() !== '-';
-    if (has) under += 1; else notUnder += 1;
+  for (const m of liveGcfRows(squad, kam)) {
+    const raw = m.marriott_cost == null ? '' : String(m.marriott_cost).trim();
+    if (raw === '') continue;                               // blank → excluded entirely
+    if (raw === '-') { notUnder += 1; continue; }           // "-" → No
+    const n = pctToNumber(raw);
+    if (n === null || n === 0) { notUnder += 1; continue; } // 0% or unreadable → No
+    under += 1;                                             // real % (e.g. 15%) → Yes
   }
   return { under, notUnder };
 }
 
 // DCRW (Damage cover & Refund waiver) Yes/No count across all master properties,
 // optional squad/kam scope.
-function dcrwCounts(squad, kam) {
-  let yes = 0, no = 0;
+// Live-only, scoped rows from the SM/GCF table. All the DCRW/GCF/Marriott/F&B
+// counts below run on THIS set, so they only reflect Current Status = "Live".
+function liveGcfRows(squad, kam) {
+  const out = [];
   for (const m of (state.gcfMarginal || [])) {
+    if (norm(m.current_status) !== 'live') continue;       // Live only
     if (squad && norm(m.squad) !== norm(squad)) continue;
     if (kam && norm(m.kam) !== norm(kam)) continue;
-    const v = norm(m.dcrw);
-    if (v === 'yes') yes += 1;
-    else if (v === 'no') no += 1;
+    out.push(m);
+  }
+  return out;
+}
+
+// DCRW (Live only): "Yes" -> Yes; #NA / NA / "-" -> No; blank -> EXCLUDED.
+function dcrwCounts(squad, kam) {
+  let yes = 0, no = 0;
+  for (const m of liveGcfRows(squad, kam)) {
+    const raw = m.dcrw == null ? '' : String(m.dcrw).trim();
+    if (raw === '') continue;                               // blank → excluded entirely
+    if (norm(raw) === 'yes') yes += 1;
+    else no += 1;                                           // no, na, #na, "-" → No
   }
   return { yes, no };
 }
@@ -2263,14 +2278,22 @@ function viewMasterList() {
   const sc = activeScope();
   const squad = sc.squad, kam = sc.kam, search = sc.search;
 
-  let rows = (state.gcfMarginal || []).slice();
+  // Live properties only — filter values and counts come from Live rows.
+  let rows = (state.gcfMarginal || []).filter((r) => norm(r.current_status) === 'live');
   if (squad) rows = rows.filter((r) => norm(r.squad) === norm(squad));
   if (kam) rows = rows.filter((r) => norm(r.kam) === norm(kam));
-  // the card that opened this view (marriott / dcrw)
-  if (f.marriott === 'yes') rows = rows.filter((r) => { const v = r.marriott_cost; return v != null && String(v).trim() !== '' && String(v).trim() !== '-'; });
-  if (f.marriott === 'no') rows = rows.filter((r) => { const v = r.marriott_cost; return !(v != null && String(v).trim() !== '' && String(v).trim() !== '-'); });
+  // the card that opened this view (marriott / dcrw). Blank values are excluded.
+  const marrIsYes = (v) => {
+    const raw = v == null ? '' : String(v).trim();
+    if (raw === '' || raw === '-') return false;
+    const n = pctToNumber(raw);
+    return n !== null && n !== 0;                            // real % (e.g. 15%) → Yes
+  };
+  const marrHasValue = (v) => v != null && String(v).trim() !== '';   // not blank
+  if (f.marriott === 'yes') rows = rows.filter((r) => marrIsYes(r.marriott_cost));
+  if (f.marriott === 'no') rows = rows.filter((r) => marrHasValue(r.marriott_cost) && !marrIsYes(r.marriott_cost));
   if (f.dcrw === 'yes') rows = rows.filter((r) => norm(r.dcrw) === 'yes');
-  if (f.dcrw === 'no') rows = rows.filter((r) => norm(r.dcrw) === 'no');
+  if (f.dcrw === 'no') rows = rows.filter((r) => { const raw = r.dcrw == null ? '' : String(r.dcrw).trim(); return raw !== '' && norm(raw) !== 'yes'; });
   // free-text search on id / squad / kam
   if (search) rows = rows.filter((r) => norm(`${r.property_id} ${r.squad} ${r.kam}`).includes(search));
 
@@ -3911,7 +3934,7 @@ function closeShortcutsPopup() {
 }
 
 function init() {
-  console.log('%cVista Tracker build: CHURN-2FY-v8', 'font-weight:bold;color:#2f7d5b');
+  console.log('%cVista Tracker build: LIVE-FILTERS-v9', 'font-weight:bold;color:#2f7d5b');
   readUrl();
 
   $('#login-btn')?.addEventListener('click', handleLogin);
