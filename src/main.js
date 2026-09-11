@@ -1,4 +1,4 @@
-/* VISTA-TRACKER BUILD MARKER: KAM-DROPDOWN-v13 — if you see 209 Expired, this file is live */
+/* VISTA-TRACKER BUILD MARKER: KAM-COUNTS-v14 — if you see 209 Expired, this file is live */
 /* ==========================================================================
    Vista Tracker — application logic
    --------------------------------------------------------------------------
@@ -3237,6 +3237,57 @@ const CHURN_VIEWS_WITH_BAR = ['churned', 'churn-detail', 'churn-rate', 'master-l
 // cursor position after the bar re-renders (fixes losing focus after 1 char).
 const churnSearchFocus = { active: false, pos: null };
 
+// Per-KAM counts for the churn-bar KAM dropdown. The badge must match what the
+// open page actually lists: on the churn tabs that's churned properties for the
+// KAM (deduped, in the Apr-2025+ window); on the Marriott/DCRW master pages it's
+// live master rows for the KAM under the active Marriott/DCRW filter. Counts
+// honour the active squad + month/year and skip the KAM filter itself. The full
+// live-KAM roster still shows (names with no match read 0), so any KAM stays
+// selectable.
+function kamBarOptions() {
+  const squad = activeScope().squad;
+  const roster = uniqueValues('__kam', 'kam').map((o) => o.value);
+  const counts = new Map();
+  const bump = (name, id) => {
+    const k = name || '\u2014';
+    if (!counts.has(k)) counts.set(k, new Set());
+    counts.get(k).add(id != null && String(id).trim() !== '' ? pidKey(id) : Symbol());
+  };
+
+  if (state.view === 'master-list') {
+    const f = state.mlFilter || {};
+    const marrYes = (v) => { const raw = v == null ? '' : String(v).trim(); if (raw === '' || raw === '-') return false; const n = pctToNumber(raw); return n !== null && n !== 0; };
+    const marrHas = (v) => v != null && String(v).trim() !== '';
+    for (const m of (state.gcfMarginal || [])) {
+      if (norm(m.current_status) !== 'live') continue;
+      if (squad && norm(m.squad) !== norm(squad)) continue;
+      if (f.marriott === 'yes' && !marrYes(m.marriott_cost)) continue;
+      if (f.marriott === 'no' && !(marrHas(m.marriott_cost) && !marrYes(m.marriott_cost))) continue;
+      if (f.dcrw === 'yes' && norm(m.dcrw) !== 'yes') continue;
+      if (f.dcrw === 'no') { const raw = m.dcrw == null ? '' : String(m.dcrw).trim(); if (!(raw !== '' && norm(raw) !== 'yes')) continue; }
+      bump(m.kam, m.property_id);
+    }
+  } else {
+    const monthNum = state.caMonth ? MONTH_NAMES.findIndex((mn) => norm(mn) === norm(state.caMonth)) + 1 : 0;
+    const yearNum = state.period.year ? Number(state.period.year) : 0;
+    for (const r of (state.churnAnalysis || [])) {
+      if (!isChurned(r.current_status)) continue;
+      if (!inFY(r.delist_date)) continue;
+      if (squad && norm(r.squad) !== norm(squad)) continue;
+      if (monthNum || yearNum) {
+        const d = parseDate(r.delist_date); if (!d) continue;
+        if (monthNum && (d.getMonth() + 1) !== monthNum) continue;
+        if (yearNum && d.getFullYear() !== yearNum) continue;
+      }
+      bump(r.kam, r.property_id);
+    }
+  }
+
+  const names = [...new Set([...roster, ...counts.keys()])].sort(cmp);
+  return names.map((v) => ({ value: v, count: (counts.get(v) ? counts.get(v).size : 0) }));
+}
+
+
 function renderChurnTopBar() {
   const bar = $('#filter-bar');
   if (!bar) return;
@@ -3307,7 +3358,7 @@ function renderChurnTopBar() {
   // churn list both read one KAM, so allowing several would split card vs list.
   const kamMs = multiSelect({
     key: 'churn-kam', label: 'KAM', single: true,
-    options: uniqueValues('__kam', 'kam'),
+    options: kamBarOptions(),
     selected: f.kam ? [f.kam] : [],
     onChange: (vals) => {
       state.cdFilters = { ...(state.cdFilters || {}), kam: vals[0] || null };
