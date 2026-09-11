@@ -1,877 +1,3971 @@
-const SUPABASE_URL = "https://benzjvkbevombzjwwtqr.supabase.co";
-const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJlbnpqdmtiZXZvbWJ6and3dHFyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ3ODY3NjIsImV4cCI6MjEwMDM2Mjc2Mn0.E8ZxzUmT5xdOwmAd8Yg_i8lLkBXHM3vh8itV1WBZV8M";
-const TABLE_NAME = "agreement track";
+/* VISTA-TRACKER BUILD MARKER: LIVE-FILTERS-v9 — if you see 209 Expired, this file is live */
+/* ==========================================================================
+   Vista Tracker — application logic
+   --------------------------------------------------------------------------
+   1  Config & constants
+   2  Small helpers
+   3  Column resolution + row normalisation
+   4  Data loading (paged, so >1000 rows come through)
+   5  State + URL routing
+   6  Filtering & aggregation
+   7  UI primitives (multi-select, tables, colour scale)
+   8  Views
+   9  Chrome (sidebar, tab strip, filter bar)
+   10 Boot
+   ========================================================================== */
 
-// Color palette assigned dynamically to whatever status values actually exist in this data
-const STATUS_PALETTE = [
-  { bg:'#e3f0e6', fg:'#2f6b3f', dot:'#3f7d5c' }, // green
-  { bg:'#f7e3e0', fg:'#a13f30', dot:'#a13f30' }, // red
-  { bg:'#f4ecd8', fg:'#8a6a1f', dot:'#b58a1f' }, // amber
-  { bg:'#e6e6f2', fg:'#4b4b8a', dot:'#4b4b8a' }, // indigo
-  { bg:'#e6f0f2', fg:'#2f6a78', dot:'#2f8a9a' }, // teal
-  { bg:'#f2e6f0', fg:'#8a2f6a', dot:'#8a2f6a' }, // magenta
+/* 1 ------------------------------------------------------- config & constants */
+
+const ENV = import.meta.env;
+
+/* Supabase's Data API page shows the URL with /rest/v1/ already on the end, so
+   accept it either way rather than failing on a reasonable copy-paste. */
+const SUPABASE_URL = (ENV.VITE_SUPABASE_URL || '')
+  .trim()
+  .replace(/\/+$/, '')
+  .replace(/\/rest\/v1$/i, '')
+  .replace(/\/+$/, '');
+const SUPABASE_KEY   = ENV.VITE_SUPABASE_ANON_KEY || '';
+const SUPABASE_TABLE = ENV.VITE_SUPABASE_TABLE || 'agreement track';
+
+
+
+
+const PAGE_SIZE = 500; // rows per request — smaller chunks load faster and avoid timeouts
+
+/* How many days before agreement_end_date counts as "To Expire". */
+const EXPIRY_WINDOW_DAYS = Number(ENV.VITE_EXPIRY_WINDOW_DAYS) || 90;
+
+/* The seven MIS columns, in MIS order. "Grand Total" is derived. */
+/* Card display order requested by the team. Internal bucket names in comments. */
+const STATUS_ORDER = [
+  'Valid',                     // 1. Valid
+  'Founder/Partner Approved',  // 2. Founder Approved
+  'Not Signed',                // 3. Pending
+  'To Expire',                 // 4. Expiring Soon
+  'Expired',                   // 5. Expired
+  'Email Confirmation',        // 6. Draft / In Progress
 ];
-const OTHER_STYLE = { bg:'#f1f1f1', fg:'#555', dot:'#999' };
-let STATUS_STYLE = {}; // built dynamically once data loads
-let KPI_ORDER = [];
-let KPI_LABELS = {};
 
-const RENEWAL_WINDOW_DAYS = 60;
-// ASSUMPTION: no "sent to owner without response" tracking column was present in the
-// columns this app already knew about, so this is detected dynamically from whatever
-// columns exist (see detectOwnerResponseColumns). 14 days is a placeholder threshold —
-// change it below if your team uses a different SLA.
-const NO_RESPONSE_THRESHOLD_DAYS = 14;
+const UNMAPPED = 'Unmapped';
 
-let allRows = [];
-let squadList = [];
-let pocList = []; // stand-in for "KAM" — this sheet's closest equivalent is POC
-let sidebarExpanded = { squads: true, pocs: false };
-let openTabs = ['ALL'];
-let activeTabId = 'ALL';
-let activeRow = null;
-let lastSyncedAt = null;
-let isRefreshing = false;
-let pieSelected = null;
-let followUpDone = new Set();
+/* Brand palette (StayVista): Sky #9CCDFB · Bloom #E9A0A7 · Shine #FDD5A9 ·
+   Sage #A8C8A8. Reds/greens are darkened brand-adjacent tones for legibility. */
+const STATUS_COLOR = {
+  'Email Confirmation':       '#9ccdfb', // SV-Sky
+  'Expired':                  '#c65f5b', // deepened bloom-red, legible on white
+  'Founder/Partner Approved': '#a8c8a8', // SV-Sage
+  'Not Signed':               '#e9a0a7', // SV-Bloom
+  'To Expire':                '#fdd5a9', // SV-Shine
+  'Valid':                    '#3f8f6b', // deepened sage-green
+  [UNMAPPED]:                 '#d6cec2',
+};
 
-// dynamically detected column names for the "awaiting owner response" tracking —
-// null if this dataset doesn't have anything matching
-let SENT_DATE_KEY = null;
-let RESPONSE_KEY = null;
+const BLANK = '(blank)';
 
-let tabState = {};
-function getTabState(tabId){
-  if(!tabState[tabId]) tabState[tabId] = { search:'', statusFilter:'all', urgentOnly:null, healthFilter:'all', sort:'health' };
-  return tabState[tabId];
+/* 2 -------------------------------------------------------------- small helpers */
+
+const $  = (sel, root = document) => root.querySelector(sel);
+
+/** Build an element. children may be nodes or strings (always set as text). */
+function el(tag, props = {}, children = []) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (v === null || v === undefined || v === false) continue;
+    if (k === 'class') node.className = v;
+    else if (k === 'text') node.textContent = v;
+    else if (k === 'html') node.innerHTML = v;
+    else if (k.startsWith('on') && typeof v === 'function') node.addEventListener(k.slice(2), v);
+    else if (k === 'dataset') Object.assign(node.dataset, v);
+    else node.setAttribute(k, v === true ? '' : String(v));
+  }
+  for (const c of [].concat(children)) {
+    if (c === null || c === undefined || c === false) continue;
+    node.append(c instanceof Node ? c : document.createTextNode(String(c)));
+  }
+  return node;
 }
 
-function handleLogin(){
-  const email = document.getElementById('email-input').value.trim();
-  const err = document.getElementById('login-error');
-  if(!email.includes('@')){ err.style.display='block'; return; }
-  err.style.display='none';
-  document.getElementById('login-screen').classList.add('hidden');
-  document.getElementById('app').classList.remove('hidden');
-  document.getElementById('who-label').textContent = email;
-  boot();
+const norm = (s) => String(s ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+const clean = (s) => String(s ?? '').trim().replace(/\s+/g, ' ');
+
+const nf = new Intl.NumberFormat('en-IN');
+const fmtInt = (n) => nf.format(n);
+const fmtPct = (n) => (n === null || Number.isNaN(n) ? '—' : `${Math.round(n)}%`);
+
+function collator() {
+  return new Intl.Collator('en', { sensitivity: 'base', numeric: true });
 }
-function signOut(){
-  document.getElementById('app').classList.add('hidden');
-  document.getElementById('login-screen').classList.remove('hidden');
-  document.getElementById('email-input').value='';
+const cmp = collator().compare;
+
+function isTruthy(v) {
+  const n = norm(v);
+  return ['live', 'yes', 'y', 'true', '1', 'active', 'onboarded', 'golive'].includes(n);
 }
 
-async function fetchAllRows(){
-  let all = [];
-  let from = 0;
-  const batchSize = 1000;
-  while(true){
-    const url = `${SUPABASE_URL}/rest/v1/${encodeURIComponent(TABLE_NAME)}?select=*`;
-    const res = await fetch(url, {
-      headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${SUPABASE_ANON_KEY}`, "Range": `${from}-${from+batchSize-1}` }
-    });
-    if(!res.ok){
-      const text = await res.text();
-      throw new Error(`Supabase returned status ${res.status}: ${text}`);
+/* 3 ------------------------------ column resolution + row normalisation ------ */
+
+/**
+ * The live table uses its own names (squad, poc, contract_signing_status, ...).
+ * Each field lists the real column first, then looser fallbacks, so a rename or
+ * a differently-cased header still resolves. Matching ignores case, spaces,
+ * underscores and punctuation throughout.
+ */
+function resolveColumns(sample) {
+  const keys = Object.keys(sample || {});
+  const index = keys.map((k) => ({ key: k, n: norm(k) }));
+
+  const pick = (tests) => {
+    for (const test of tests) {
+      const hit = index.find(test);
+      if (hit) return hit.key;
     }
-    const batch = await res.json();
-    all = all.concat(batch);
-    if(batch.length < batchSize) break;
-    from += batchSize;
-  }
-  return all;
-}
+    return null;
+  };
 
-async function boot(){
-  const root = document.getElementById('view-root');
-  root.innerHTML = `<div class="loading-note">Loading data from Supabase…</div>`;
-  try{
-    allRows = await fetchAllRows();
-    buildColumnIndex();
-    buildStatusStyles();
-    buildGroupLists();
-    detectOwnerResponseColumns();
-    lastSyncedAt = new Date();
-    renderSidebar();
-    renderTabStrip();
-    renderActiveTab();
-    updateSyncLabel();
-    // keep the dashboard fresh without a full page reload
-    setInterval(manualRefresh, 60000);
-  }catch(e){
-    root.innerHTML = `<div class="error-note">Could not reach Supabase: ${e.message}</div>`;
-  }
-}
+  const has = (...parts) => (c) => parts.every((p) => c.n.includes(p));
+  const is  = (...names) => (c) => names.includes(c.n);
 
-async function manualRefresh(){
-  if(isRefreshing) return;
-  isRefreshing = true;
-  const btn = document.getElementById('refresh-btn');
-  if(btn){ btn.classList.add('spinning'); btn.disabled = true; }
-  try{
-    const fresh = await fetchAllRows();
-    if(fresh && fresh.length){
-      allRows = fresh;
-      buildColumnIndex();
-      buildStatusStyles();
-      buildGroupLists();
-      detectOwnerResponseColumns();
-      lastSyncedAt = new Date();
-      if(!activeRow){
-        renderSidebar();
-        renderTabStrip();
-        renderActiveTab();
-      }
-    }
-  }catch(e){
-    console.error('Refresh from Supabase failed:', e);
-  }finally{
-    isRefreshing = false;
-    const btn2 = document.getElementById('refresh-btn');
-    if(btn2){ btn2.classList.remove('spinning'); btn2.disabled = false; }
-    updateSyncLabel();
-  }
-}
-function updateSyncLabel(){
-  const label = document.getElementById('sync-label');
-  if(label) label.textContent = lastSyncedAt ? `Synced ${lastSyncedAt.toLocaleTimeString()}` : '';
-}
-
-// ---------- RESILIENT COLUMN LOOKUP ----------
-// Supabase/CSV imports sometimes rename columns (e.g. "Vista Name" -> "vista_name")
-// depending on how a table was created. Instead of hardcoding one exact spelling,
-// build a normalized index once per data load, and look fields up by trying several
-// likely names. This means renaming/re-importing a table won't silently break the
-// dashboard the way it did with "Squad"/"Current Status" showing as blank.
-let COLUMN_INDEX = {}; // normalized name -> actual key as it appears in the data
-
-function normalizeKey(k){
-  return k.toString().toLowerCase().replace(/[^a-z0-9]/g, '');
-}
-function buildColumnIndex(){
-  COLUMN_INDEX = {};
-  if(!allRows.length) return;
-  Object.keys(allRows[0]).forEach(k=>{
-    COLUMN_INDEX[normalizeKey(k)] = k;
-  });
-}
-// tries each candidate name (any casing/spacing/underscore style) and returns the
-// first one that actually exists in this row's data
-function getVal(row, candidates){
-  for(const c of candidates){
-    const actualKey = COLUMN_INDEX[normalizeKey(c)];
-    if(actualKey !== undefined && row[actualKey] !== undefined && row[actualKey] !== null && row[actualKey] !== ''){
-      return row[actualKey];
-    }
-  }
-  return null;
-}
-
-function fieldsFor(row){
   return {
-    name: getVal(row, ["Vista Name","Property Name","vista_name","property_name"]) || "Unnamed property",
-    // this sheet has no "Owner Facing Account Manager" column in some imports — POC is the closest stand-in for KAM
-    owner: (getVal(row, ["POC","Owner Facing Account Manager","poc"]) || "").toString().trim() || "Unassigned",
-    status: (getVal(row, ["Current Status","current_status","Property Current Status"]) || "").toString().trim() || "Unknown",
-    kickoff: getVal(row, ["Live date","Live Date","live_date"]) || "—",
-    endDateRaw: getVal(row, ["Agreement end date","Agreement End Date","agreement_end_date"]) || null,
-    contractStatus: getVal(row, ["Contract status","Contract Status","contract_status"]) || "—",
-    squad: (getVal(row, ["Squad","squad","New Squad Mapping"]) || "").toString().trim() || "Unassigned",
-    city: (getVal(row, ["City","city"]) || "").toString().trim() || "—",
-    sentToOwnerRaw: SENT_DATE_KEY ? row[SENT_DATE_KEY] : null,
-    ownerResponse: RESPONSE_KEY ? (row[RESPONSE_KEY] || "").toString().trim() : "",
+    // KAM = the dedicated `kam` column the sync now writes (from "Owner Facing
+    // AM"), separate from POC. Falls back to Owner Facing headers if reading a
+    // sheet directly, but NEVER to POC.
+    kam: pick([
+      is('kam'),                                 // dedicated Supabase column
+      is('ownerfacingam'),                       // "Owner Facing AM" (exact)
+      has('ownerfacing', 'am'),
+      is('ownerfacingaccountmanager'),
+      has('ownerfacing', 'accountmanager'),
+      has('ownerfacing', 'manager'),
+      has('ownerfacing'),
+      is('kamname'),
+      has('key', 'accountmanager'),
+    ]),
+    // secondary Owner Facing column, used only to fill blanks in the primary.
+    // (Also never POC.)
+    kamAlt: pick([
+      has('ownerfacing', 'ops'),
+      has('ownerfacing', 'secondary'),
+      has('ownerfacing', 'backup'),
+    ]),
+    squad: pick([
+      is('squad'),
+      is('newsquadmapping'),
+      has('squad'),
+      is('city', 'cluster', 'region'),
+    ]),
+    // pre-signature states: Not Signed / Email Confirmation / Founder-Partner Approved
+    signing: pick([
+      is('contractsigningstatus'),
+      has('signing', 'status'),
+      has('contract', 'status'),
+      is('agreementstatus'),
+    ]),
+    // post-signature / current agreement status: Valid / To Expire / Expired.
+    // The AQ column is now "Current Contract Status".
+    lifecycle: pick([
+      is('currentcontractstatus'),
+      has('current', 'contract', 'status'),
+      is('contractlifecyclestatus'),
+      has('lifecycle', 'status'),
+      is('agreementstatus'),
+    ]),
+    endDate: pick([
+      is('agreementenddate'),
+      has('agreement', 'end'),
+      has('contract', 'end'),
+      has('expiry'), has('expiration'),
+    ]),
+    reason: pick([is('reasonnotsigned'), has('reason', 'signed'), has('reason')]),
+    property: pick([
+      is('vistaname'),
+      is('propertyname'),
+      has('vista', 'name'),
+      has('property', 'name'),
+      has('villa', 'name'),
+      is('name', 'title'),
+    ]),
+    url: pick([
+      is('villadetailslink'),
+      has('villa', 'link'),
+      has('details', 'link'),
+      is('googlelink'),
+      has('property', 'link'),
+      has('link'), has('url'),
+    ]),
+    agreementUrl: pick([is('agreementlink'), has('agreement', 'link')]),
+    // current_status carries Live / Delisted / Paused. Must NOT match
+    // "Current Contract Status" (the agreement column), so exclude "contract".
+    liveStatus: pick([
+      is('currentstatus'),
+      (c) => c.n.includes('current') && c.n.includes('status') && !c.n.includes('contract'),
+      is('livestatus', 'islive', 'live'),
+      has('live', 'status'),
+    ]),
+    liveDate:   pick([is('livedate'), has('live', 'date'), has('golive')]),
+    delistDate: pick([is('delistdate'), has('delist')]),
+    pauseDate:  pick([is('pausedate'), has('pause')]),
+    city:       pick([is('city'), has('city')]),
+    code:       pick([is('propertyid'), has('property', 'id'), is('propertycode', 'id')]),
+    // the *unit-level* name, used only to tell apart rows that share a Property ID
+    propertyName: pick([is('propertyname'), has('property', 'name')]),
   };
 }
 
-// Looks for a column that tracks "agreement sent to owner" and one that tracks the
-// owner's response, since column names vary and this app was never told the exact ones.
-function detectOwnerResponseColumns(){
-  SENT_DATE_KEY = null; RESPONSE_KEY = null;
-  if(!allRows.length) return;
-  const keys = Object.keys(allRows[0]);
-  SENT_DATE_KEY = keys.find(k => /sent/i.test(k) && /owner/i.test(k))
-    || keys.find(k => /sent/i.test(k) && /date/i.test(k))
-    || null;
-  RESPONSE_KEY = keys.find(k => /response/i.test(k)) || null;
+/**
+ * Map whatever the sheet says into the seven MIS buckets.
+ * Order matters: "Not Signed" is tested before "Signed", "To Expire" before
+ * "Expired", otherwise substrings swallow each other.
+ */
+function normalizeStatus(raw) {
+  const n = norm(raw);
+  if (!n) return '';
+  // "Not live yet" is a pre-agreement state in the Contract Status column;
+  // group it with Not Signed rather than dropping it to Unmapped.
+  if (n.includes('notliveyet') || n.includes('notyetlive')) return 'Not Signed';
+  if (n.includes('emailconfirm') || n.includes('confirmationemail') || n.includes('confirmationmail')) return 'Email Confirmation';
+  if (n.includes('founder') || n.includes('partnerapproved') || n.includes('partnerapproval')) return 'Founder/Partner Approved';
+  if (n.includes('notsigned') || n.includes('unsigned') || n.includes('yettosign') || n.includes('pendingsignature') || n.includes('nosign')) return 'Not Signed';
+  if (n.includes('toexpire') || n.includes('abouttoexpire') || n.includes('expiringsoon') || n.includes('nearingexpiry') || n.includes('duefor')) return 'To Expire';
+  if (n.includes('expired') || n.includes('lapsed')) return 'Expired';
+  if (n.includes('valid') || n.includes('signed') || n.includes('executed') || n.includes('active')) return 'Valid';
+  return '';
 }
 
-function buildStatusStyles(){
-  const counts = {};
-  allRows.forEach(row=>{
-    const s = fieldsFor(row).status;
-    counts[s] = (counts[s]||0)+1;
+/**
+ * The table has two status columns whose names differ only by capitalisation
+ * ("Contract status" and "Contract Status"), so the name tells us nothing about
+ * which is which. Work it out from the values instead: whichever column carries
+ * the pre-signature wording is the signing column, whichever carries the
+ * expiry wording is the lifecycle column.
+ */
+const PRE_SIGNATURE = ['Not Signed', 'Email Confirmation', 'Founder/Partner Approved'];
+const POST_SIGNATURE = ['Expired', 'To Expire'];
+
+function detectStatusColumns(raw) {
+  const keys = Object.keys(raw[0] || {});
+  const candidates = keys.filter((k) => {
+    const n = norm(k);
+    // The AQ column is now "Current Contract Status" — keep any column that
+    // mentions "contract" or "agreement" (these are the status columns), and
+    // only exclude the live/delisted column, which is "current status" WITHOUT
+    // the word "contract".
+    const isLiveStatus = n.includes('current') && n.includes('status') && !n.includes('contract') && !n.includes('agreement');
+    if (isLiveStatus) return false;
+    return (n.includes('status') || n.includes('contract') || n.includes('agreement'))
+      && !n.includes('date')
+      && !n.includes('link');
   });
-  const sorted = Object.entries(counts).sort((a,b)=>b[1]-a[1]);
-  const top = sorted.slice(0,6).map(e=>e[0]);
-  STATUS_STYLE = {};
-  top.forEach((s,i)=>{ STATUS_STYLE[s.toLowerCase()] = STATUS_PALETTE[i % STATUS_PALETTE.length]; });
-  KPI_ORDER = top.map(s=>s.toLowerCase());
-  KPI_LABELS = {};
-  top.forEach(s=>{ KPI_LABELS[s.toLowerCase()] = s; });
-}
-function statusKey(status){
-  const s = (status||'').toString().trim().toLowerCase();
-  return STATUS_STYLE[s] ? s : 'other';
-}
-function styleFor(key){ return STATUS_STYLE[key] || OTHER_STYLE; }
 
-// Live/Delisted get a fixed semantic color regardless of palette rank; everything else
-// keeps its dynamically-assigned palette color.
-function semanticStyleFor(key){
-  const label = (KPI_LABELS[key]||'').toLowerCase();
-  if(label.includes('live')) return { dot:'#3f7d5c', fg:'#1f5c37' };
-  if(label.includes('delist')) return { dot:'#a13f30', fg:'#7a2318' };
-  const st = styleFor(key);
-  return { dot: st.dot, fg: st.fg };
-}
-function hexMix(hex, pct){
-  const h = hex.replace('#','');
-  const r = parseInt(h.substring(0,2),16), g = parseInt(h.substring(2,4),16), b = parseInt(h.substring(4,6),16);
-  const mr = Math.round(r + (255-r)*pct), mg = Math.round(g + (255-g)*pct), mb = Math.round(b + (255-b)*pct);
-  return `rgb(${mr},${mg},${mb})`;
+  const sample = raw.length > 3000 ? raw.slice(0, 3000) : raw;
+  const scored = candidates.map((key) => {
+    let pre = 0, post = 0, valid = 0, mapped = 0, filled = 0, signedExact = 0;
+    for (const r of sample) {
+      const v = r[key];
+      if (!clean(v)) continue;
+      filled += 1;
+      // "Signed" (but not "Not Signed") only ever appears in the signing column
+      const n = norm(v);
+      if (n === 'signed') signedExact += 1;
+      const bucket = normalizeStatus(v);
+      if (!bucket) continue;
+      mapped += 1;
+      if (PRE_SIGNATURE.indexOf(bucket) !== -1) pre += 1;
+      else if (POST_SIGNATURE.indexOf(bucket) !== -1) post += 1;
+      else if (bucket === 'Valid') valid += 1;
+    }
+    return { key, pre, post, valid, mapped, filled, signedExact };
+  }).filter((c) => c.mapped > 0 || c.signedExact > 0);
+
+  const best = (metric) => scored.slice()
+    .sort((a, b) => b[metric] - a[metric] || b.mapped - a.mapped)[0];
+
+  // The signing column is the one that actually contains the literal "Signed".
+  // Only if none does do we fall back to the pre-signature heuristic.
+  const signedCol = scored.slice().sort((a, b) => b.signedExact - a.signedExact)[0];
+  const signingBest = (signedCol && signedCol.signedExact > 0) ? signedCol : best('pre');
+
+  // Lifecycle = the CURRENT contract status column (AQ). It's the one with
+  // post-signature values (Expired / To Expire); if none stands out, it's the
+  // status column that ISN'T the signing column. Never leave it null when a
+  // status column exists, or every row falls through to Unmapped.
+  let lifecycleBest = best('post');
+  if (!lifecycleBest || lifecycleBest.post === 0) {
+    lifecycleBest = scored.find((c) => !signingBest || c.key !== signingBest.key) || scored[0];
+  }
+
+  return {
+    signing: signingBest ? signingBest.key : (scored[0] ? scored[0].key : null),
+    lifecycle: lifecycleBest ? lifecycleBest.key : null,
+    scored,
+  };
 }
 
-function daysRemaining(endDateRaw){
-  if(!endDateRaw) return null;
-  const end = new Date(endDateRaw);
-  if(isNaN(end.getTime())) return null;
-  const today = new Date(); today.setHours(0,0,0,0);
-  end.setHours(0,0,0,0);
-  return Math.round((end - today) / 86400000);
+const DAY = 86400000;
+// Parse a date value that may be: a real date string ('2025-06-15'),
+// a spreadsheet SERIAL NUMBER ('45254' = days since 1899-12-30), or blank.
+// Serial numbers must be handled explicitly — new Date('45254') wrongly yields
+// the YEAR 45254, which silently drops the row from FY windows.
+function parseDate(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const s = String(v).trim();
+  if (s === '') return null;
+  // pure number (optionally "45254.0") = spreadsheet serial date
+  if (/^[0-9]+(\.0+)?$/.test(s)) {
+    const serial = Math.floor(Number(s));
+    // plausible serial-date range (~1900-01-01 to ~2100); avoids treating a real
+    // 4-digit year or an id as a serial by mistake
+    if (serial >= 1 && serial <= 80000) {
+      const ms = Date.UTC(1899, 11, 30) + serial * 86400000;
+      const d = new Date(ms);
+      return Number.isNaN(d.getTime()) ? null : d;
+    }
+  }
+  const d = new Date(s);
+  return Number.isNaN(d.getTime()) ? null : d;
 }
-function urgencyLevel(endDateRaw){
-  const d = daysRemaining(endDateRaw);
-  if(d === null) return null;
-  if(d < 0) return 'expired';   // agreement end date has already passed — distinct from "expiring soon"
-  if(d <= 7) return 'red';
-  if(d <= 30) return 'orange';
+
+/**
+ * The MIS "Agreement status" is not one column in this table — it is the
+ * signing state until a contract exists, then the lifecycle state, then the
+ * end date. Resolved in that order, and the Connection check tab reports which
+ * source each row actually used.
+ */
+function resolveAgreementStatus(row, cols, now, windowDays) {
+  // Count purely from the CURRENT contract status column (AQ / "Contract Status",
+  // capital S), taken at face value. Column N ("Contract status", small s) is the
+  // historical entry status and is intentionally ignored.
+  const current = normalizeStatus(cols.lifecycle ? row[cols.lifecycle] : '');
+  if (current) return { status: current, source: cols.lifecycle };
+  return { status: UNMAPPED, source: null };
+}
+
+/**
+ * Live / not live / unknown.
+ *
+ * Deliberately strict: a row is only live if something actually says so. An
+ * unreadable status used to fall through to "has a live date, therefore live",
+ * which quietly inflated the live count above what the sheet reports.
+ */
+function resolveLive(row, cols, now) {
+  // Match the sheet's definition exactly: a property is live if, and only if,
+  // its Current Status column says "Live". No delist-date or live-date
+  // inference — that used to add rows the sheet's Current Status filter excludes.
+  const label = norm(cols.liveStatus ? row[cols.liveStatus] : '');
+  if (!label) return null;              // no status value → unknown, not counted live
+  return label === 'live';              // only exactly "Live" counts
+}
+
+/**
+ * Values drift in case and spacing too — "Goa", "GOA", "goa " and "Ooty-Coorg"
+ * vs "Ooty Coorg" are all the same squad. Group them on a normalised key and
+ * display whichever spelling appears most often, so a single squad can never
+ * split into two rows of the pivot.
+ */
+function buildCanonicalizer(raw, column) {
+  const groups = new Map();
+  if (!column) return () => BLANK;
+
+  for (const r of raw) {
+    const value = clean(r[column]);
+    if (!value) continue;
+    const key = norm(value);
+    if (!groups.has(key)) groups.set(key, new Map());
+    const spellings = groups.get(key);
+    spellings.set(value, (spellings.get(value) || 0) + 1);
+  }
+
+  const chosen = new Map();
+  for (const [key, spellings] of groups) {
+    const best = [...spellings.entries()].sort((a, b) => b[1] - a[1] || cmp(a[0], b[0]))[0][0];
+    chosen.set(key, best);
+  }
+
+  return (v) => {
+    const value = clean(v);
+    if (!value) return BLANK;
+    return chosen.get(norm(value)) || value;
+  };
+}
+
+function normalizeRows(raw, cols) {
+  const canonKam   = buildCanonicalizer(raw, cols.kam);
+  const canonKamAlt = buildCanonicalizer(raw, cols.kamAlt);
+  const canonSquad = buildCanonicalizer(raw, cols.squad);
+  const now = new Date();
+
+  return raw.map((r, i) => {
+    const agreement = resolveAgreementStatus(r, cols, now, EXPIRY_WINDOW_DAYS);
+    return {
+      __i: i,
+      __kam:      (() => {
+        const primary = canonKam(cols.kam ? r[cols.kam] : '');
+        if (primary !== BLANK) return primary;
+        const alt = cols.kamAlt && cols.kamAlt !== cols.kam ? canonKamAlt(r[cols.kamAlt]) : BLANK;
+        return alt;
+      })(),
+      __squad:    canonSquad(cols.squad ? r[cols.squad] : ''),
+      __statusRaw: [cols.signing && clean(r[cols.signing]), cols.lifecycle && clean(r[cols.lifecycle])].filter(Boolean).join(' / '),
+      __status:   agreement.status,
+      __source:   agreement.source,
+      __property: clean(cols.property ? r[cols.property] : '') || '—',
+      __city:     clean(cols.city     ? r[cols.city]     : ''),
+      __code:     clean(cols.code     ? r[cols.code]     : ''),
+      __url:      clean(cols.url      ? r[cols.url]      : ''),
+      __agreementUrl: clean(cols.agreementUrl ? r[cols.agreementUrl] : ''),
+      __reason:   clean(cols.reason   ? r[cols.reason]   : ''),
+      __endDate:  cols.endDate ? clean(r[cols.endDate]) : '',
+      __liveDateObj: parseDate(cols.liveDate ? r[cols.liveDate] : null),
+      __endDateObj:  parseDate(cols.endDate ? r[cols.endDate] : null),
+      __delistObj:   parseDate(cols.delistDate ? r[cols.delistDate] : null),
+      __live:     resolveLive(r, cols, now),
+      // "new property, no agreement yet": live, but validity AND signing blank
+      __newNoAgreement: (() => {
+        const val = cols.lifecycle ? clean(r[cols.lifecycle]) : '';
+        const sig = cols.signing ? clean(r[cols.signing]) : '';
+        return !val && !sig;
+      })(),
+      __raw: r,
+    };
+  });
+  // No deduplication: the dashboard counts every row exactly as the sheet does,
+  // so the live total matches the sheet's filtered row count (e.g. 1,219).
+}
+
+
+const authHeaders = () => ({
+  apikey: SUPABASE_KEY,
+  Authorization: `Bearer ${SUPABASE_KEY}`,
+});
+
+/**
+ * Postgres table names ARE case-sensitive over PostgREST: a table actually
+ * called "Agreement Track" will 404 if .env says "agreement track". So ask the
+ * API which tables exist and match on a normalised key.
+ */
+async function listTables() {
+  try {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/`, { headers: authHeaders() });
+    if (!res.ok) return [];
+    const doc = await res.json();
+    const fromDefs  = Object.keys(doc.definitions || {});
+    const fromPaths = Object.keys(doc.paths || {}).map((p) => p.replace(/^\//, ''));
+    return [...new Set([...fromDefs, ...fromPaths])].filter((t) => t && !t.startsWith('rpc/'));
+  } catch {
+    return [];
+  }
+}
+
+// fetch that gives up after `ms` so a stalled request shows an error instead
+// of spinning on "Loading" forever.
+async function fetchWithTimeout(url, options = {}, ms = 45000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      throw new Error(`The request to Supabase took longer than ${Math.round(ms / 1000)}s and was stopped. The table may be very large or the connection is slow — try Refresh, or check your network.`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Fetch one page, retrying a couple of times if a chunk times out or hiccups,
+// so a single slow moment doesn't fail the whole load.
+async function fetchPageWithRetry(url, options, attempts = 3) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fetchWithTimeout(url, options);
+    } catch (e) {
+      lastErr = e;
+      if (i < attempts - 1) await new Promise((r) => setTimeout(r, 800 * (i + 1)));
+    }
+  }
+  throw lastErr;
+}
+
+async function probeTable(name) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${encodeURIComponent(name)}?select=*&limit=1`, {
+    headers: authHeaders(),
+  });
+  return { ok: res.ok, status: res.status, body: res.ok ? '' : await res.text().catch(() => '') };
+}
+
+/** Fetch every row, 1000 at a time. Without this the tabs silently cap at 1000. */
+async function fetchTable(tableName) {
+  // Best-effort read of an optional table; returns [] if it isn't there yet.
+  if (!SUPABASE_URL || !SUPABASE_KEY) return [];
+  try {
+    const out = [];
+    let from = 0;
+    for (let guard = 0; guard < 40; guard++) {
+      const res = await fetch(`${SUPABASE_URL}/rest/v1/${encodeURIComponent(tableName)}?select=*`, {
+        headers: { ...authHeaders(), 'Range-Unit': 'items', Range: `${from}-${from + PAGE_SIZE - 1}` },
+      });
+      if (!res.ok) return out;
+      const batch = await res.json();
+      out.push(...batch);
+      if (batch.length < PAGE_SIZE) break;
+      from += PAGE_SIZE;
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+
+
+async function fetchAllRows(diag) {
+  if (!SUPABASE_URL || !SUPABASE_KEY) {
+    throw new Error('Missing VITE_SUPABASE_URL or VITE_SUPABASE_ANON_KEY. Check .env (or Vercel → Settings → Environment Variables) and redeploy.');
+  }
+
+  diag.projectUrl = SUPABASE_URL;
+  diag.tableRequested = SUPABASE_TABLE;
+  diag.tableUsed = SUPABASE_TABLE;
+  diag.tableAutoCorrected = false;
+
+  // 1. try the configured name
+  let probe = await probeTable(SUPABASE_TABLE);
+  diag.httpStatus = probe.status;
+
+  // 2. if it isn't there, find it case-insensitively among the real tables
+  if (!probe.ok) {
+    diag.availableTables = await listTables();
+    const match = diag.availableTables.find((t) => norm(t) === norm(SUPABASE_TABLE));
+    if (match) {
+      diag.tableUsed = match;
+      diag.tableAutoCorrected = match !== SUPABASE_TABLE;
+      probe = await probeTable(match);
+      diag.httpStatus = probe.status;
+    }
+  }
+
+  if (!probe.ok) {
+    const hint = diag.availableTables && diag.availableTables.length
+      ? ` Tables this key can see: ${diag.availableTables.join(', ')}.`
+      : ' The key could not list any tables, which usually means the anon key is wrong or Row Level Security blocks everything.';
+    throw new Error(`Supabase returned ${probe.status} for “${SUPABASE_TABLE}”.${hint} ${probe.body.slice(0, 200)}`);
+  }
+
+  const endpoint = `${SUPABASE_URL}/rest/v1/${encodeURIComponent(diag.tableUsed)}?select=*`;
+  diag.endpoint = endpoint;
+
+  const out = [];
+  let from = 0;
+
+  for (let guard = 0; guard < 120; guard++) {
+    const res = await fetchPageWithRetry(endpoint, {
+      headers: {
+        ...authHeaders(),
+        'Range-Unit': 'items',
+        Range: `${from}-${from + PAGE_SIZE - 1}`,
+        Prefer: 'count=planned',
+      },
+    });
+
+    diag.httpStatus = res.status;
+
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`Supabase returned ${res.status} while reading rows. ${body.slice(0, 240)}`);
+    }
+
+    const batch = await res.json();
+    out.push(...batch);
+    diag.requests = (diag.requests || 0) + 1;
+
+    const total = Number((res.headers.get('content-range') || '').split('/')[1]);
+    if (Number.isFinite(total)) diag.reportedTotal = total;
+    if (batch.length < PAGE_SIZE) break;
+    if (Number.isFinite(total) && out.length >= total) break;
+    from += PAGE_SIZE;
+  }
+
+  diag.rowsFetched = out.length;
+  return out;
+}
+
+/* 5 ------------------------------------------------------- state + routing --- */
+
+const VIEWS = [
+  { id: 'overview',        label: 'Live Properties',    group: 'Summary' },
+  { id: 'squad',           label: 'Squad-wise',         group: 'Summary' },
+  { id: 'kam',             label: 'KAM-wise',           group: 'Summary' },
+  { id: 'monthly-churn',   label: 'Monthly churn',      group: 'Summary' },
+  { id: 'properties',      label: 'Property Details',   group: 'Detail'  },
+  { id: 'help',            label: 'Help & How it works', group: 'Detail'  },
+];
+
+/* Counts and Valid % tabs are gone — every summary is card-based now. */
+const SUBTABS = {
+  overview:        [],
+  squad:           [],
+  kam:             [],
+  properties:      [],   // status filtering comes from the cards + the STATUS filter
+  diagnostics: [
+    { id: 'connection', label: 'Connection' },
+    { id: 'columns',    label: 'Columns' },
+    { id: 'values',     label: 'Status values' },
+    { id: 'raw',        label: 'Sample row' },
+  ],
+};
+
+const state = {
+  user: null,
+  rows: [],
+  raw: [],
+  churnAnalysis: [],
+  gcfMarginal: [],
+  momChurn: [],
+  caSquad: null,
+  caMonth: null,
+  caKam: null,
+  cd: {},
+  cdFilters: {},
+  cdReturn: 'squad',
+  cdPage: 1,
+  mlFilter: {},
+  mlReturn: 'overview',
+  mlPage: 1,
+  mcSquad: null,
+  mcMonth: null,
+  mcYear: null,
+  mcFy: null,
+  cols: {},
+  diag: {},
+  loading: true,
+  refreshing: false,
+  loadedAt: null,
+  error: null,
+  view: 'overview',
+  sub: 'snapshot',
+  filters: { squads: [], kams: [], statuses: [], newNoAgreement: false, expiring30: false },
+  period: { month: '', year: '' },   // filter on live_date
+  search: '',
+  focus: false,        // drilled-in view: back button shown, summary cards hidden
+  returnTo: null,      // where the Back button returns to
+  sort: {}, // per view: { key, dir }
+  page: {}, // per view: current page of the property list
+};
+
+const EXTRA_VIEWS = ['churned', 'churn-detail', 'churn-rate', 'master-list', 'monthly-churn', 'monthly-churn-detail', 'diagnostics'];
+const validView = (v) => (v === 'live-properties') ? 'overview'
+  : (VIEWS.some((x) => x.id === v) || EXTRA_VIEWS.includes(v)) ? v : 'overview';
+
+function defaultSub(view) {
+  const subs = SUBTABS[view] || [];
+  return subs.length ? subs[0].id : '';
+}
+
+function readUrl() {
+  const p = new URLSearchParams(location.search);
+  state.view = validView(p.get('view') || 'overview');
+  const subs = SUBTABS[state.view] || [];
+  const sub = p.get('tab');
+  state.sub = subs.some((s) => s.id === sub) ? sub : defaultSub(state.view);
+  const split = (v) => (v ? v.split('~').map(clean).filter(Boolean) : []);
+  state.filters.squads   = split(p.get('squad'));
+  state.filters.kams     = split(p.get('kam'));
+  state.filters.statuses = split(p.get('status'));
+  state.period.month = p.get('m') || '';
+  state.period.year  = p.get('y') || '';
+  // the top month filter (numeric 1-12) also drives the churn section's month.
+  // Always resync from the URL — including clearing it when no month is set, so
+  // a stale month can't linger on pages where none was chosen.
+  if (state.period.month) {
+    const n = Number(state.period.month);
+    state.caMonth = (n >= 1 && n <= 12) ? MONTH_NAMES[n - 1] : null;
+  } else {
+    state.caMonth = null;
+  }
+  state.search = p.get('q') || '';
+  state.focus = p.get('focus') === '1';
+  state.filters.newNoAgreement = p.get('newna') === '1';
+  state.filters.expiring30 = p.get('exp30') === '1';
+  state.caSquad = p.get('casquad') || null;
+  state.caKam = p.get('cakam') || null;
+  state.cd = {
+    gcfLow: p.get('cgcf') === '1',
+    initiatedBy: p.get('cby') || null,
+    fnb: p.get('cfnb') || null,
+    reason: p.get('creason') || null,
+  };
+}
+
+function urlFor(view, sub) {
+  const p = new URLSearchParams();
+  if (view && view !== 'overview') p.set('view', view);
+  const s = sub || (view === state.view ? state.sub : defaultSub(view));
+  if (s && s !== defaultSub(view)) p.set('tab', s);
+  if (state.filters.squads.length)   p.set('squad',  state.filters.squads.join('~'));
+  if (state.filters.kams.length)     p.set('kam',    state.filters.kams.join('~'));
+  if (state.filters.statuses.length) p.set('status', state.filters.statuses.join('~'));
+  if (state.period.month) p.set('m', state.period.month);
+  if (state.period.year)  p.set('y', state.period.year);
+  if (state.search) p.set('q', state.search);
+  if (state.focus) p.set('focus', '1');
+  if (state.filters.newNoAgreement) p.set('newna', '1');
+  if (state.filters.expiring30) p.set('exp30', '1');
+  if (state.caSquad) p.set('casquad', state.caSquad);
+  if (state.caKam) p.set('cakam', state.caKam);
+  const qs = p.toString();
+  return qs ? `?${qs}` : location.pathname;
+}
+
+function syncUrl() {
+  history.replaceState(null, '', urlFor(state.view, state.sub));
+}
+
+// Simple navigation history so "back" always returns to the actual previous
+// page, however deep you drill. Each entry captures the view + the scope needed
+// to reconstruct it (filters, churn drill state, master-list filter).
+const navStack = [];
+
+function pushNav() {
+  navStack.push({
+    view: state.view,
+    filters: JSON.parse(JSON.stringify(state.filters)),
+    search: state.search,
+    focus: state.focus,
+    caSquad: state.caSquad, caKam: state.caKam, caMonth: state.caMonth,
+    cd: state.cd ? { ...state.cd } : {},
+    cdFilters: state.cdFilters ? { ...state.cdFilters } : {},
+    mlFilter: state.mlFilter ? { ...state.mlFilter } : {},
+  });
+  if (navStack.length > 50) navStack.shift();   // keep it bounded
+}
+
+function goBackHistory(fallback = 'overview') {
+  const prev = navStack.pop();
+  if (!prev) { go(fallback); return; }
+  state.filters = prev.filters;
+  state.search = prev.search;
+  state.focus = prev.focus;
+  state.caSquad = prev.caSquad; state.caKam = prev.caKam; state.caMonth = prev.caMonth;
+  state.cd = prev.cd; state.cdFilters = prev.cdFilters; state.mlFilter = prev.mlFilter;
+  state.page = {};
+  state.view = validView(prev.view);
+  state.sub = defaultSub(state.view);
+  syncUrl();
+  render();
+  window.scrollTo({ top: 0, behavior: 'auto' });
+}
+
+function go(view, sub) {
+  if (view !== state.view) state.page = {};
+  state.view = validView(view);
+  state.sub = sub || defaultSub(state.view);
+  closeDrawer();
+  syncUrl();
+  render();
+  window.scrollTo({ top: 0, behavior: 'auto' });
+}
+
+/** Return from a drilled-in card view to wherever the click came from. */
+function goBack() {
+  // prefer the navigation history stack (reliable for deep drills)
+  if (navStack.length) { goBackHistory('overview'); return; }
+  const r = state.returnTo;
+  state.focus = false;
+  state.returnTo = null;
+  state.page = {};
+  if (r) {
+    state.filters = r.filters;
+    state.search = r.search;
+    state.view = validView(r.view);
+  } else {
+    // opened directly via a focus URL (e.g. Ctrl-click tab) → go to the summary
+    state.filters = { squads: [], kams: [], statuses: [] };
+    state.search = '';
+    state.view = 'overview';
+  }
+  state.sub = defaultSub(state.view);
+  syncUrl();
+  render();
+  window.scrollTo({ top: 0, behavior: 'auto' });
+}
+
+/* 6 ------------------------------------------------- filtering & aggregation - */
+
+function matchesSearch(r, q) {
+  if (!q) return true;
+  const needle = q.toLowerCase();
+  return [r.__property, r.__kam, r.__squad, r.__status, r.__code]
+    .some((v) => String(v).toLowerCase().includes(needle));
+}
+
+/** Rows matching every filter except `skip` — used for cross-filtered counts. */
+function inPeriod(r) {
+  const { month, year } = state.period;
+  if (!month && !year) return true;
+  const d = r.__liveDateObj;
+  if (!d) return false;   // no live date can't match a period filter
+  if (year && String(d.getFullYear()) !== String(year)) return false;
+  if (month && String(d.getMonth() + 1) !== String(month)) return false;
+  return true;
+}
+
+function filterRows(skip = null) {
+  const { squads, kams, statuses } = state.filters;
+  return state.rows.filter((r) =>
+    (skip === 'squad'  || !squads.length   || squads.includes(r.__squad)) &&
+    (skip === 'kam'    || !kams.length     || kams.includes(r.__kam)) &&
+    (skip === 'status' || !statuses.length || statuses.includes(r.__status)) &&
+    (!state.filters.liveOnly || r.__live === true) &&
+    (skip === 'newna'  || !state.filters.newNoAgreement || r.__newNoAgreement) &&
+    (!state.filters.expiring30 || (r.__live === true && r.__endDateObj && r.__endDateObj >= new Date() && r.__endDateObj <= new Date(Date.now() + 30 * MS_DAY))) &&
+    (skip === 'period' || inPeriod(r)) &&
+    (skip === 'search' || matchesSearch(r, state.search))
+  );
+}
+
+function activeRows() { return filterRows(null); }
+
+function hasAnyFilter() {
+  const f = state.filters;
+  return !!(f.squads.length || f.kams.length || f.statuses.length || f.newNoAgreement || f.expiring30 || state.period.month || state.period.year || state.search);
+}
+
+/** All statuses actually present, in MIS order, plus Unmapped only if it occurs. */
+function statusColumns(rows) {
+  const seen = new Set(rows.map((r) => r.__status));
+  const cols = STATUS_ORDER.slice();
+  if (seen.has(UNMAPPED)) cols.push(UNMAPPED);
+  return cols;
+}
+
+function uniqueValues(field, skip) {
+  const rows = filterRows(skip);
+  const counts = new Map();
+  for (const r of rows) counts.set(r[field], (counts.get(r[field]) || 0) + 1);
+  // every option stays listed even at zero, so a selection is never invisible
+  for (const r of state.rows) if (!counts.has(r[field])) counts.set(r[field], 0);
+  return [...counts.entries()]
+    .map(([value, count]) => ({ value, count }))
+    .sort((a, b) => cmp(a.value, b.value));
+}
+
+/* 7 ----------------------------------------------------------- UI primitives - */
+
+/**
+ * Multi-select dropdown: search, select-all/clear, live counts, and a trigger
+ * that always shows what's currently chosen.
+ */
+function multiSelect({ key, label, options, selected, onChange }) {
+  const wrap = el('div', { class: 'ms' });
+  const panelId = `ms-${key}-panel`;
+
+  const valueSpan = el('span', { class: 'ms-value' });
+  const badge = el('span', { class: 'ms-badge' });
+  const trigger = el('button', {
+    type: 'button',
+    class: 'ms-trigger',
+    'aria-haspopup': 'listbox',
+    'aria-expanded': 'false',
+    'aria-controls': panelId,
+  }, [
+    el('span', { class: 'ms-key', text: label }),
+    valueSpan,
+    badge,
+    el('span', { class: 'ms-caret', text: '▾' }),
+  ]);
+
+  function paintTrigger() {
+    const n = selected.length;
+    wrap.classList.toggle('has-selection', n > 0);
+    badge.style.display = n ? '' : 'none';
+    badge.textContent = String(n);
+    if (n === 0)      valueSpan.textContent = 'All';
+    else if (n === 1) valueSpan.textContent = selected[0];
+    else if (n === 2) valueSpan.textContent = selected.join(', ');
+    else              valueSpan.textContent = `${selected[0]} +${n - 1} more`;
+    trigger.title = n ? `${label}: ${selected.join(', ')}` : `${label}: all`;
+  }
+
+  const search = el('input', { class: 'ms-search', type: 'search', placeholder: `Search ${label.toLowerCase()}…`, 'aria-label': `Search ${label}` });
+  const countLabel = el('span', { class: 'ms-count' });
+  const list = el('div', { class: 'ms-list', role: 'listbox', 'aria-multiselectable': 'true' });
+
+  const selectAll = el('button', { type: 'button', text: 'Select all' });
+  const clearAll  = el('button', { type: 'button', text: 'Clear' });
+
+  const panel = el('div', { class: 'ms-panel', id: panelId, hidden: true }, [
+    search,
+    el('div', { class: 'ms-actions' }, [selectAll, clearAll, countLabel]),
+    list,
+  ]);
+
+  function paintList() {
+    const q = search.value.trim().toLowerCase();
+    const shown = options.filter((o) => !q || o.value.toLowerCase().includes(q));
+    list.replaceChildren();
+
+    if (!shown.length) {
+      list.append(el('div', { class: 'ms-empty', text: 'No matches' }));
+    } else {
+      for (const o of shown) {
+        const box = el('input', { type: 'checkbox', checked: selected.includes(o.value) });
+        box.addEventListener('change', () => {
+          if (box.checked) { if (!selected.includes(o.value)) selected.push(o.value); }
+          else selected.splice(selected.indexOf(o.value), 1);
+          paintTrigger();
+          countLabel.textContent = `${selected.length} selected`;
+          onChange(selected.slice());
+        });
+        list.append(el('label', { class: 'ms-opt', role: 'option', 'aria-selected': selected.includes(o.value) }, [
+          box,
+          el('span', { class: 'opt-label', text: o.value, title: o.value }),
+          el('span', { class: 'opt-count', text: fmtInt(o.count) }),
+        ]));
+      }
+    }
+    countLabel.textContent = `${selected.length} selected`;
+  }
+
+  selectAll.addEventListener('click', () => {
+    const q = search.value.trim().toLowerCase();
+    const pool = options.filter((o) => !q || o.value.toLowerCase().includes(q)).map((o) => o.value);
+    selected = [...new Set([...selected, ...pool])];
+    paintTrigger(); paintList(); onChange(selected.slice());
+  });
+
+  clearAll.addEventListener('click', () => {
+    selected = [];
+    paintTrigger(); paintList(); onChange(selected.slice());
+  });
+
+  search.addEventListener('input', paintList);
+  search.addEventListener('keydown', (e) => { if (e.key === 'Escape') { e.stopPropagation(); close(); } });
+
+  function open() {
+    document.querySelectorAll('.ms.open').forEach((m) => m !== wrap && m._close?.());
+    wrap.classList.add('open');
+    panel.hidden = false;
+    trigger.setAttribute('aria-expanded', 'true');
+    // keep the panel on-screen on narrow viewports
+    const room = window.innerWidth - wrap.getBoundingClientRect().left;
+    panel.classList.toggle('flip-right', room < 280 && window.innerWidth > 760);
+    paintList();
+    search.focus();
+  }
+  function close() {
+    wrap.classList.remove('open');
+    panel.hidden = true;
+    trigger.setAttribute('aria-expanded', 'false');
+    search.value = '';
+  }
+  wrap._close = close;
+
+  trigger.addEventListener('click', () => (panel.hidden ? open() : close()));
+  wrap.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !panel.hidden) { close(); trigger.focus(); } });
+
+  /* Refresh options/selection without rebuilding the node, so the panel can
+     stay open while several values are ticked. */
+  wrap._sync = (nextOptions, nextSelected) => {
+    options = nextOptions;
+    selected = nextSelected.slice();
+    paintTrigger();
+    if (!panel.hidden) paintList();
+  };
+
+  paintTrigger();
+  wrap.append(trigger, panel);
+  return wrap;
+}
+
+document.addEventListener('click', (e) => {
+  document.querySelectorAll('.ms.open').forEach((m) => { if (!m.contains(e.target)) m._close?.(); });
+});
+
+/** Sortable, frozen-first-column pivot table shared by the KAM and Squad tabs. */
+/* Rows per page in every property list. */
+const PAGE_ROWS = 25;
+
+function statusPill(status) {
+  const c = STATUS_COLOR[status] || '#d6cec2';
+  const dark = ['Valid', 'Expired'].includes(status);
+  return el('span', {
+    class: 'pill',
+    text: status,
+    style: `background:${c}; color:${dark ? '#fff' : '#1e1e1e'}`,
+  });
+}
+
+/* ---- links that open a filtered Property Details tab in this same browser -- */
+
+const DETAIL_TAB = 'vista-tracker-details';
+
+/** URL for Property Details pre-filtered by the given dimensions. */
+function detailHref({ status, squad, kam, live, newNoAgreement, expiring30 } = {}) {
+  const p = new URLSearchParams();
+  p.set('view', 'properties');   // drilled-in list always lives on Property Details
+  if (newNoAgreement) p.set('newna', '1');
+  if (expiring30) p.set('exp30', '1');
+  const squads   = squad ? [squad] : state.filters.squads;
+  const kams     = kam   ? [kam]   : state.filters.kams;
+  const statuses = status ? [status] : state.filters.statuses;
+  if (squads.length)   p.set('squad',  squads.join('~'));
+  if (kams.length)     p.set('kam',    kams.join('~'));
+  if (statuses.length) p.set('status', statuses.join('~'));
+  if (state.search) p.set('q', state.search);
+  p.set('focus', '1');   // marks a drilled-in view (back button, cards hidden)
+  return `${location.pathname}?${p.toString()}`;
+}
+
+/**
+ * Normal click → filter in place (fast, no new tab). It records where we came
+ * from so the Back button can return there, applies the card's filter, and
+ * jumps to Property Details. Modifier/middle clicks fall through to the browser
+ * so Ctrl/Cmd-click still opens the same URL in a genuine new tab.
+ */
+function cardClickHandler(filter) {
+  return (e) => {
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.button === 1) return; // let the browser open a new tab
+    e.preventDefault();
+
+    state.returnTo = { view: state.view, filters: JSON.parse(JSON.stringify(state.filters)), search: state.search };
+    pushNav();
+    if (filter.status) {
+      state.filters.statuses = [filter.status];
+    }
+    if (filter.squad)  state.filters.squads = [filter.squad];
+    if (filter.kam)    state.filters.kams = [filter.kam];
+    state.filters.newNoAgreement = !!filter.newNoAgreement;
+    state.filters.expiring30 = !!filter.expiring30;
+    // If the card is a live-only metric (status cards, new-no-agreement, etc.),
+    // force the list to live-only too so its count matches the card's count.
+    state.filters.liveOnly = !!filter.live;
+    state.focus = true;
+    state.page = {};
+    go('properties');   // the drilled-in list lives on Property Details
+  };
+}
+
+/**
+ * A clickable summary card. Normal click filters in place; Ctrl/Cmd-click opens
+ * the filtered view in another tab of the same browser window.
+ */
+function statCard({ label, value, sub, accent, filter, highlight }) {
+  const cls = ['stat', accent ? `accent-${accent}` : '', highlight ? 'stat-hero' : '', filter ? 'stat-link' : '']
+    .filter(Boolean).join(' ');
+  const body = [
+    el('div', { class: 's-label' }, [label, filter ? el('span', { class: 'ext', text: '↗' }) : null]),
+    el('div', { class: 's-value', text: value }),
+    sub ? el('div', { class: 's-sub', text: sub }) : null,
+  ];
+  if (!filter) return el('div', { class: cls }, body);
+  const a = el('a', {
+    class: cls,
+    href: detailHref(filter),
+    target: DETAIL_TAB,
+    title: 'Click to filter · Ctrl/Cmd-click to open in a new tab',
+  }, body);
+  a.addEventListener('click', cardClickHandler(filter));
+  return a;
+}
+
+/** The agreement status cards shown at the top of every summary page. */
+function statusCards(rows, { live } = {}) {
+  const statuses = statusColumns(rows);
+  const counts = Object.fromEntries(statuses.map((st) => [st, 0]));
+  for (const r of rows) counts[r.__status] = (counts[r.__status] || 0) + 1;
+  const total = rows.length;
+
+  const grid = el('div', { class: 'stat-grid' });
+  for (const st of statuses) {
+    const n = counts[st] || 0;
+    if (!n && st === UNMAPPED) continue;
+    grid.append(statCard({
+      label: st,
+      value: fmtInt(n),
+      sub: fmtPct(total ? n * 100 / total : null) + ' of scope',
+      accent: STATUS_ACCENT[st],
+      filter: { status: st, live },
+    }));
+  }
+  return grid;
+}
+
+const STATUS_ACCENT = {
+  'Valid': 'good',
+  'To Expire': 'warn',
+  'Expired': 'bad',
+  'Not Signed': 'bad',
+  'Email Confirmation': 'sky',
+  'Founder/Partner Approved': 'sage',
+  [UNMAPPED]: '',
+};
+
+/** Per-squad / per-KAM card: total plus a mini status breakdown. */
+function groupCard(entry, dimension) {
+  const filter = dimension === 'squad' ? { squad: entry.key } : { kam: entry.key };
+  const statuses = entry.statuses;
+
+  const bar = el('div', { class: 'mini-bar' });
+  for (const st of statuses) {
+    const n = entry.counts[st] || 0;
+    if (!n) continue;
+    bar.append(el('div', {
+      class: 'mini-seg',
+      style: `width:${n * 100 / entry.total}%; background:${STATUS_COLOR[st]}`,
+      title: `${st}: ${fmtInt(n)}`,
+    }));
+  }
+
+  const chips = statuses.filter((st) => entry.counts[st]).map((st) => el('span', { class: 'mini-chip' }, [
+    el('span', { class: 'mini-dot', style: `background:${STATUS_COLOR[st]}` }),
+    el('span', { class: 'mini-name', text: st }),
+    el('span', { class: 'mini-n', text: fmtInt(entry.counts[st]) }),
+  ]));
+
+  const card = el('a', {
+    class: 'group-card',
+    href: detailHref(filter),
+    target: DETAIL_TAB,
+    title: `Click to filter · Ctrl/Cmd-click for a new tab`,
+  }, [
+    el('div', { class: 'gc-head' }, [
+      el('div', { class: 'gc-name', text: entry.key }),
+      el('div', { class: 'gc-total' }, [fmtInt(entry.total), el('span', { class: 'ext', text: '↗' })]),
+    ]),
+    bar,
+    el('div', { class: 'gc-chips' }, chips),
+    el('div', { class: 'gc-foot' }, [
+      el('span', { text: `${fmtInt(entry.counts['Valid'] || 0)} valid` }),
+      el('span', { class: 'gc-pct', text: fmtPct(entry.validPct) }),
+    ]),
+  ]);
+  card.addEventListener('click', cardClickHandler(filter));
+  return card;
+}
+
+/* ---- paginated property list ------------------------------------------- */
+
+function pageKey() { return `${state.view}:${state.sub}`; }
+function currentPage() { return state.page[pageKey()] || 1; }
+function setPage(n) { state.page[pageKey()] = n; renderView(); }
+
+function pager(totalRows) {
+  const pages = Math.max(1, Math.ceil(totalRows / PAGE_ROWS));
+  const page = Math.min(currentPage(), pages);
+  const wrap = el('div', { class: 'pager' });
+  if (pages <= 1) {
+    wrap.append(el('span', { class: 'pager-info', text: `${fmtInt(totalRows)} properties` }));
+    return { wrap, page, pages };
+  }
+
+  const from = (page - 1) * PAGE_ROWS + 1;
+  const to = Math.min(page * PAGE_ROWS, totalRows);
+  wrap.append(el('span', { class: 'pager-info', text: `${fmtInt(from)}–${fmtInt(to)} of ${fmtInt(totalRows)}` }));
+
+  const btn = (label, target, disabled, current) => {
+    const b = el('button', {
+      type: 'button',
+      class: `pager-btn${current ? ' current' : ''}`,
+      disabled: disabled || undefined,
+      'aria-current': current ? 'page' : null,
+      text: label,
+    });
+    if (!disabled && !current) b.addEventListener('click', () => setPage(target));
+    return b;
+  };
+
+  const nums = [];
+  const push = (n) => nums.push(n);
+  push(1);
+  for (let n = page - 1; n <= page + 1; n++) if (n > 1 && n < pages) push(n);
+  if (pages > 1) push(pages);
+  const uniq = [...new Set(nums)].sort((a, b) => a - b);
+
+  const group = el('div', { class: 'pager-btns' }, [btn('‹', page - 1, page === 1)]);
+  let last = 0;
+  for (const n of uniq) {
+    if (n - last > 1) group.append(el('span', { class: 'pager-gap', text: '…' }));
+    group.append(btn(String(n), n, false, n === page));
+    last = n;
+  }
+  group.append(btn('›', page + 1, page === pages));
+  wrap.append(group);
+  return { wrap, page, pages };
+}
+
+/** Row-level property table. Restacks into cards under 540px via data-label. */
+function propertyList(rows, opts = {}) {
+  const { wrap: pagerEl, page } = pager(rows.length);
+  const slice = rows.slice((page - 1) * PAGE_ROWS, page * PAGE_ROWS);
+
+  const head = ['Property', 'Squad', 'KAM', 'Agreement status', 'Ends', 'Link'];
+  const body = slice.map((r) => el('tr', {}, [
+    el('td', { class: 'freeze', 'data-label': 'Property' }, [
+      r.__url
+        ? el('a', { class: 'link-out', href: r.__url, target: '_blank', rel: 'noopener noreferrer' }, [r.__property, el('span', { class: 'ext', text: '↗' })])
+        : r.__property,
+      r.__code ? el('div', { class: 'row-sub', text: r.__code }) : null,
+    ]),
+    el('td', { 'data-label': 'Squad', style: 'text-align:left', text: r.__squad }),
+    el('td', { 'data-label': 'KAM', style: 'text-align:left', text: r.__kam }),
+    el('td', { 'data-label': 'Agreement status', style: 'text-align:left', class: 'status-cell' }, [
+      statusPill(r.__status),
+      r.__reason ? el('div', { class: 'row-sub', text: r.__reason }) : null,
+    ]),
+    el('td', { 'data-label': 'Ends', style: 'text-align:left', text: r.__endDate || '–' }),
+    el('td', { 'data-label': 'Link', style: 'text-align:left' }, [
+      r.__agreementUrl
+        ? el('a', { class: 'link-out', href: r.__agreementUrl, target: '_blank', rel: 'noopener noreferrer' }, ['Agreement', el('span', { class: 'ext', text: '↗' })])
+        : el('span', { class: 'zero', text: '–' }),
+    ]),
+  ]));
+
+  const table = el('table', { class: 'grid stacked' }, [
+    el('thead', {}, [el('tr', {}, head.map((h, i) =>
+      el('th', { scope: 'col', class: i === 0 ? 'freeze' : '', style: 'text-align:left', text: h })))]),
+    el('tbody', {}, body.length ? body : [el('tr', {}, [el('td', { colspan: head.length, class: 'freeze', text: 'No properties match the current filters.' })])]),
+  ]);
+
+  const anyFilter = state.filters.squads.length || state.filters.kams.length || state.filters.statuses.length || state.filters.liveOnly || state.search || state.period.month || state.period.year;
+  return el('div', { class: 'panel' }, [
+    el('div', { class: 'panel-head' }, [
+      el('h3', { text: opts.title || 'Property details' }),
+      el('span', { class: `count-badge${anyFilter ? ' filtered' : ''}` }, [
+        el('strong', { text: fmtInt(rows.length) }),
+        el('span', { text: rows.length === 1 ? ' property' : ' properties' }),
+        anyFilter ? el('span', { class: 'count-sub', text: ' found' }) : null,
+      ]),
+    ]),
+    el('div', { class: 'table-wrap stacked-wrap' }, [table]),
+    pagerEl,
+  ]);
+}
+
+/* 8 -------------------------------------------------------------------- views */
+
+function pageHead(title, desc) {
+  return el('div', { class: 'page-head' }, [
+    el('h2', { text: title }),
+    desc ? el('p', { text: desc }) : null,
+  ]);
+}
+
+function sectionHead(title, hint) {
+  return el('div', { class: 'section-head' }, [
+    el('h3', { text: title }),
+    hint ? el('span', { class: 'hint', text: hint }) : null,
+  ]);
+}
+
+/** Aggregate rows by a dimension, newest MIS buckets included. */
+function groupBy(rows, field) {
+  const statuses = statusColumns(rows);
+  const map = new Map();
+  for (const r of rows) {
+    const key = r[field] || BLANK;
+    if (!map.has(key)) map.set(key, { key, total: 0, statuses, counts: Object.fromEntries(statuses.map((st) => [st, 0])) });
+    const e = map.get(key);
+    if (e.counts[r.__status] === undefined) e.counts[r.__status] = 0;
+    e.counts[r.__status] += 1;
+    e.total += 1;
+  }
+  return [...map.values()]
+    .map((e) => ({ ...e, validPct: e.total ? (e.counts['Valid'] || 0) * 100 / e.total : null }))
+    .sort((a, b) => b.total - a.total || cmp(a.key, b.key));
+}
+
+/* ---- business metrics (all derived from real columns only) --------------- */
+
+const MS_DAY = 86400000;
+
+function monthStart(d = new Date()) { return new Date(d.getFullYear(), d.getMonth(), 1); }
+
+/** Live agreements whose end date is within the next `days` days. */
+function expiringWithin(rows, days) {
+  const now = new Date();
+  const limit = new Date(now.getTime() + days * MS_DAY);
+  return rows.filter((r) => r.__live === true && r.__endDateObj && r.__endDateObj >= now && r.__endDateObj <= limit).length;
+}
+
+/** Properties that went live since the start of this calendar month. */
+function newLiveThisMonth(rows) {
+  const start = monthStart();
+  return rows.filter((r) => r.__live === true && r.__liveDateObj && r.__liveDateObj >= start).length;
+}
+
+/** Live properties needing attention: not signed, expired, or already lapsed. */
+function atRisk(rows) {
+  const now = new Date();
+  return rows.filter((r) => r.__live === true && (
+    r.__status === 'Not Signed' ||
+    r.__status === 'Expired' ||
+    (r.__endDateObj && r.__endDateObj < now)
+  )).length;
+}
+
+/** The row of quick-read insight cards shared across dashboard/squad/KAM. */
+function insightCards(scopeRows, { live }) {
+  const liveRows = scopeRows.filter((r) => r.__live === true);
+  const grid = el('div', { class: 'stat-grid insight-grid' });
+
+  grid.append(statCard({
+    label: 'Expiring in 30 days', value: fmtInt(expiringWithin(scopeRows, 30)),
+    sub: 'live agreements', accent: 'warn',
+    filter: { expiring30: true, live: true },
+  }));
+  grid.append(statCard({
+    label: 'New live this month', value: fmtInt(newLiveThisMonth(scopeRows)),
+    sub: 'went live since ' + monthStart().toLocaleDateString([], { month: 'short', day: 'numeric' }),
+    accent: 'sky',
+  }));
+  grid.append(statCard({
+    label: 'At-risk properties', value: fmtInt(atRisk(scopeRows)),
+    sub: 'not signed, expired or lapsed', accent: 'bad',
+  }));
+  grid.append(statCard({
+    label: 'Valid agreements', value: fmtInt(liveRows.filter((r) => r.__status === 'Valid').length),
+    sub: fmtPct(liveRows.length ? liveRows.filter((r) => r.__status === 'Valid').length * 100 / liveRows.length : null) + ' of live',
+    accent: 'good', filter: { status: 'Valid', live: true },
+  }));
+  return grid;
+}
+
+/**
+ * The prominent Live Properties + Churn pair shown at the top of the dashboard
+ * and, when a squad or KAM is selected, on those pages too.
+ */
+function heroStats(scopeRows, { label } = {}) {
+  const live = scopeRows.filter((r) => r.__live === true).length;
+  const total = scopeRows.length;
+
+  // Delisting rate = churned / (live + churned) * 100, computed from Supabase,
+  // FY 2025-26, scoped to the selected squad/KAM. Single source of truth.
+  const selectedSquad = state.filters.squads.length === 1 ? state.filters.squads[0] : null;
+  const selectedKam = state.filters.kams.length === 1 ? state.filters.kams[0] : null;
+  const month = state.caMonth || null;
+  const dr = delistingRate(selectedSquad, selectedKam, month);
+
+  // Churn RATE now comes from the MOM churn tab, by the agreed formula
+  // (churned ÷ live-at-beginning). Region = the selected squad, else India.
+  // Month selected → that month; year → sum of that year's months; nothing →
+  // sum of all months to date. KAM has no MOM row, so KAM scope shows no rate.
+  const momRegion = selectedKam ? null : (selectedSquad || 'India');
+  const momChurnRate = momRegion ? momRate(momRegion, month, state.period.year || null) : null;
+
+  // period label reflects the month/year filter (or the full window if none)
+  const periodLabel = (month || state.period.year)
+    ? [month, state.period.year].filter(Boolean).join(' ')
+    : 'to date';
+
+  let churn, churnSub, churnClickable;
+  if (momChurnRate !== null && momChurnRate !== undefined) {
+    churn = momChurnRate;
+    const who = selectedSquad ? selectedSquad : 'All India';
+    churnSub = month
+      ? `${who} · ${periodLabel} · churned ÷ live at month start`
+      : `${who} · cumulative monthly churn · ${periodLabel}`;
+    churnClickable = true;
+  } else if (dr.rate !== null) {
+    // fallback (e.g. KAM scope, or MOM tab empty) — old computed rate
+    churn = dr.rate;
+    const who = selectedKam ? selectedKam : selectedSquad ? selectedSquad : 'All India';
+    churnSub = `${fmtInt(dr.churned)} churned · ${who} · ${periodLabel}`;
+    churnClickable = true;
+  } else {
+    churn = null;
+    churnSub = 'no churn data';
+    churnClickable = false;
+  }
+
+  // Two-FY display: current FY big, previous FY small. Only when no specific
+  // month/year is selected (a picked month/year narrows to that period instead).
+  const region = momRegion || 'India';
+  const showTwoFY = !month && !state.period.year && !selectedKam;
+  const curFy = fyStartYear(new Date());
+  const prevFy = curFy - 1;
+
+  let churnInner;
+  if (showTwoFY) {
+    const cur = fyChurnRate(region, curFy);
+    const prev = fyChurnRate(region, prevFy);
+    churnInner = [
+      el('div', { class: 's-label' }, ['Churn rate', el('span', { class: 'ext', text: ' ↗' })]),
+      el('div', { class: 'hero-num', text: cur.rate !== null ? fmtPct(cur.rate) : '—' }),
+      el('div', { class: 's-sub' }, [
+        el('strong', { text: fyLabel(curFy) }),
+        el('span', { text: ' (current) · cumulative to date' }),
+      ]),
+      el('div', { class: 's-sub prev-fy' }, [
+        el('span', { text: `${fyLabel(prevFy)}: ` }),
+        el('strong', { text: prev.rate !== null ? fmtPct(prev.rate) : '—' }),
+        el('span', { text: ' (full year)' }),
+      ]),
+    ];
+    churnClickable = cur.rate !== null || prev.rate !== null;
+  } else {
+    churnInner = [
+      el('div', { class: 's-label' }, ['Churn rate', churnClickable ? el('span', { class: 'ext', text: ' ↗' }) : null]),
+      el('div', { class: 'hero-num', text: fmtPct(churn) }),
+      el('div', { class: 's-sub', text: churnSub }),
+    ];
+  }
+
+  // clickable → opens the Churn view (now inside the Squad-wise tab)
+  let churnCard;
+  if (churnClickable) {
+    churnCard = el('a', { class: 'hero-churn', href: '?view=churn-rate', target: DETAIL_TAB,
+      title: 'Click to see how the churn rate is calculated' }, churnInner);
+    churnCard.addEventListener('click', (e) => {
+      if (e.ctrlKey || e.metaKey) return;
+      e.preventDefault();
+      pushNav();
+      go('churn-rate');
+    });
+  } else {
+    churnCard = el('div', { class: 'hero-churn' }, churnInner);
+  }
+
+  return el('div', { class: 'hero-stats' }, [
+    el('div', { class: 'hero-live' }, [
+      el('div', { class: 's-label', text: label || 'Live properties' }),
+      el('div', { class: 'hero-num', text: fmtInt(live) }),
+      el('div', { class: 's-sub', text: `${fmtPct(total ? live * 100 / total : null)} of ${fmtInt(total)} in scope` }),
+    ]),
+    churnCard,
+  ]);
+}
+
+/* ---- Dashboard: Style 3 — hero number, action cards, status, squads ------ */
+
+/** The coloured "needs action today" row. All values from live data. */
+function actionCards(scopeRows) {
+  const live = scopeRows.filter((r) => r.__live === true);
+  const now = new Date();
+
+  const notSigned = live.filter((r) => r.__status === 'Not Signed').length;
+  const expiring = expiringWithin(scopeRows, 30);
+  const newNoAgreement = live.filter((r) => r.__newNoAgreement).length;
+  const newLive = newLiveThisMonth(scopeRows);
+
+  const card = (label, value, tone, filter) => {
+    const body = [
+      el('div', { class: 'act-label' }, [label, filter ? el('span', { class: 'ext', text: '↗' }) : null]),
+      el('div', { class: 'act-num', text: fmtInt(value) }),
+    ];
+    if (!filter) return el('div', { class: `act-card tone-${tone}` }, body);
+    const a = el('a', { class: `act-card tone-${tone}`, href: detailHref(filter), target: DETAIL_TAB,
+      title: 'Click to filter · Ctrl/Cmd-click for a new tab' }, body);
+    a.addEventListener('click', cardClickHandler(filter));
+    return a;
+  };
+
+  return el('div', { class: 'action-grid' }, [
+    card('Not signed', notSigned, 'danger', { status: 'Not Signed', live: true }),
+    card('Expiring in 30 days', expiring, 'warning', { expiring30: true, live: true }),
+    card('New — no agreement yet', newNoAgreement, 'sky', { newNoAgreement: true, live: true }),
+    card('New live this month', newLive, 'success', null),
+  ]);
+}
+
+function viewOverview(allRows) {
+  const hasLiveCol = !!(state.cols.liveStatus || state.cols.liveDate || state.cols.delistDate);
+  const live = hasLiveCol ? allRows.filter((r) => r.__live === true) : allRows;
+
+  const frag = el('div', {}, [
+    pageHead('Live properties', 'Everything at a glance. Tap any card to open the matching properties; Ctrl/Cmd-click opens a new tab.'),
+  ]);
+
+  // 1. hero band: the live number + churn
+  frag.append(heroStats(allRows, { label: 'Live properties' }));
+
+  // 2. needs action today
+  frag.append(sectionHead('Needs action today', 'What requires attention right now'));
+  frag.append(actionCards(allRows));
+
+  // 3. agreement status (quieter reference cards, in the requested order)
+  frag.append(sectionHead('Agreement status', `${fmtInt(live.length)} live properties`));
+  frag.append(statusCards(live, { live: true }));
+
+  return frag;
+}
+
+// Normalize a property id for joining across tables: strip whitespace, a
+// trailing ".0" (numbers stored as floats), and lowercase. So "3257", "3257.0",
+// " 3257 " all match.
+function pidKey(v) {
+  if (v === null || v === undefined) return '';
+  let s = String(v).trim().replace(/\s+/g, '');
+  s = s.replace(/\.0+$/, '');   // 3257.0 -> 3257
+  return s.toLowerCase();
+}
+
+// Average owner / Vista F&B food share across churned properties in scope.
+// Values are stored as decimals (0.8 = 80%); blanks and error values are skipped.
+function fnbAverages(squad, kam) {
+  let ownerSum = 0, ownerN = 0, vistaSum = 0, vistaN = 0;
+  const churn = churnAnalysis(squad, kam, state.caMonth || null, { raw: true }).rows;
+  for (const r of churn) {
+    const o = pctToNumber(r.fnbOwner);
+    const v = pctToNumber(r.fnbVista);
+    if (o !== null) { ownerSum += o; ownerN += 1; }
+    if (v !== null) { vistaSum += v; vistaN += 1; }
+  }
+  return {
+    owner: ownerN ? ownerSum / ownerN : null,
+    vista: vistaN ? vistaSum / vistaN : null,
+  };
+}
+
+// A card showing an average F&B % that opens the churned list (both F&B columns
+// visible) when clicked, respecting the active squad/KAM/filters.
+function fnbAverageCard(label, value, squad, kam) {
+  const card = el('a', { class: 'stat stat-link', href: '#',
+    title: 'Click to see these properties with both F&B shares' }, [
+    el('div', { class: 's-label' }, [label, el('span', { class: 'ext', text: ' ↗' })]),
+    el('div', { class: 's-value', text: value === null ? '—' : fmtPct(value) }),
+  ]);
+  card.addEventListener('click', (e) => {
+    e.preventDefault();
+    state.caSquad = squad || null;
+    state.caKam = kam || null;
+    state.cd = {};
+    state.cdFilters = {};
+    state.cdPage = 1;
+    pushNav();
+    go('churn-detail');
+  });
+  return card;
+}
+
+// Count of properties under Marriott (any value in marriott_cost) vs not,
+// across ALL properties in the master (gcf_marginal). Optional squad/kam scope.
+// Marriott (Live only): any real % (e.g. 15%) -> Yes; 0% and "-" -> No; blank -> EXCLUDED.
+function marriottCounts(squad, kam) {
+  let under = 0, notUnder = 0;
+  for (const m of liveGcfRows(squad, kam)) {
+    const raw = m.marriott_cost == null ? '' : String(m.marriott_cost).trim();
+    if (raw === '') continue;                               // blank → excluded entirely
+    if (raw === '-') { notUnder += 1; continue; }           // "-" → No
+    const n = pctToNumber(raw);
+    if (n === null || n === 0) { notUnder += 1; continue; } // 0% or unreadable → No
+    under += 1;                                             // real % (e.g. 15%) → Yes
+  }
+  return { under, notUnder };
+}
+
+// DCRW (Damage cover & Refund waiver) Yes/No count across all master properties,
+// optional squad/kam scope.
+// Live-only, scoped rows from the SM/GCF table. All the DCRW/GCF/Marriott/F&B
+// counts below run on THIS set, so they only reflect Current Status = "Live".
+function liveGcfRows(squad, kam) {
+  const out = [];
+  for (const m of (state.gcfMarginal || [])) {
+    if (norm(m.current_status) !== 'live') continue;       // Live only
+    if (squad && norm(m.squad) !== norm(squad)) continue;
+    if (kam && norm(m.kam) !== norm(kam)) continue;
+    out.push(m);
+  }
+  return out;
+}
+
+// DCRW (Live only): "Yes" -> Yes; #NA / NA / "-" -> No; blank -> EXCLUDED.
+function dcrwCounts(squad, kam) {
+  let yes = 0, no = 0;
+  for (const m of liveGcfRows(squad, kam)) {
+    const raw = m.dcrw == null ? '' : String(m.dcrw).trim();
+    if (raw === '') continue;                               // blank → excluded entirely
+    if (norm(raw) === 'yes') yes += 1;
+    else no += 1;                                           // no, na, #na, "-" → No
+  }
+  return { yes, no };
+}
+
+// ONE source of truth for "what squad/kam/status/search/month is active right
+// now". Every list view uses this, so filters behave identically everywhere and
+// a new view/card automatically respects them. Prefers the live top filter bar,
+// falling back to any churn-drill scope.
+// ONE shared churn-row filter. Every churn view runs its rows through this so
+// the churn dropdowns (F&B, reason, initiated-by, GCF) + search always apply,
+// consistently, on every current and future churn page. `cd` is the optional
+// card filter (from clicking a card); dropdowns override the card per-field.
+function applyChurnFilters(rows, cd = {}) {
+  const f = state.cdFilters || {};
+  const sc = activeScope();
+
+  // top filter bar: squad / kam / search
+  if (sc.squad) rows = rows.filter((r) => norm(r.squad) === norm(sc.squad));
+  if (sc.kam) rows = rows.filter((r) => norm(r.kam) === norm(sc.kam));
+  if (sc.search) rows = rows.filter((r) => norm(`${r.property_id} ${r.vista_name} ${r.squad} ${r.kam}`).includes(sc.search));
+
+  // card filter applies unless a dropdown overrides the same field
+  if (cd.gcfLow && !f.gcfRange) rows = rows.filter((r) => { const n = pctToNumber(r.gcf); return n !== null && n < 5; });
+  if (cd.initiatedBy && !f.initiatedBy) rows = rows.filter((r) => norm(r.initiatedBy).includes(norm(cd.initiatedBy)));
+  if (cd.fnb && !f.fnb) rows = rows.filter((r) => fnbBucket(r.fnb) === cd.fnb);
+  if (cd.reason && !f.reason) rows = rows.filter((r) => norm(r.reason) === norm(cd.reason));
+
+  // churn dropdown filters
+  if (f.fnb) rows = rows.filter((r) => fnbBucket(r.fnb) === f.fnb);
+  if (f.reason) rows = rows.filter((r) => norm(r.reason) === norm(f.reason));
+  if (f.initiatedBy) rows = rows.filter((r) => norm(r.initiatedBy).includes(norm(f.initiatedBy)));
+  if (f.gcfRange) {
+    rows = rows.filter((r) => {
+      const n = pctToNumber(r.gcf); if (n === null) return false;
+      if (f.gcfRange === '<5%') return n < 5;
+      if (f.gcfRange === '5% & above') return n >= 5;
+      return true;
+    });
+  }
+  return rows;
+}
+
+function activeScope() {
+  const cdf = state.cdFilters || {};
+  return {
+    squad: cdf.squad || (state.filters.squads.length === 1 ? state.filters.squads[0] : null) || state.caSquad || null,
+    kam: cdf.kam || (state.filters.kams.length === 1 ? state.filters.kams[0] : null) || state.caKam || null,
+    status: state.filters.statuses.length === 1 ? state.filters.statuses[0] : null,
+    search: norm(state.search || ''),
+    month: state.caMonth || null,
+  };
+}
+
+/* ==== Churn Analysis module ============================================== */
+
+// Financial year window for churn: 1 Apr 2025 → 31 Mar 2026.
+const FY_START = new Date(2025, 3, 1);        // Apr 1, 2025 (start of churn analysis)
+// The window runs to TODAY and moves forward automatically — it never stops at
+// a fixed month again. (End of today so a delist dated "today" is included.)
+const FY_END = (() => { const n = new Date(); n.setHours(23, 59, 59, 999); return n; })();
+
+// Financial-year helpers. A FY runs 1 Apr → 31 Mar. fyOf(2025-06) -> 2025 (FY25-26).
+function fyStartYear(d) { return d.getMonth() >= 3 ? d.getFullYear() : d.getFullYear() - 1; }
+function fyLabel(startYear) { return `FY${String(startYear).slice(2)}-${String(startYear + 1).slice(2)}`; }
+// User-facing label for the whole analysis window: "Apr'25–Aug'26".
+function windowLabel() {
+  const s = FY_START, e = new Date();
+  const mon = (d) => ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][d.getMonth()];
+  return `${mon(s)}'${String(s.getFullYear()).slice(2)}–${mon(e)}'${String(e.getFullYear()).slice(2)}`;
+}
+// The ordered list of {year, month} for a FY, capped at today for the current FY.
+function fyMonthsList(startYear) {
+  const out = [];
+  const today = new Date();
+  for (let i = 0; i < 12; i++) {
+    const month = ((3 + i) % 12) + 1;                 // 4,5,…,12,1,2,3
+    const year = (3 + i) <= 11 ? startYear : startYear + 1;
+    const firstOfMonth = new Date(year, month - 1, 1);
+    if (firstOfMonth > today) break;                  // don't show future months
+    out.push({ year, month });
+  }
+  return out;
+}
+// All FYs that have any data, from FY starting 2025 up to the current FY.
+function availableFYs() {
+  const out = [];
+  const curFy = fyStartYear(new Date());
+  for (let y = 2025; y <= curFy; y++) out.push(y);
+  return out;
+}
+
+// A property is CHURNED if its current status is Delisted, TAC, or Paused.
+const CHURNED_STATUSES = ['delisted', 'tac', 'paused'];
+function isChurned(status) {
+  return CHURNED_STATUSES.includes(norm(status));
+}
+
+// Is a churn date inside the analysis window (1 Apr 2025 → today)?
+function inFY(dateStr) {
+  const d = parseDate(dateStr);
+  return !!d && d >= FY_START && d <= FY_END;
+}
+
+// Count of LIVE properties (Current Status = "Live") in the main table, scoped
+// to an optional squad / KAM. (Current live — used for reference/display.)
+function liveCount(squad, kam) {
+  let n = 0;
+  for (const r of (state.rows || [])) {
+    if (r.__live !== true) continue;
+    if (squad && norm(r.__squad) !== norm(squad)) continue;
+    if (kam && norm(r.__kam) !== norm(kam)) continue;
+    n += 1;
+  }
+  return n;
+}
+
+// Properties that were LIVE on 1 Apr 2025 (FY start), scoped. A property counts if
+// it went live before FY start AND had not churned before FY start. That is:
+//   (a) still live now and went live before Apr 2025, PLUS
+//   (b) churned during the FY (delist date on/after Apr 2025) — they were live at start.
+function liveAtFYStart(squad, kam) {
+  let n = 0;
+  // (a) current-live properties that went live before FY start
+  for (const r of (state.rows || [])) {
+    if (r.__live !== true) continue;
+    if (squad && norm(r.__squad) !== norm(squad)) continue;
+    if (kam && norm(r.__kam) !== norm(kam)) continue;
+    const ld = r.__liveDateObj;
+    if (ld && ld < FY_START) n += 1;      // was already live at FY start
+    else if (!ld) n += 1;                 // no live date on record → count it (already on books)
+  }
+  // (b) FY-churned properties were live at FY start too (deduped by id)
+  const seen = new Set();
+  for (const r of (state.churnAnalysis || [])) {
+    if (!isChurned(r.current_status)) continue;
+    if (squad && norm(r.squad) !== norm(squad)) continue;
+    if (kam && norm(r.kam) !== norm(kam)) continue;
+    if (!inFY(r.delist_date)) continue;
+    const id = pidKey(r.property_id);
+    if (id && seen.has(id)) continue;
+    if (id) seen.add(id);
+    n += 1;
+  }
+  return n;
+}
+
+// Count of FY-churned properties (Delisted, delist date in FY), scoped, deduped.
+function churnedCountFY(squad, kam, month) {
+  const seen = new Set();
+  let n = 0;
+  const monthNum = month ? MONTH_NAMES.findIndex((mn) => norm(mn) === norm(month)) + 1 : 0;
+  const yearNum = state.period.year ? Number(state.period.year) : 0;
+  for (const r of (state.churnAnalysis || [])) {
+    if (!isChurned(r.current_status)) continue;
+    if (squad && norm(r.squad) !== norm(squad)) continue;
+    if (kam && norm(r.kam) !== norm(kam)) continue;
+    if (!inFY(r.delist_date)) continue;
+    if (monthNum || yearNum) {
+      const d = parseDate(r.delist_date);
+      if (!d) continue;
+      if (monthNum && (d.getMonth() + 1) !== monthNum) continue;
+      if (yearNum && d.getFullYear() !== yearNum) continue;
+    }
+    const id = r.property_id != null ? String(r.property_id).trim() : '';
+    if (id && seen.has(id)) continue;
+    if (id) seen.add(id);
+    n += 1;
+  }
+  return n;
+}
+
+// Churn rate = churned (FYTD) / live-at-FY-start * 100, same scope.
+// Returns { rate, churned, live } so detail views can reconcile the number.
+// `live` here is the FY-start live count (the denominator).
+function delistingRate(squad, kam, month) {
+  const churned = churnedCountFY(squad, kam, month);
+  const live = liveCount(squad, kam);          // current live properties
+  const denom = live + churned;                // live + churned
+  return { rate: denom ? (churned * 100 / denom) : null, churned, live, denom };
+}
+
+
+// The full MIS squad row (churned count, HO, SV, etc.) for a squad.
+
+
+// Monthly churn rates for a squad, as [{month, rate}] in FY order (Apr→Mar).
+const FNB_BUCKETS = ['0%', '1-10%', '11-20%', '21%+'];
+const MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+
+function pctToNumber(v) {
+  if (v === null || v === undefined || v === '') return null;
+  let n = Number(String(v).trim().replace('%', ''));
+  if (Number.isNaN(n)) return null;
+  if (n > 0 && n < 1) n = n * 100;   // 0.03 -> 3
+  return n;
+}
+
+function fnbBucket(v) {
+  const n = pctToNumber(v);
+  if (n === null) return null;
+  if (n <= 0) return '0%';
+  if (n <= 10) return '1-10%';
+  if (n <= 20) return '11-20%';
+  return '21%+';
+}
+
+function churnAnalysis(squad, kam, month, opts = {}) {
+  const churn = state.churnAnalysis || [];
+  const marginal = state.gcfMarginal || [];
+
+  const gcfById = {};
+  for (const m of marginal) if (m.property_id != null) gcfById[pidKey(m.property_id)] = m;
+
+  const monthNum = month ? MONTH_NAMES.findIndex((mn) => norm(mn) === norm(month)) + 1 : 0;
+  const yearNum = state.period.year ? Number(state.period.year) : 0;
+  const isDelisted = (r) => isChurned(r.current_status);
+  const matchSquad = (r) => !squad || norm(r.squad) === norm(squad);
+  const matchKam = (r) => !kam || norm(r.kam) === norm(kam);
+  const matchMonth = (r) => {
+    if (!monthNum && !yearNum) return true;
+    const d = parseDate(r.delist_date);
+    if (!d || Number.isNaN(d.getTime())) return false;
+    if (monthNum && (d.getMonth() + 1) !== monthNum) return false;   // month must match
+    if (yearNum && d.getFullYear() !== yearNum) return false;         // year must match
+    return true;
+  };
+
+  const seen = new Set();
+  const rows = [];
+  for (const r of churn) {
+    if (!isDelisted(r) || !matchSquad(r) || !matchKam(r) || !matchMonth(r)) continue;
+    if (!inFY(r.delist_date)) continue;   // FY 2025-26 only
+    const id = pidKey(r.property_id);
+    if (id && seen.has(id)) continue;
+    if (id) seen.add(id);
+    const g = id ? gcfById[id] : null;
+    const rawBy = r.delist_initiated_by || '';
+    const byNorm = norm(rawBy);
+    const initiatedBy = byNorm === 'ho' ? 'Home Owner'
+      : byNorm === 'sv' ? 'StayVista'
+      : (rawBy || 'Unknown');
+    rows.push({
+      property_id: r.property_id,
+      vista_name: r.vista_name || '',
+      squad: r.squad || '',
+      kam: r.kam || '—',
+      initiatedBy,
+      reason: r.reason_bucket || 'Unspecified',
+      delistDate: r.delist_date || '',
+      gcf: g ? g.gcf_current : null,
+      fnbOwner: g ? g.fnb_owner : null,
+      fnbVista: g ? g.fnb_vista : null,
+      fnb: g ? g.fnb_owner : null,   // F&B bucket uses owner's food share
+      gst: g ? g.gst : null,
+      marriott: g ? g.marriott_cost : null,
+      dcrw: g ? g.dcrw : null,
+    });
+  }
+
+  const total = rows.length;
+  const lowGcf = rows.filter((r) => { const n = pctToNumber(r.gcf); return n !== null && n < 5; }).length;
+
+  const byBucket = (list, keyFn) => {
+    const m = {};
+    for (const r of list) { const k = keyFn(r) || 'Unknown'; m[k] = (m[k] || 0) + 1; }
+    return Object.entries(m).sort((a, b) => b[1] - a[1]);
+  };
+
+  const fnbCounts = Object.fromEntries(FNB_BUCKETS.map((b) => [b, 0]));
+  for (const r of rows) { const b = fnbBucket(r.fnb); if (b) fnbCounts[b] += 1; }
+
+  // FOOLPROOF FILTERING: by default, the returned row list has the active churn
+  // filters (F&B/reason/initiated-by/GCF + search) applied, so no view can ever
+  // display unfiltered churn rows by accident. Metric aggregates below are kept
+  // on the unfiltered set so summary cards stay stable; a caller that needs the
+  // truly raw rows (e.g. those cards) passes { raw: true }.
+  const outRows = opts.raw ? rows : applyChurnFilters(rows, opts.cd || {});
+
+  return { rows: outRows, total, lowGcf,
+    initiatedBy: byBucket(rows, (r) => r.initiatedBy),
+    reasons: byBucket(rows, (r) => r.reason),
+    fnbCounts };
+}
+
+function churnSquads() {
+  const m = {};
+  for (const r of (state.churnAnalysis || [])) {
+    if (!isChurned(r.current_status)) continue;
+    const s = r.squad || '—';
+    (m[s] = m[s] || new Set());
+    if (r.property_id != null) m[s].add(String(r.property_id).trim());
+  }
+  return Object.entries(m).map(([name, set]) => ({ name, count: set.size })).sort((a, b) => b.count - a.count);
+}
+
+function churnKams(squad) {
+  const m = {};
+  for (const r of (state.churnAnalysis || [])) {
+    if (!isChurned(r.current_status)) continue;
+    if (squad && norm(r.squad) !== norm(squad)) continue;
+    const k = r.kam || '—';
+    (m[k] = m[k] || new Set());
+    if (r.property_id != null) m[k].add(String(r.property_id).trim());
+  }
+  return Object.entries(m).map(([name, set]) => ({ name, count: set.size })).sort((a, b) => b.count - a.count);
+}
+
+/* ---- Churned properties (drill-in from the churn card) ------------------- */
+
+
+
+/* ---- Churn Analysis: Squad -> KAM drill-down ---------------------------- */
+
+function churnMetricCard(label, value, tone) {
+  return el('div', { class: `stat ${tone ? 'tone-' + tone : ''}` }, [
+    el('div', { class: 's-label', text: label }),
+    el('div', { class: 's-value', text: fmtInt(value) }),
+  ]);
+}
+
+function viewChurnRate() {
+  const squad = state.filters.squads.length === 1 ? state.filters.squads[0] : null;
+  const kam = state.filters.kams.length === 1 ? state.filters.kams[0] : null;
+  const month = state.caMonth || null;
+  const scope = kam ? `${kam} · ${squad || ''}` : squad ? squad : 'All India';
+
+  const frag = el('div', {}, []);
+  const back = el('button', { type: 'button', class: 'back-btn' }, [el('span', { class: 'back-arrow', text: '‹' }), 'Go back to previous page']);
+  back.addEventListener('click', () => goBackHistory('overview'));
+  frag.append(back);
+
+  const dr = delistingRate(squad, kam, month);
+
+  // When the user is searching or has any churn filter active, they want to find
+  // specific properties — so show ONLY the matching list, not the summary cards
+  // or the by-squad table (those are clutter during a search).
+  const anyFilterActive = !!(state.search
+    || (state.cdFilters && Object.values(state.cdFilters).some(Boolean)));
+
+  if (anyFilterActive) {
+    frag.append(pageHead('Churned properties', `Search results · ${scope}`));
+    const rows = churnAnalysis(squad, kam, month).rows;   // churnAnalysis auto-applies filters+search
+    frag.append(sectionHead('Results', `${fmtInt(rows.length)} ${rows.length === 1 ? 'property' : 'properties'}`));
+    frag.append(churnPropertyTable(rows));
+    return frag;
+  }
+
+  // Label reflects the selected month/year (or two-FY view if none picked).
+  const region = kam ? null : (squad || 'India');
+  const showTwoFY = !month && !state.period.year && !kam;
+  const periodLabel = (month || state.period.year)
+    ? [month, state.period.year].filter(Boolean).join(' ')
+    : 'FY view';
+
+  frag.append(pageHead('Churn rate', `How the rate is calculated · ${scope}`));
+  frag.append(sectionHead('The calculation', 'Churn rate = churned that month ÷ live at start of month × 100 · cumulative = sum of monthly rates'));
+
+  // Headline: two financial years (current big, previous smaller) when no
+  // specific month/year is picked; otherwise the selected period's rate.
+  const curFy = fyStartYear(new Date());
+  const prevFy = curFy - 1;
+  if (showTwoFY && region) {
+    const cur = fyChurnRate(region, curFy);
+    const prev = fyChurnRate(region, prevFy);
+    frag.append(el('div', { class: 'fy-churn-cards' }, [
+      el('div', { class: 'stat fy-current' }, [
+        el('div', { class: 's-label', text: `${fyLabel(curFy)} · current` }),
+        el('div', { class: 's-value big', text: cur.rate !== null ? fmtPct(cur.rate) : '—' }),
+        el('div', { class: 's-sub', text: `${fmtInt(cur.churned)} churned · cumulative to date` }),
+      ]),
+      el('div', { class: 'stat fy-prev' }, [
+        el('div', { class: 's-label', text: `${fyLabel(prevFy)} · previous` }),
+        el('div', { class: 's-value', text: prev.rate !== null ? fmtPct(prev.rate) : '—' }),
+        el('div', { class: 's-sub', text: `${fmtInt(prev.churned)} churned · full year` }),
+      ]),
+    ]));
+  } else {
+    // single-period: the selected month/year's rate
+    const p = region ? primaryMonthRate(region, month, state.period.year || (month ? curFy : null)) : null;
+    const rate = month ? (p ? p.rate : null) : (region ? momRate(region, null, state.period.year || null) : null);
+    const churned = month && p ? p.churned : null;
+    frag.append(el('div', { class: 'stat-grid' }, [
+      el('div', { class: 'stat tone-danger' }, [
+        el('div', { class: 's-label', text: `Churn rate · ${periodLabel}` }),
+        el('div', { class: 's-value', text: rate !== null && rate !== undefined ? fmtPct(rate) : '—' }),
+        churned !== null ? el('div', { class: 's-sub', text: `${fmtInt(churned)} churned` }) : null,
+      ]),
+    ]));
+  }
+
+  // squad breakdown (only at all-India level) — each row clickable, new formula
+  if (!squad && !kam) {
+    const squads = [...new Set((state.churnAnalysis || []).map((r) => r.squad).filter(Boolean))].sort();
+    frag.append(sectionHead('By squad', `Cumulative churn rate per squad · ${fyLabel(curFy)} · click a row for that squad's churned properties`));
+    const table = el('table', { class: 'grid' });
+    table.append(el('thead', {}, [el('tr', {}, ['Squad', `${fyLabel(prevFy)}`, `${fyLabel(curFy)} (current)`].map((h) => el('th', { style: 'text-align:left', text: h })))]));
+    const tb = el('tbody', {});
+    for (const s of squads) {
+      const cur = fyChurnRate(s, curFy);
+      const prev = fyChurnRate(s, prevFy);
+      const tr = el('tr', { class: 'row-click', title: `Click for ${s}'s churned properties` }, [
+        el('td', { style: 'text-align:left', text: s }),
+        el('td', { style: 'text-align:left', text: prev.rate !== null ? fmtPct(prev.rate) : '—' }),
+        el('td', { style: 'text-align:left' }, [
+          el('span', { class: cur.rate !== null && cur.rate > 5 ? 'flag-dot' : '', text: cur.rate !== null ? fmtPct(cur.rate) : '—' }),
+        ]),
+      ]);
+      tr.addEventListener('click', () => {
+        state.caSquad = s; state.caKam = null;
+        state.cd = {}; state.cdFilters = {}; state.cdPage = 1;
+        pushNav();
+        go('churn-detail');
+      });
+      tb.append(tr);
+    }
+    table.append(tb);
+    frag.append(el('div', { class: 'panel' }, [el('div', { class: 'table-wrap' }, [table])]));
+  }
+
+  // the churned property list behind the number (April 2025 onward via churnAnalysis)
+  const listRows = churnAnalysis(squad, kam, month).rows;
+  frag.append(sectionHead('Churned properties', `${fmtInt(listRows.length)} in this scope`));
+  frag.append(churnPropertyTable(listRows));
+
+  return frag;
+}
+
+function viewChurnDetail() {
+  // ONE shared scope helper — same filters everywhere.
+  const sc = activeScope();
+  const squad = sc.squad, kam = sc.kam, topSearch = sc.search;
+  const cd = state.cd || {};
+
+  const frag = el('div', {}, []);
+
+  // back button → return to where we came from (squad or kam tab)
+  const back = el('button', { type: 'button', class: 'back-btn' }, [el('span', { class: 'back-arrow', text: '‹' }), 'Go back to previous page']);
+  back.addEventListener('click', () => goBackHistory('squad'));
+  frag.append(back);
+
+  // build the churned rows, then apply all churn filters via the shared rule
+  const rows = churnAnalysis(squad, kam, sc.month, { cd }).rows;
+
+  // title describing the active card filter
+  const bits = [];
+  if (cd.gcfLow) bits.push('GCF below 5%');
+  if (cd.initiatedBy) bits.push(`initiated by ${cd.initiatedBy}`);
+  if (cd.fnb) bits.push(`F&B ${cd.fnb}`);
+  if (cd.reason) bits.push(cd.reason);
+  const scope = kam ? `${kam} · ${squad}` : squad ? squad : 'all squads';
+  frag.append(pageHead('Churned properties', `${scope}${bits.length ? ' · ' + bits.join(' · ') : ''}`));
+
+  frag.append(sectionHead('Results', `${fmtInt(rows.length)} properties`));
+  frag.append(churnPropertyTable(rows));
+
+  return frag;
+}
+
+/** Filter controls for the churn-detail list. Simple dropdowns. */
+function churnFilterBar(allRows) {
+  const f = state.cdFilters || {};
+  const uniq = (key) => [...new Set(allRows.map((r) => r[key]).filter(Boolean))].sort();
+  const bar = el('div', { class: 'filter-bar' });
+
+  const addSelect = (label, key, options) => {
+    const sel = el('select', { class: 'flt' });
+    sel.append(el('option', { value: '', text: label }));
+    for (const o of options) {
+      const opt = el('option', { value: o, text: o });
+      if (f[key] === o) opt.selected = true;
+      sel.append(opt);
+    }
+    sel.addEventListener('change', () => {
+      state.cdFilters = { ...(state.cdFilters || {}), [key]: sel.value || null };
+      state.cdPage = 1;
+      render();
+    });
+    bar.append(sel);
+  };
+
+  addSelect('All squads', 'squad', uniq('squad'));
+  addSelect('All KAMs', 'kam', uniq('kam'));
+  addSelect('All reasons', 'reason', uniq('reason'));
+  addSelect('All initiated-by', 'initiatedBy', uniq('initiatedBy'));
+  addSelect('All GCF ranges', 'gcfRange', ['<5%', '5% & above']);
+
+  if (state.cdFilters && Object.values(state.cdFilters).some(Boolean)) {
+    const clear = el('button', { type: 'button', class: 'reset-btn', text: 'Clear filters' });
+    clear.addEventListener('click', () => { state.cdFilters = {}; state.cdPage = 1; render(); });
+    bar.append(clear);
+  }
+  return bar;
+}
+
+function churnPropertyTable(rows) {
+  if (!rows.length) return el('div', { class: 'state' }, [el('p', { text: 'No churned properties in this scope.' })]);
+
+  const { wrap: pagerEl, page } = pager(rows.length);
+  const pageRows = rows.slice((page - 1) * PAGE_ROWS, page * PAGE_ROWS);
+
+  const head = ['Property ID', 'Name', 'KAM', 'Squad', 'GCF', 'F&B Owner', 'F&B Vista', 'GST', 'Initiated by', 'Reason', 'Delist date'];
+  const table = el('table', { class: 'grid' });
+  table.append(el('thead', {}, [el('tr', {}, head.map((h, i) =>
+    el('th', { class: i === 0 ? 'freeze' : '', style: 'text-align:left', text: h })))]));
+  const tbody = el('tbody', {});
+  for (const r of pageRows) {
+    // show a share/tax value as a percentage: 0.03 -> "3%", "0.15" -> "15%",
+    // "18%" stays "18%", blank -> "—".
+    const showPct = (v) => {
+      if (v == null || String(v).trim() === '' || String(v).trim() === '-') return '—';
+      const s = String(v).trim();
+      if (s.includes('%')) return s;                 // already a percent
+      let n = Number(s);
+      if (Number.isNaN(n)) return s;                 // non-numeric, show as-is
+      if (n > 0 && n <= 1) n = n * 100;              // 0.03 -> 3 (decimals)
+      // trim trailing zeros: 3.0 -> 3, 12.50 -> 12.5
+      return `${Math.round(n * 100) / 100}%`;
+    };
+    const show = (v) => (v != null && v !== '' ? String(v) : '—');
+    tbody.append(el('tr', {}, [
+      el('td', { class: 'freeze', style: 'text-align:left', text: r.property_id != null ? String(r.property_id) : '—' }),
+      el('td', { style: 'text-align:left', text: r.vista_name || '—' }),
+      el('td', { style: 'text-align:left', text: r.kam || '—' }),
+      el('td', { style: 'text-align:left', text: r.squad || '—' }),
+      el('td', { style: 'text-align:left', text: showPct(r.gcf) }),
+      el('td', { style: 'text-align:left', text: showPct(r.fnbOwner) }),
+      el('td', { style: 'text-align:left', text: showPct(r.fnbVista) }),
+      el('td', { style: 'text-align:left', text: showPct(r.gst) }),
+      el('td', { style: 'text-align:left', text: r.initiatedBy || '—' }),
+      el('td', { style: 'text-align:left', text: r.reason || '—' }),
+      el('td', { style: 'text-align:left', text: r.delistDate ? String(r.delistDate).slice(0, 10) : '—' }),
+    ]));
+  }
+  table.append(tbody);
+
+  return el('div', { class: 'panel' }, [
+    el('div', { class: 'table-wrap' }, [el('div', { class: 'churn-table-scroll' }, [table])]),
+    pagerEl,
+  ]);
+}
+
+/* ---- Squad-wise / KAM-wise: cards on top, property list below ------------ */
+
+function viewGroup(rows, field, dimension, title, desc) {
+  // Squad/KAM summaries are LIVE properties only (for the agreement section).
+  const live = rows.filter((r) => r.__live === true);
+  const groups = groupBy(live, field);
+
+  const selected = dimension === 'squad' ? state.filters.squads : state.filters.kams;
+  const focused = selected.length === 1 ? selected[0] : null;
+
+  const frag = el('div', {}, [pageHead(title, desc)]);
+
+  // ---- SECTION 1: Agreement status (live properties) ----
+  frag.append(
+    sectionHead('Agreement status', `${fmtInt(live.length)} live properties`),
+    statusCards(live, { live: true }),
+  );
+
+  // ---- SECTION 2: Churn (delisted properties, from MIS + churn_analysis) ----
+  frag.append(churnSection(dimension, focused));
+
+  // ---- SECTION 3: the drill cards (squads or KAMs) ----
+  frag.append(
+    sectionHead(dimension === 'squad' ? 'Squads' : 'KAMs', `${fmtInt(groups.length)} in scope · tap a card to open its properties`),
+    el('div', { class: 'group-grid' }, groups.map((e) => groupCard(e, dimension))),
+  );
+
+  // The live property table appears once a specific squad/KAM is selected.
+  if (focused) {
+    frag.append(propertyList(live, { title: `${focused} · properties` }));
+  }
+  return frag;
+}
+
+/**
+ * The Churn section shown inside the Squad-wise / KAM-wise tabs.
+ * Uses the MIS pre-calculated churn rate + churn_analysis breakdowns, scoped to
+ * the selected squad/KAM. Every metric card is clickable → opens the matching
+ * churned-property list (new tab in the same browser, with a back button).
+ */
+function churnSection(dimension, focused) {
+  const squad = dimension === 'squad' ? focused : (state.filters.squads.length === 1 ? state.filters.squads[0] : null);
+  const kam = dimension === 'kam' ? focused : null;
+  const month = state.caMonth || null;
+
+  const wrap = el('div', {});
+  const scope = kam ? kam : squad ? squad : 'all India';
+
+  // Delisting rate, computed = churned / (live + churned) * 100, same scope,
+  // FY 2025-26. When a month is picked, churned is that month's FY churn.
+  const dr = delistingRate(squad, kam, month);
+  const rate = dr.rate;
+
+  // month banner + clear
+  if (month) {
+    const banner = el('div', { class: 'month-banner' }, [
+      el('span', { text: `Showing: ${month} only` }),
+    ]);
+    const clear = el('button', { type: 'button', class: 'reset-btn', text: 'Clear month' });
+    clear.addEventListener('click', () => { state.caMonth = null; render(); });
+    banner.append(clear);
+    wrap.append(banner);
+  }
+
+  // all metric computations respect the selected month
+  const m2 = churnAnalysis(squad, kam, month, { raw: true });
+
+  // headline churn rate, flagged red if > 1%
+  const flagged = rate !== null && rate > 1;
+  const rateSub = rate !== null
+    ? `${fmtInt(dr.churned)} churned ÷ (${fmtInt(dr.live)} live + ${fmtInt(dr.churned)}) · ${windowLabel()}${month ? ' · ' + month : ''}`
+    : 'no data';
+  const rateCard = el('div', { class: `stat ${flagged ? 'tone-danger' : ''}` }, [
+    el('div', { class: 's-label' }, ['Churn rate', flagged ? el('span', { class: 'flag-dot', title: 'Above 1%', text: ' ●' }) : null]),
+    el('div', { class: 's-value', text: rate !== null ? fmtPct(rate) : '—' }),
+    el('div', { class: 's-sub', text: rateSub }),
+  ]);
+
+  // Counts come from the ACTUAL churn rows (m2) so every card matches the list
+  // that opens when you click it.
+  const churnedCount = m2.total;
+
+  wrap.append(sectionHead('Churn', `Delisted properties · ${scope}${month ? ' · ' + month : ''}`));
+  wrap.append(el('div', { class: 'stat-grid' }, [
+    rateCard,
+    clickableChurnCard('Total churned', churnedCount, {}, squad, kam),
+    clickableChurnCard('GCF below 5%', m2.lowGcf, { gcfLow: true }, squad, kam),
+  ]));
+
+  // Initiated by — always counted from the actual rows, so the card number
+  // equals the number of rows you see when you click it.
+  const findBy = (k) => (m2.initiatedBy.find(([label]) => norm(label).includes(k)) || [null, 0])[1];
+  const ho = findBy('home');
+  const sv = findBy('stay');
+  wrap.append(sectionHead('Churn initiated by', 'Home Owner vs StayVista'));
+  wrap.append(el('div', { class: 'stat-grid' }, [
+    clickableChurnCard('Home Owner', ho || 0, { initiatedBy: 'Home Owner' }, squad, kam),
+    clickableChurnCard('StayVista', sv || 0, { initiatedBy: 'StayVista' }, squad, kam),
+  ]));
+
+  // F&B — average owner share and average Vista share (clicking opens the list
+  // showing both F&B columns, respecting active filters). Ranges removed: owner
+  // and vista shares roughly sum to 100%, so bucketing them wasn't meaningful.
+  const fnbAvg = fnbAverages(squad, kam);
+  wrap.append(sectionHead('F&B share', 'Average owner vs Vista food share · click to see the properties'));
+  wrap.append(el('div', { class: 'stat-grid' }, [
+    fnbAverageCard("Avg owner's F&B share", fnbAvg.owner, squad, kam),
+    fnbAverageCard("Avg Vista's F&B share", fnbAvg.vista, squad, kam),
+  ]));
+
+  // Under Marriott vs not (across ALL properties in the master, this scope)
+  const mc = marriottCounts(squad, kam);
+  wrap.append(sectionHead('Marriott', 'Properties under Marriott vs not · all properties'));
+  wrap.append(el('div', { class: 'stat-grid' }, [
+    masterListCard('Under Marriott', mc.under, { marriott: 'yes' }, squad, kam),
+    masterListCard('Not under Marriott', mc.notUnder, { marriott: 'no' }, squad, kam),
+  ]));
+
+  // DCRW — Damage cover & Refund waiver, Yes/No count across all properties
+  const dc = dcrwCounts(squad, kam);
+  wrap.append(sectionHead('DCRW', 'Damage cover & Refund waiver · charged per booking · all properties'));
+  wrap.append(el('div', { class: 'stat-grid' }, [
+    masterListCard('DCRW — Yes', dc.yes, { dcrw: 'yes' }, squad, kam),
+    masterListCard('DCRW — No', dc.no, { dcrw: 'no' }, squad, kam),
+  ]));
+
+  return wrap;
+}
+
+/** A churn metric card that opens the filtered churned-property list on click. */
+// A card that opens a filtered list of MASTER properties (from gcf_marginal),
+// e.g. under Marriott / DCRW Yes. These cover all properties, not just churned.
+function masterListCard(label, value, filter, squad, kam) {
+  const card = el('a', { class: 'stat stat-link', href: '#',
+    title: 'Click to see these properties · 25 per page' }, [
+    el('div', { class: 's-label' }, [label, el('span', { class: 'ext', text: ' ↗' })]),
+    el('div', { class: 's-value', text: fmtInt(value) }),
+  ]);
+  card.addEventListener('click', (e) => {
+    e.preventDefault();
+    state.mlFilter = { ...filter, squad: squad || null, kam: kam || null, label };
+    state.mlPage = 1;
+    pushNav();
+    go('master-list');
+  });
+  return card;
+}
+
+function viewMasterList() {
+  const f = state.mlFilter || {};
+  const frag = el('div', {}, []);
+  const back = el('button', { type: 'button', class: 'back-btn' }, [el('span', { class: 'back-arrow', text: '‹' }), 'Go back to previous page']);
+  back.addEventListener('click', () => goBackHistory('overview'));
+  frag.append(back);
+
+  // Scope comes from the shared activeScope helper — same filters everywhere.
+  const sc = activeScope();
+  const squad = sc.squad, kam = sc.kam, search = sc.search;
+
+  // Live properties only — filter values and counts come from Live rows.
+  let rows = (state.gcfMarginal || []).filter((r) => norm(r.current_status) === 'live');
+  if (squad) rows = rows.filter((r) => norm(r.squad) === norm(squad));
+  if (kam) rows = rows.filter((r) => norm(r.kam) === norm(kam));
+  // the card that opened this view (marriott / dcrw). Blank values are excluded.
+  const marrIsYes = (v) => {
+    const raw = v == null ? '' : String(v).trim();
+    if (raw === '' || raw === '-') return false;
+    const n = pctToNumber(raw);
+    return n !== null && n !== 0;                            // real % (e.g. 15%) → Yes
+  };
+  const marrHasValue = (v) => v != null && String(v).trim() !== '';   // not blank
+  if (f.marriott === 'yes') rows = rows.filter((r) => marrIsYes(r.marriott_cost));
+  if (f.marriott === 'no') rows = rows.filter((r) => marrHasValue(r.marriott_cost) && !marrIsYes(r.marriott_cost));
+  if (f.dcrw === 'yes') rows = rows.filter((r) => norm(r.dcrw) === 'yes');
+  if (f.dcrw === 'no') rows = rows.filter((r) => { const raw = r.dcrw == null ? '' : String(r.dcrw).trim(); return raw !== '' && norm(raw) !== 'yes'; });
+  // free-text search on id / squad / kam
+  if (search) rows = rows.filter((r) => norm(`${r.property_id} ${r.squad} ${r.kam}`).includes(search));
+
+  // churn dropdowns that also make sense for master rows: F&B band + GCF range.
+  // (reason / initiated-by are churn-only fields and don't exist here, so they're
+  //  intentionally not applied to the master property list.)
+  const cdf = state.cdFilters || {};
+  if (cdf.fnb) rows = rows.filter((r) => fnbBucket(r.fnb_owner) === cdf.fnb);
+  if (cdf.gcfRange) rows = rows.filter((r) => {
+    const n = pctToNumber(r.gcf_current); if (n === null) return false;
+    if (cdf.gcfRange === '<5%') return n < 5;
+    if (cdf.gcfRange === '5% & above') return n >= 5;
+    return true;
+  });
+
+  const scope = kam ? `${kam} · ${squad || ''}` : squad ? squad : 'all properties';
+  frag.append(pageHead(f.label || 'Properties', `${scope}`));
+  frag.append(sectionHead('Results', `${fmtInt(rows.length)} properties`));
+
+  if (!rows.length) {
+    frag.append(el('div', { class: 'state' }, [el('p', { text: 'No properties in this scope.' })]));
+    return frag;
+  }
+
+  // numbered pager (same style as the property list)
+  const { wrap: pagerEl, page } = pager(rows.length);
+  const pageRows = rows.slice((page - 1) * PAGE_ROWS, page * PAGE_ROWS);
+
+  const showPct = (v) => {
+    if (v == null || String(v).trim() === '' || String(v).trim() === '-') return '—';
+    const s = String(v).trim();
+    if (s.includes('%')) return s;
+    let n = Number(s); if (Number.isNaN(n)) return s;
+    if (n > 0 && n <= 1) n = n * 100;
+    return `${Math.round(n * 100) / 100}%`;
+  };
+
+  const table = el('table', { class: 'grid' });
+  const head = ['Property ID', 'Squad', 'KAM', 'GCF', 'F&B Owner', 'F&B Vista', 'GST', 'Marriott', 'DCRW'];
+  table.append(el('thead', {}, [el('tr', {}, head.map((h, i) => el('th', { class: i === 0 ? 'freeze' : '', style: 'text-align:left', text: h })))]));
+  const tb = el('tbody', {});
+  for (const r of pageRows) {
+    tb.append(el('tr', {}, [
+      el('td', { class: 'freeze', style: 'text-align:left', text: r.property_id != null ? String(r.property_id) : '—' }),
+      el('td', { style: 'text-align:left', text: r.squad || '—' }),
+      el('td', { style: 'text-align:left', text: r.kam || '—' }),
+      el('td', { style: 'text-align:left', text: showPct(r.gcf_current) }),
+      el('td', { style: 'text-align:left', text: showPct(r.fnb_owner) }),
+      el('td', { style: 'text-align:left', text: showPct(r.fnb_vista) }),
+      el('td', { style: 'text-align:left', text: showPct(r.gst) }),
+      el('td', { style: 'text-align:left', text: (r.marriott_cost != null && String(r.marriott_cost).trim() !== '' && String(r.marriott_cost).trim() !== '-') ? String(r.marriott_cost) : '—' }),
+      el('td', { style: 'text-align:left', text: r.dcrw || '—' }),
+    ]));
+  }
+  table.append(tb);
+
+  frag.append(el('div', { class: 'panel' }, [
+    el('div', { class: 'table-wrap' }, [el('div', { class: 'churn-table-scroll' }, [table])]),
+    pagerEl,
+  ]));
+  return frag;
+}
+
+// Monthly churn computed from the churn list (delist dates), per squad.
+// Rate for a squad+month = that month's churned ÷ (squad live + squad total FY churned) × 100.
+// Same denominator as the main churn rate, so figures reconcile.
+function churnedInSquadMonth(squad, monthNum, year) {
+  const seen = new Set();
+  const out = [];
+  for (const r of (state.churnAnalysis || [])) {
+    if (!isChurned(r.current_status)) continue;
+    if (squad && norm(r.squad) !== norm(squad)) continue;
+    if (!inFY(r.delist_date)) continue;
+    const d = parseDate(r.delist_date);
+    if (!d || (d.getMonth() + 1) !== monthNum) continue;
+    if (year && d.getFullYear() !== year) continue;   // year-aware: Jun'25 ≠ Jun'26
+    const id = pidKey(r.property_id);
+    if (id && seen.has(id)) continue;
+    if (id) seen.add(id);
+    out.push(r);
+  }
+  return out;
+}
+
+// Look up the validated monthly churn straight from the "MOM churn" tab
+// (mom_churn table). Returns the tab's EXACT churn % and churn count for a
+// region (squad or 'India') in a given month + year. No recalculation.
+// Returns null rate when that region/month/year isn't in the tab.
+// ---- Churn calculation (PRIMARY source: the churn tab) ---------------------
+// Churn is computed from churn_analysis (the "List of Churned Properties" tab),
+// which has Squad, Current Status, and the delist/pause date. Churned = status
+// Paused/Delisted/TAC, dated by the delist date. The live count at the start of
+// a month is reconstructed backwards from the current live count:
+//   live_at_month_start = current_live + everyone who churned from that month on.
+// Rate = churned that month ÷ live_at_month_start × 100.
+
+function smChurnedList(region) {
+  // churned rows in the CHURN tab for a region (or all if 'india'/null), with a
+  // parsed churn date. Deduped by property_id.
+  const isAll = !region || norm(region) === 'india';
+  const seen = new Set();
+  const out = [];
+  for (const r of (state.churnAnalysis || [])) {
+    if (!isChurned(r.current_status)) continue;              // Paused/Delisted/TAC
+    if (!isAll && norm(r.squad) !== norm(region)) continue;
+    const d = parseDate(r.delist_date);
+    if (!d) continue;                                        // need a churn date
+    if (d < FY_START) continue;                              // churn counts from Apr 2025 onward
+    const id = pidKey(r.property_id);
+    if (id && seen.has(id)) continue;
+    if (id) seen.add(id);
+    out.push({ date: d });
+  }
+  return out;
+}
+
+function smCurrentLive(region) {
+  // current live count for a region from the main table (agreement track)
+  const isAll = !region || norm(region) === 'india';
+  let n = 0;
+  for (const r of (state.rows || [])) {
+    if (r.__live !== true) continue;
+    if (!isAll && norm(r.__squad) !== norm(region)) continue;
+    n += 1;
+  }
+  return n;
+}
+
+// One month's SM-tab churn for a region. year+monthNum identify the month.
+function smMonth(region, monthNum, year) {
+  const churnedRows = smChurnedList(region);
+  const monthStart = new Date(year, monthNum - 1, 1);
+  const monthEnd = new Date(year, monthNum, 1);            // first of next month
+
+  let churnedThisMonth = 0;
+  let churnedFromMonthOnward = 0;                          // for the backwards reconstruction
+  for (const c of churnedRows) {
+    if (c.date >= monthStart && c.date < monthEnd) churnedThisMonth += 1;
+    if (c.date >= monthStart) churnedFromMonthOnward += 1;
+  }
+  // live at the start of this month = today's live + everyone who left since then
+  const liveAtStart = smCurrentLive(region) + churnedFromMonthOnward;
+  const rate = liveAtStart > 0 ? (churnedThisMonth * 100 / liveAtStart) : null;
+  return { churned: churnedThisMonth, liveBegin: liveAtStart, rate };
+}
+
+// Primary monthly rate: SM-tab calculation, with the MOM tab as fallback.
+function primaryMonthRate(region, monthName, year) {
+  const monthNum = MONTH_INDEX(monthName);
+  const sm = smMonth(region, monthNum, year);
+  if (sm.rate !== null && sm.rate !== undefined) {
+    // cross-check against the MOM tab (informational only)
+    const mm = momMonth(region, monthName, year);
+    if (mm && mm.rate !== null && Math.abs(sm.rate - mm.rate) > 1 && !primaryMonthRate._warned) {
+      primaryMonthRate._warned = true;
+      try { console.warn(`Churn cross-check ${region} ${monthName} ${year}: SM ${sm.rate.toFixed(2)}% vs MOM ${mm.rate.toFixed(2)}%`); } catch {}
+    }
+    return { rate: sm.rate, churned: sm.churned, liveBegin: sm.liveBegin, source: 'SM' };
+  }
+  // fallback: MOM tab
+  const mm = momMonth(region, monthName, year);
+  if (mm && mm.rate !== null) return { rate: mm.rate, churned: mm.churned, liveBegin: mm.liveBegin, source: 'MOM' };
   return null;
 }
-function daysSince(dateRaw){
-  if(!dateRaw) return null;
-  const d = new Date(dateRaw);
-  if(isNaN(d.getTime())) return null;
-  const today = new Date(); today.setHours(0,0,0,0); d.setHours(0,0,0,0);
-  return Math.round((today - d) / 86400000);
-}
-function isAwaitingResponse(f){
-  if(!SENT_DATE_KEY) return false;
-  const days = daysSince(f.sentToOwnerRaw);
-  if(days === null || days < NO_RESPONSE_THRESHOLD_DAYS) return false;
-  const resp = (f.ownerResponse||'').toLowerCase();
-  if(!resp) return true;
-  return /pending|no response|awaiting|not received|none/i.test(resp);
+
+// ---- MOM-tab churn (fallback / cross-check) --------------------------------
+function momNum(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(String(v).replace(/[^0-9.-]/g, ''));
+  return Number.isNaN(n) ? null : n;
 }
 
-function buildGroupLists(){
-  const sq = {}, poc = {};
-  allRows.forEach(row=>{
-    const f = fieldsFor(row);
-    sq[f.squad] = (sq[f.squad]||0)+1;
-    poc[f.owner] = (poc[f.owner]||0)+1;
-  });
-  squadList = Object.entries(sq).sort((a,b)=>b[1]-a[1]).map(([name,count])=>({name,count}));
-  pocList = Object.entries(poc).sort((a,b)=>b[1]-a[1]).map(([name,count])=>({name,count}));
-}
+// One month's churn for a region, computed by the agreed formula:
+//   (Paused + Delisted/TAC) ÷ Live Count at Beginning × 100.
+// Also cross-checks against the tab's own "Churn %" and warns (once) on a gap.
+function momMonth(region, monthName, year) {
+  const rows = state.momChurn || [];
+  const tgtRegion = norm(region || 'india');
+  const tgtMonth = norm(monthName || '');
+  const tgtYear = String(year || '');
+  for (const r of rows) {
+    if (norm(r.region) !== tgtRegion) continue;
+    if (tgtMonth && norm(r.month) !== tgtMonth) continue;
+    if (tgtYear && String(r.year).trim() !== tgtYear) continue;
 
-function tabIdFor(type,name){ return `${type}::${name}`; }
-function parseTab(tabId){
-  if(tabId==='ALL') return {type:'ALL', name:'All Properties'};
-  const [type,...rest] = tabId.split('::');
-  return {type, name: rest.join('::')};
-}
+    const paused = momNum(r.paused) || 0;
+    const delTac = momNum(r.delisted_tac) || 0;
+    const liveBegin = momNum(r.live_begin);
+    const churned = paused + delTac;
+    const computed = (liveBegin && liveBegin > 0) ? (churned * 100 / liveBegin) : null;
 
-function renderSidebar(){
-  const sb = document.getElementById('sidebar');
-  sb.innerHTML = `
-    <div class="sidebar-title">Overview</div>
-    <div class="sidebar-item ${activeTabId==='ALL'?'active':''}" onclick="openTab('ALL')">
-      <span>All Properties</span><span class="sidebar-count">${allRows.length}</span>
-    </div>
-    <div class="sidebar-item ${activeTabId==='SOP'?'active':''}" onclick="openTab('SOP')">
-      <span>Playbook &amp; SOPs</span><span class="sidebar-count">4</span>
-    </div>
-    <div class="sidebar-divider"></div>
-
-    <div class="sidebar-section-header" onclick="toggleSection('squads')">
-      <span>Squad</span><span class="sidebar-caret">${sidebarExpanded.squads?'▾':'▸'}</span>
-    </div>
-    ${sidebarExpanded.squads ? `<div class="sidebar-sublist">${squadList.map(s=>`
-      <div class="sidebar-item ${activeTabId===tabIdFor('SQUAD',s.name)?'active':''}" onclick="openTab('${tabIdFor('SQUAD',s.name).replace(/'/g,"\\'")}')">
-        <span>${escapeHtml(s.name)}</span><span class="sidebar-count">${s.count}</span>
-      </div>`).join('')}</div>` : ''}
-
-    <div class="sidebar-divider"></div>
-
-    <div class="sidebar-section-header" onclick="toggleSection('pocs')">
-      <span>POC (KAM)</span><span class="sidebar-caret">${sidebarExpanded.pocs?'▾':'▸'}</span>
-    </div>
-    ${sidebarExpanded.pocs ? `<div class="sidebar-sublist">${pocList.map(k=>`
-      <div class="sidebar-item ${activeTabId===tabIdFor('POC',k.name)?'active':''}" onclick="openTab('${tabIdFor('POC',k.name).replace(/'/g,"\\'")}')">
-        <span>${escapeHtml(k.name)}</span><span class="sidebar-count">${k.count}</span>
-      </div>`).join('')}</div>` : ''}
-  `;
-}
-function toggleSection(key){
-  sidebarExpanded[key] = !sidebarExpanded[key];
-  renderSidebar();
-}
-
-function openTab(tabId){
-  if(!openTabs.includes(tabId)) openTabs.push(tabId);
-  activeTabId = tabId;
-  activeRow = null;
-  renderSidebar();
-  renderTabStrip();
-  renderActiveTab();
-}
-function closeTab(tabId, evt){
-  evt.stopPropagation();
-  if(tabId === 'ALL') return;
-  openTabs = openTabs.filter(t=>t!==tabId);
-  delete tabState[tabId];
-  if(activeTabId === tabId) activeTabId = 'ALL';
-  renderSidebar();
-  renderTabStrip();
-  renderActiveTab();
-}
-function renderTabStrip(){
-  const strip = document.getElementById('tab-strip');
-  strip.innerHTML = openTabs.map(t=>{
-    const p = parseTab(t);
-    const label = t==='ALL' ? '🏠 All Properties' : `${p.type==='SQUAD'?'📍':'🧑'} ${escapeHtml(p.name)}`;
-    return `
-    <div class="browser-tab ${activeTabId===t?'active':''}" onclick="openTab('${t.replace(/'/g,"\\'")}')">
-      <span>${label}</span>
-      ${t!=='ALL' ? `<span class="close-x" onclick="closeTab('${t.replace(/'/g,"\\'")}', event)">✕</span>` : ''}
-    </div>`;
-  }).join('');
-}
-
-function rowsForTab(tabId){
-  if(tabId==='SOP') return [];
-  if(tabId==='ALL') return allRows;
-  const p = parseTab(tabId);
-  if(p.type==='SQUAD') return allRows.filter(r=>fieldsFor(r).squad === p.name);
-  if(p.type==='POC') return allRows.filter(r=>fieldsFor(r).owner === p.name);
-  return allRows;
-}
-
-/* ---------- SQUAD DISTRIBUTION — BIG PIE CHART (chart only, no side list) ---------- */
-function squadDistributionChartHtml(){
-  const total = allRows.length || 1;
-  const top = squadList.slice(0, 8);
-  const restCount = squadList.slice(8).reduce((s,x)=>s+x.count,0);
-  const segments = restCount > 0 ? [...top, {name:'Other', count:restCount}] : top;
-  const colors = segments.map((seg,i)=> (restCount>0 && i===segments.length-1) ? '#c9c9c9' : STATUS_PALETTE[i % STATUS_PALETTE.length].dot);
-
-  const size = 300, cx = size/2, cy = size/2, r = 130;
-  let angle = 0;
-  const wedges = segments.map((s,i)=>{
-    const pct = Math.round((s.count/total)*1000)/10;
-    const sweep = (s.count/total)*360;
-    const startAngle = angle, endAngle = angle + sweep;
-    angle = endAngle;
-    const p1 = polarPoint(cx,cy,r,startAngle), p2 = polarPoint(cx,cy,r,endAngle);
-    const largeArc = sweep > 180 ? 1 : 0;
-    const path = `M ${cx} ${cy} L ${p1.x.toFixed(2)} ${p1.y.toFixed(2)} A ${r} ${r} 0 ${largeArc} 1 ${p2.x.toFixed(2)} ${p2.y.toFixed(2)} Z`;
-    const mid = polarPoint(cx, cy, r*0.66, startAngle + sweep/2);
-    const nameArg = s.name.replace(/'/g,"\\'");
-    const selected = pieSelected && pieSelected.name === s.name;
-    const shortName = s.name.length > 13 ? s.name.slice(0,12)+'…' : s.name;
-    let label = '';
-    if(sweep >= 22){
-      label = `<text x="${mid.x.toFixed(2)}" y="${(mid.y-6).toFixed(2)}" class="pie-name-label" text-anchor="middle">${escapeHtml(shortName)}</text><text x="${mid.x.toFixed(2)}" y="${(mid.y+10).toFixed(2)}" class="pie-pct-label" text-anchor="middle">${pct}%</text>`;
-    } else if(sweep >= 10){
-      label = `<text x="${mid.x.toFixed(2)}" y="${mid.y.toFixed(2)}" class="pie-pct-label" text-anchor="middle">${pct}%</text>`;
+    // cross-check against the sheet's own Churn % (informational only)
+    const sheetPct = pctToNumber(r.churn_pct);
+    if (computed !== null && sheetPct !== null && Math.abs(computed - sheetPct) > 0.5 && !momMonth._warned) {
+      momMonth._warned = true;
+      try { console.warn(`MOM churn cross-check: ${region} ${monthName} ${year} computed ${computed.toFixed(2)}% vs sheet ${sheetPct.toFixed(2)}%`); } catch {}
     }
-    return `<path d="${path}" fill="${colors[i]}" class="pie-wedge${selected?' selected':''}" onclick="selectPieSlice('${nameArg}', ${s.count}, ${pct})"><title>${escapeHtml(s.name)}: ${s.count} (${pct}%)</title></path>${label}`;
-  }).join('');
 
-  const infoPop = pieSelected ? `
-    <div class="pie-info-pop">
-      <div>
-        <div class="pie-info-name">${escapeHtml(pieSelected.name)}</div>
-        <div class="pie-info-stats"><span>${pieSelected.count} properties</span><span>·</span><span>${pieSelected.pct}% of portfolio</span></div>
-      </div>
-      <button class="pie-info-close" onclick="closePieInfo()">✕</button>
-    </div>` : '';
+    return { rate: computed, churned, liveBegin: liveBegin || null, sheetPct,
+      ym: `${r.year}-${MONTH_INDEX(r.month)}` };
+  }
+  return null;
+}
 
-  return `
-    <div class="section-card">
-      <div class="section-title">Squad Distribution</div>
-      <div class="section-desc">Share of all ${total} properties by squad — click a slice for details.</div>
-      <div class="dist-chart-row-solo">
-        <svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">${wedges}</svg>
-      </div>
-      ${infoPop}
-    </div>`;
+function MONTH_INDEX(m) {
+  const i = ['january','february','march','april','may','june','july','august','september','october','november','december'].indexOf(norm(m));
+  return i === -1 ? 0 : i + 1;
 }
-function polarPoint(cx, cy, r, angleDeg){
-  const rad = (angleDeg - 90) * Math.PI / 180;
-  return { x: cx + r*Math.cos(rad), y: cy + r*Math.sin(rad) };
-}
-function selectPieSlice(name, count, pct){
-  pieSelected = (pieSelected && pieSelected.name === name) ? null : { name, count, pct };
-  renderActiveTab();
-}
-function closePieInfo(){ pieSelected = null; renderActiveTab(); }
 
-/* ---------- TOP 5 SQUAD STRIPS ---------- */
-function computeLeaderboard(groupField){
-  const groups = {};
-  allRows.forEach(row=>{
-    const f = fieldsFor(row);
-    const key = f[groupField];
-    if(!groups[key]) groups[key] = [];
-    groups[key].push(row);
+// The churn rate to display, honouring the month/year selection:
+//  - a specific month+year → that month's rate
+//  - a year only          → SUM of that year's monthly rates (cumulative %)
+//  - nothing selected      → SUM of all months' rates up to the current month
+// (Cumulative = simple sum of the monthly percentages, per the agreed definition.)
+// Cumulative churn rate for an entire financial year (Apr startYear → Mar
+// startYear+1), summing each month's rate up to today. Uses the primary
+// (churn-tab) calculation. region = squad or 'India'.
+// Cumulative churn rate for a whole financial year (sum of that FY's monthly
+// rates, up to the current month for the ongoing FY). region = squad or 'India'.
+// Uses the same primary per-month calculation as everywhere else.
+function fyChurnRate(region, fyStart) {
+  const monthNames = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+  const today = new Date();
+  let sum = 0, any = false, churnedTotal = 0;
+  for (let i = 0; i < 12; i++) {
+    const month = ((3 + i) % 12) + 1;              // 4..12,1..3
+    const year = (3 + i) <= 11 ? fyStart : fyStart + 1;
+    if (new Date(year, month - 1, 1) > today) break;   // don't count future months
+    const p = primaryMonthRate(region, monthNames[month - 1], year);
+    if (p && p.rate !== null) { sum += p.rate; churnedTotal += (p.churned || 0); any = true; }
+  }
+  return any ? { rate: sum, churned: churnedTotal } : { rate: null, churned: 0 };
+}
+
+function momRate(region, monthName, year) {
+  const smHasData = (state.churnAnalysis || []).some((r) => isChurned(r.current_status) && parseDate(r.delist_date));
+  const momHasData = (state.momChurn || []).length > 0;
+  if (!smHasData && !momHasData) return null;
+
+  // single month
+  if (monthName) {
+    const p = primaryMonthRate(region, monthName, year);
+    return p ? p.rate : null;
+  }
+
+  // Build the list of months to sum. Prefer SM-derived months (from churn dates);
+  // fall back to the MOM tab's month rows when SM has nothing.
+  const today = new Date();
+  const monthSet = new Map();   // key "y-m" -> {y, mi}
+  if (smHasData) {
+    for (const r of (state.churnAnalysis || [])) {
+      if (!isChurned(r.current_status)) continue;
+      const d = parseDate(r.delist_date);
+      if (!d || d < FY_START || d > today) continue;
+      monthSet.set(`${d.getFullYear()}-${d.getMonth() + 1}`, { y: d.getFullYear(), mi: d.getMonth() + 1 });
+    }
+  } else {
+    const tgt = norm(region || 'india');
+    for (const r of (state.momChurn || [])) {
+      if (norm(r.region) !== tgt) continue;
+      monthSet.set(`${r.year}-${MONTH_INDEX(r.month)}`, { y: Number(String(r.year).trim()), mi: MONTH_INDEX(r.month) });
+    }
+  }
+
+  const monthNames = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+  let sum = 0, any = false;
+  for (const { y, mi } of monthSet.values()) {
+    if (year && String(y) !== String(year)) continue;
+    if (new Date(y, mi - 1, 1) > today) continue;
+    const p = primaryMonthRate(region, monthNames[mi - 1], y);
+    if (p && p.rate !== null) { sum += p.rate; any = true; }
+  }
+  return any ? sum : null;
+}
+
+// Kept for the monthly table cells: one month's rate + churned count.
+// Uses the SM-tab calculation (primary), MOM tab as fallback.
+function momLookup(region, monthName, year) {
+  const p = primaryMonthRate(region, monthName, year);
+  if (!p) return null;
+  return { rate: p.rate, count: p.churned, liveBegin: p.liveBegin };
+}
+
+function squadMonthRate(squad, monthNum, year) {
+  const churnedThisMonth = churnedInSquadMonth(squad, monthNum, year).length;
+  const dr = delistingRate(squad, null, null);   // squad's current live + total churned
+  const denom = dr.live + dr.churned;
+  return { count: churnedThisMonth, rate: denom ? (churnedThisMonth * 100 / denom) : null };
+}
+
+function viewMonthlyChurn() {
+  const frag = el('div', {}, []);
+  const back = el('button', { type: 'button', class: 'back-btn' }, [el('span', { class: 'back-arrow', text: '‹' }), 'Go back to previous page']);
+  back.addEventListener('click', () => goBackHistory('overview'));
+  frag.append(back);
+
+  const fys = availableFYs();
+  if (state.mcFy == null || !fys.includes(state.mcFy)) state.mcFy = fys[fys.length - 1];
+  const fy = state.mcFy;
+
+  frag.append(pageHead('Monthly churn by squad',
+    `Churn rate per squad, per month · ${fyLabel(fy)} · click any cell for that month's churned properties`));
+
+  if (fys.length > 1) {
+    const toggle = el('div', { class: 'fy-toggle' });
+    for (const y of fys) {
+      const b = el('button', { type: 'button', class: `fy-btn${y === fy ? ' active' : ''}`, text: fyLabel(y) });
+      b.addEventListener('click', () => { state.mcFy = y; render(); });
+      toggle.append(b);
+    }
+    frag.append(toggle);
+  }
+
+  const churnSquads = [...new Set((state.churnAnalysis || []).map((r) => r.squad).filter(Boolean))];
+  const momSquads = [...new Set((state.momChurn || []).map((r) => r.region).filter((x) => x && norm(x) !== 'india'))];
+  const squads = [...new Set([...churnSquads, ...momSquads])].sort();
+  const months = fyMonthsList(fy);
+  const shortName = (n) => ['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][n];
+
+  const table = el('table', { class: 'grid monthly-churn' });
+  table.append(el('thead', {}, [el('tr', {}, [
+    el('th', { class: 'freeze', style: 'text-align:left', text: 'Squad' }),
+    ...months.map(({ year, month }) => el('th', { style: 'text-align:center', text: `${shortName(month)} '${String(year).slice(2)}` })),
+  ])]));
+  const tb = el('tbody', {});
+  for (const s of squads) {
+    const cells = [el('td', { class: 'freeze', style: 'text-align:left', text: s })];
+    for (const { year, month } of months) {
+      const monthName = ['','January','February','March','April','May','June','July','August','September','October','November','December'][month];
+      const mom = momLookup(s, monthName, year);
+      const rate = mom ? mom.rate : null;
+      const count = mom ? mom.count : null;
+      if (rate === null || rate === undefined) {
+        // no data in the MOM churn tab for this squad/month → blank cell
+        cells.push(el('td', { class: 'mc-cell empty', style: 'text-align:center', text: '·' }));
+      } else {
+        const flagged = rate > 1;
+        const td = el('td', { class: `mc-cell click${flagged ? ' flag' : ''}`, style: 'text-align:center',
+          title: `${s} · ${shortName(month)} ${year}${count != null ? ' · ' + count + ' churned' : ''}` },
+          [el('span', { text: fmtPct(rate) })]);
+        td.addEventListener('click', () => {
+          state.mcSquad = s; state.mcMonth = month; state.mcYear = year;
+          pushNav();
+          go('monthly-churn-detail');
+        });
+        cells.push(td);
+      }
+    }
+    tb.append(el('tr', {}, cells));
+  }
+  table.append(tb);
+  const minW = Math.max(900, 160 + months.length * 70);
+  frag.append(el('div', { class: 'panel' }, [el('div', { class: 'table-wrap' }, [el('div', { class: 'churn-table-scroll', style: `min-width:${minW}px` }, [table])])]));
+  return frag;
+}
+
+function viewMonthlyChurnDetail() {
+  const squad = state.mcSquad, monthNum = state.mcMonth, year = state.mcYear;
+  const shortName = (n) => ['','January','February','March','April','May','June','July','August','September','October','November','December'][n];
+  const frag = el('div', {}, []);
+  const back = el('button', { type: 'button', class: 'back-btn' }, [el('span', { class: 'back-arrow', text: '‹' }), 'Go back to previous page']);
+  back.addEventListener('click', () => goBackHistory('monthly-churn'));
+  frag.append(back);
+
+  const props = churnedInSquadMonth(squad, monthNum, year);
+  const { rate } = squadMonthRate(squad, monthNum, year);
+  const period = `${shortName(monthNum)} ${year || ''}`.trim();
+  frag.append(pageHead(`${squad} · ${period}`, `Churned properties this month · rate ${rate !== null ? fmtPct(rate) : '—'}`));
+  frag.append(sectionHead('Churned properties', `${fmtInt(props.length)} in ${squad} · ${period}`));
+
+  if (!props.length) {
+    frag.append(el('div', { class: 'state' }, [el('p', { text: 'No churned properties in this month.' })]));
+    return frag;
+  }
+
+  // join gcf for extra fields
+  const gcfById = {};
+  for (const m of (state.gcfMarginal || [])) if (m.property_id != null) gcfById[pidKey(m.property_id)] = m;
+
+  const table = el('table', { class: 'grid' });
+  const head = ['Property ID', 'Property', 'Squad', 'KAM', 'Churn month', 'Initiated by', 'Reason', 'Delist date'];
+  table.append(el('thead', {}, [el('tr', {}, head.map((h, i) => el('th', { class: i === 0 ? 'freeze' : '', style: 'text-align:left', text: h })))]));
+  const tb = el('tbody', {});
+  for (const r of props) {
+    const by = norm(r.delist_initiated_by) === 'ho' ? 'Home Owner' : norm(r.delist_initiated_by) === 'sv' ? 'StayVista' : (r.delist_initiated_by || '—');
+    tb.append(el('tr', {}, [
+      el('td', { class: 'freeze', style: 'text-align:left', text: r.property_id != null ? String(r.property_id) : '—' }),
+      el('td', { class: 'hl-prop', style: 'text-align:left', text: r.vista_name || '—' }),
+      el('td', { style: 'text-align:left', text: r.squad || '—' }),
+      el('td', { class: 'hl-kam', style: 'text-align:left', text: r.kam || '—' }),
+      el('td', { style: 'text-align:left', text: shortName(monthNum) }),
+      el('td', { style: 'text-align:left', text: by }),
+      el('td', { style: 'text-align:left', text: r.reason_bucket || '—' }),
+      el('td', { style: 'text-align:left', text: r.delist_date ? String(r.delist_date).slice(0, 10) : '—' }),
+    ]));
+  }
+  table.append(tb);
+  frag.append(el('div', { class: 'panel' }, [el('div', { class: 'table-wrap' }, [el('div', { class: 'churn-table-scroll', style: 'min-width:1000px' }, [table])])]));
+  return frag;
+}
+
+function clickableChurnCard(label, value, filter, squad, kam) {
+  const p = new URLSearchParams();
+  p.set('view', 'churn-detail');
+  if (squad) p.set('casquad', squad);
+  if (kam) p.set('cakam', kam);
+  if (filter.gcfLow) p.set('cgcf', '1');
+  if (filter.initiatedBy) p.set('cby', filter.initiatedBy);
+  if (filter.fnb) p.set('cfnb', filter.fnb);
+  if (filter.reason) p.set('creason', filter.reason);
+  const href = '?' + p.toString();
+
+  const card = el('a', { class: 'stat stat-link', href, target: DETAIL_TAB,
+    title: 'Click to see these properties · Ctrl/Cmd-click for a new tab' }, [
+    el('div', { class: 's-label' }, [label, el('span', { class: 'ext', text: ' ↗' })]),
+    el('div', { class: 's-value', text: fmtInt(value) }),
+  ]);
+  card.addEventListener('click', (e) => {
+    if (e.ctrlKey || e.metaKey) return;
+    e.preventDefault();
+    state.caSquad = squad || null;
+    state.caKam = kam || null;
+    state.cd = { gcfLow: !!filter.gcfLow, initiatedBy: filter.initiatedBy || null, fnb: filter.fnb || null, reason: filter.reason || null };
+    state.cdFilters = {};   // clear any leftover dropdown filters from a previous card
+    state.cdPage = 1;
+    pushNav();
+    go('churn-detail');
   });
-  const topStatus = KPI_ORDER[0]; // treat the single most common status as "healthy" reference
-  return Object.entries(groups).map(([name, rows])=>{
-    const total = rows.length;
-    let healthy=0, churnLike=0, renewal=0;
-    rows.forEach(row=>{
-      const f = fieldsFor(row);
-      const sk = statusKey(f.status);
-      if(sk===topStatus) healthy++;
-      else churnLike++;
-      const d = daysRemaining(f.endDateRaw);
-      if(d !== null && d <= RENEWAL_WINDOW_DAYS) renewal++;
+  return card;
+}
+
+
+/* ---- Property Details: the filtered row-level list ---------------------- */
+
+function viewProperties(rows) {
+  // A drilled-in view (from a card click) or a single-status filter should show
+  // just the list — the summary cards would be all-zero-but-one, so drop them.
+  const singleStatus = state.filters.statuses.length === 1 ? state.filters.statuses[0] : null;
+  const drilled = state.focus || !!singleStatus || state.filters.newNoAgreement;
+
+  const heading = state.filters.newNoAgreement ? 'New properties — no agreement yet'
+    : singleStatus ? `${singleStatus} properties`
+    : state.filters.squads.length === 1 ? `${state.filters.squads[0]} properties`
+    : state.filters.kams.length === 1 ? `${state.filters.kams[0]} properties`
+    : 'Property details';
+
+  const frag = el('div', {}, [
+    pageHead(
+      heading,
+      drilled
+        ? 'Filtered view. Use Back to return, or clear the filters to see the full summary.'
+        : 'Every row behind the summaries. Links open in a new tab.'
+    ),
+  ]);
+
+  const oneSquad = state.filters.squads.length === 1 ? state.filters.squads[0] : null;
+  const oneKam = state.filters.kams.length === 1 ? state.filters.kams[0] : null;
+
+  // Agreement cards show ONLY on the unfiltered summary. Once any filter is
+  // active (drilled view), we show just the property list — so the card count
+  // and the list count can never disagree.
+  if (!drilled) {
+    frag.append(
+      sectionHead('Agreement status', `${fmtInt(rows.filter((r) => r.__live === true).length)} live properties in scope`),
+      statusCards(rows.filter((r) => r.__live === true), { live: true }),
+    );
+  }
+
+  // Churn cards: only when a single squad/KAM is selected (not for a status
+  // filter), so the filtered view has that squad/KAM's churn metrics.
+  if (!singleStatus && !state.filters.newNoAgreement && (oneSquad || oneKam)) {
+    frag.append(churnSection(oneKam ? 'kam' : 'squad', oneKam || oneSquad));
+  }
+
+  frag.append(propertyList(rows, { title: drilled ? heading : 'All properties' }));
+  return frag;
+}
+
+/* diagnostics ------------------------------------------------------------- */
+
+const FIELD_DOCS = [
+  ['squad',        'Squad-wise summary',      'squad',                     true],
+  ['kam',          'KAM-wise summary',        'poc',                       true],
+  ['signing',      'Pre-signature statuses',  'contract_signing_status',   true],
+  ['lifecycle',    'Valid / expiry statuses', 'contract_lifecycle_status', false],
+  ['endDate',      'Expiry fallback',         'agreement_end_date',        false],
+  ['property',     'Property names',          'vista_name',                false],
+  ['url',          'Property links',          'villa_details_link',        false],
+  ['agreementUrl', 'Agreement links',         'agreement_link',            false],
+  ['liveStatus',   'Live / not live',         'current_status',            false],
+  ['liveDate',     'Live date fallback',      'live_date',                 false],
+  ['delistDate',   'Delisted check',          'delist_date',               false],
+  ['city',         'City',                    'city',                      false],
+  ['code',         'Property ID',             'property_id',               false],
+  ['reason',       'Why not signed',          'reason_not_signed',         false],
+];
+
+function kv(label, value, tone) {
+  return el('tr', {}, [
+    el('td', { class: 'freeze', 'data-label': 'Field', style: 'text-align:left', text: label }),
+    el('td', { 'data-label': label, style: 'text-align:left' }, [
+      tone ? el('span', { class: 'pill', text: value, style: `background:${tone}; color:#1e1e1e` }) : String(value),
+    ]),
+  ]);
+}
+
+function diagnosticsText() {
+  const d = state.diag;
+  const lines = [
+    'VISTA TRACKER — CONNECTION CHECK',
+    `Project URL      : ${d.projectUrl || '(not set)'}`,
+    `Table in .env    : ${d.tableRequested || '(not set)'}`,
+    `Table actually used: ${d.tableUsed || '(none)'}${d.tableAutoCorrected ? '  <-- auto-corrected for case' : ''}`,
+    `HTTP status      : ${d.httpStatus ?? '(no response)'}`,
+    `Rows fetched     : ${d.rowsFetched ?? 0}${d.reportedTotal != null ? ` of ${d.reportedTotal} reported` : ''}`,
+    `Requests made    : ${d.requests ?? 0}`,
+    d.availableTables ? `Tables visible   : ${d.availableTables.join(', ')}` : null,
+    state.error ? `ERROR            : ${state.error}` : null,
+    '',
+    'COLUMN MAPPING',
+    ...FIELD_DOCS.map(([f, use]) => `  ${use.padEnd(22)} -> ${state.cols[f] || 'NOT FOUND'}`),
+    '',
+    `ALL COLUMNS IN TABLE (${(d.allColumns || []).length})`,
+    `  ${(d.allColumns || []).join(' | ') || '(none)'}`,
+    '',
+    'STATUS VALUES FOUND',
+    ...(d.statusMap || []).map((s) => `  "${s.raw}" -> ${s.bucket}  [via ${s.source || 'nothing matched'}]  (${s.count})`),
+  ];
+  return lines.filter((l) => l !== null).join('\n');
+}
+
+function viewHelp() {
+  const frag = el('div', {}, []);
+  frag.append(pageHead('Help & How it works', 'A plain-language guide to Vista Tracker — for anyone on the team.'));
+
+  const section = (title, children) =>
+    el('div', { class: 'help-card' }, [el('h3', { class: 'help-h', text: title }), ...children]);
+  const p = (text) => el('p', { class: 'help-p', text });
+  const steps = (items) => el('ol', { class: 'help-steps' }, items.map((t) => el('li', { text: t })));
+  const rows = (pairs) => el('div', { class: 'help-table' },
+    pairs.map(([k, v]) => el('div', { class: 'help-row' }, [el('div', { class: 'help-k', text: k }), el('div', { class: 'help-v', text: v })])));
+
+  // What it is
+  frag.append(section('What this dashboard is', [
+    p('Vista Tracker is a read-only view of our property, agreement, and churn data. It does not change any data — it only shows what is already in our Google Sheets. Think of it as a live window onto the sheets, organised for quick answers.'),
+  ]));
+
+  // Where the data comes from
+  frag.append(section('Where the numbers come from (the data journey)', [
+    p('The data flows in one direction, automatically, once a day:'),
+    steps([
+      'Our Google Sheets hold the master data (properties, agreements, churn).',
+      'A small automatic script (Apps Script) copies the sheets into a database (Supabase) every hour.',
+      'The dashboard reads from that database and shows it here.',
+    ]),
+    p('So if a number looks wrong, the fix is almost always in the Google Sheet, not the dashboard. The dashboard faithfully shows whatever the sheet contains.'),
+  ]));
+
+  // The tabs
+  frag.append(section('What each tab shows', [
+    rows([
+      ['Live Properties', 'The headline view: how many properties are live, the churn rate, and what needs action.'],
+      ['Squad-wise', 'The same numbers broken down by squad.'],
+      ['KAM-wise', 'Broken down by each Key Account Manager (from the “Owner Facing AM” column).'],
+      ['Monthly churn', 'Churn rate for each squad, month by month. Use the FY toggle to switch financial years. Click any cell to see the exact properties that churned that month.'],
+      ['Property Details', 'The full searchable list of properties, with filters.'],
+    ]),
+  ]));
+
+  // Key definitions
+  frag.append(section('How the key numbers are defined', [
+    rows([
+      ['Live property', 'A property whose Current Status is “Live”.'],
+      ['Churned property', 'A property whose status is Delisted, TAC, or Paused.'],
+      ['Churn rate', 'Churned ÷ (current live + churned) × 100.'],
+      ['Time window', 'Churn is counted from April 2025 up to today, and moves forward automatically.'],
+      ['KAM', 'The “Owner Facing AM” from the sheet (a different person from the POC).'],
+    ]),
+  ]));
+
+  // Refreshing
+  frag.append(section('Keeping it up to date', [
+    p('The data syncs automatically every hour. To pull the very latest at any moment, click the “Refresh” button at the top right. The time next to it shows when the data was last loaded.'),
+  ]));
+
+  // Troubleshooting — the main ask
+  frag.append(section('If something looks wrong or won’t load', [
+    p('Most problems fall into a few simple buckets. Try these in order before escalating:'),
+    el('div', { class: 'help-trouble' }, [
+      el('div', { class: 'help-tr' }, [
+        el('strong', { text: '“The dashboard could not load” / it spins forever' }),
+        p('Usually a slow connection or a sync still running. Click “Try again”, check your internet, and if a sync was just started, wait a minute and retry. It now retries slow loads on its own, so this should be rare.'),
+      ]),
+      el('div', { class: 'help-tr' }, [
+        el('strong', { text: 'The totals suddenly dropped (e.g. far fewer properties than usual)' }),
+        p('This usually means the hourly sync did not finish. Ask whoever manages the Apps Script to run “syncSheetToSupabase” again and let it finish. The dashboard is showing the database honestly — the database is just incomplete.'),
+      ]),
+      el('div', { class: 'help-tr' }, [
+        el('strong', { text: 'A specific number doesn’t match our sheet' }),
+        p('The dashboard mirrors the sheet, so the difference is almost always in the data: a duplicate row, a blank date, or a status typed differently (e.g. “T.A.C.” vs “TAC”). Check the sheet for that property.'),
+      ]),
+      el('div', { class: 'help-tr' }, [
+        el('strong', { text: 'A name looks wrong (e.g. KAM shows the wrong person)' }),
+        p('Check the matching column in the source sheet for that property. If the sheet is right but the dashboard is wrong, note it down and pass it to whoever maintains the dashboard.'),
+      ]),
+    ]),
+    p('For anything technical, open the “Connection check” page (it appears on the error screen) and share it with the tech team — it has the details they need.'),
+  ]));
+
+  // Who to contact
+  frag.append(section('Who maintains this', [
+    p('This dashboard was built and is maintained internally. Keep a note here of who to contact when something breaks, so the team always knows where to turn:'),
+    p('Maintainer: Lavanya Pujari (lavanya.pujari@stayvista.co.in). Tech/database questions: the team managing Supabase and the Apps Script sync.'),
+  ]));
+
+  return frag;
+}
+
+function viewDiagnostics() {
+  const d = state.diag;
+  const frag = el('div', {}, [
+    pageHead('Connection check', 'Exactly what the app asked Supabase for, what came back, and how each column was matched. If a tab is empty, the answer is on this page.'),
+  ]);
+
+  if (state.sub === 'connection') {
+    const rows = [
+      kv('Project URL', d.projectUrl || '(not set)'),
+      kv('Table name in .env', d.tableRequested || '(not set)'),
+      kv('Table actually read', d.tableUsed || '(none)', d.tableAutoCorrected ? '#fcd4a8' : null),
+      kv('Request URL', d.endpoint || '(never reached)'),
+      kv('HTTP status', String(d.httpStatus ?? 'no response'), d.httpStatus === 200 || d.httpStatus === 206 ? '#a8d5bd' : '#e9a0a7'),
+      kv('Rows fetched', `${fmtInt(d.rowsFetched || 0)}${d.reportedTotal != null ? ` (table reports ${fmtInt(d.reportedTotal)})` : ''}`),
+      kv('Paged requests', String(d.requests || 0)),
+    ];
+    if (d.availableTables) rows.push(kv('Tables this key can see', d.availableTables.join(', ') || '(none)'));
+
+    frag.append(el('div', { class: 'panel' }, [
+      el('div', { class: 'panel-head' }, [el('h3', { text: 'Where the data comes from' })]),
+      el('div', { class: 'table-wrap stacked-wrap' }, [
+        el('table', { class: 'grid stacked' }, [
+          el('thead', {}, [el('tr', {}, [
+            el('th', { scope: 'col', class: 'freeze', style: 'text-align:left', text: 'Setting' }),
+            el('th', { scope: 'col', style: 'text-align:left', text: 'Value' }),
+          ])]),
+          el('tbody', {}, rows),
+        ]),
+      ]),
+    ]));
+
+    if (d.tableAutoCorrected) {
+      frag.append(el('div', { class: 'panel' }, [
+        el('div', { class: 'panel-body' }, [
+          el('p', { style: 'margin:0', html: `Your <code>.env</code> says <code>${d.tableRequested}</code> but the real table is <code>${d.tableUsed}</code>. The app corrected this automatically — update <code>.env</code> to match and you save one round trip on every load.` }),
+        ]),
+      ]));
+    }
+
+    const copy = el('button', { type: 'button', class: 'reset-btn', text: 'Copy this report' });
+    copy.addEventListener('click', async () => {
+      const text = diagnosticsText();
+      try { await navigator.clipboard.writeText(text); copy.textContent = 'Copied'; }
+      catch { window.prompt('Copy the text below:', text); }
+      setTimeout(() => { copy.textContent = 'Copy this report'; }, 1800);
     });
-    const churnRate = total ? Math.round((churnLike/total)*1000)/10 : 0;
-    return { name, total, healthy, churnLike, churnRate, renewal };
-  });
-}
-function topSquadStripsHtml(){
-  const rows = computeLeaderboard('squad').sort((a,b)=>b.total-a.total).slice(0,5);
-  const maxTotal = Math.max(...rows.map(r=>r.total), 1);
-  const healthyLabel = KPI_LABELS[KPI_ORDER[0]] || 'Healthy';
-  return `
-    <div class="section-card">
-      <div class="section-title">Top 5 Squads</div>
-      <div class="section-desc">Ranked by total properties · ${escapeHtml(healthyLabel)} count and churn rate shown for context.</div>
-      <div class="squad-strips">
-        ${rows.map(r=>`
-          <div class="squad-strip" onclick="openTab('${tabIdFor('SQUAD', r.name).replace(/'/g,"\\'")}')">
-            <div class="squad-strip-top">
-              <span class="squad-strip-name">${escapeHtml(r.name)}</span>
-              <span class="squad-strip-total">${r.total}</span>
-            </div>
-            <div class="squad-strip-bar"><div class="squad-strip-fill" style="width:${(r.total/maxTotal)*100}%"></div></div>
-            <div class="squad-strip-meta">
-              <span>${escapeHtml(healthyLabel)}: ${r.healthy}</span>
-              <span class="lb-badge ${r.churnRate<=15?'good':r.churnRate<=35?'warn':'bad'}">${r.churnRate}% churn</span>
-            </div>
-          </div>`).join('')}
-      </div>
-    </div>`;
-}
 
-/* ---------- COMPACT LEADERBOARDS ---------- */
-function leaderboardData(field){
-  const grouped = {};
-  allRows.forEach(row=>{ const key = fieldsFor(row)[field]; (grouped[key] = grouped[key] || []).push(row); });
-  return Object.entries(grouped).map(([name, rows])=>{
-    const health = Math.round(rows.reduce((sum,row)=>sum + healthFor(row).score,0) / rows.length);
-    const risk = rows.filter(row=>healthFor(row).score < 40).length;
-    return {name, health, risk, total:rows.length};
-  }).sort((a,b)=>b.health-a.health || b.total-a.total).slice(0,3);
-}
-function compactLeaderboardHtml(){
-  const block = (title, subtitle, field) => `<div class="leaderboard-panel"><div><div class="section-title">${title}</div><div class="section-desc">${subtitle}</div></div><div class="leaderboard-tiles">${leaderboardData(field).map((item,index)=>`<div class="leaderboard-tile"><span class="rank-no">0${index+1}</span><div class="mini-score ${item.health>=80?'good':item.health>=60?'steady':'watch'}"><b>${item.health}</b><small>health</small></div><strong title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</strong><span>${item.total} homes · ${item.risk} at risk</span></div>`).join('')}</div></div>`;
-  return `<section class="leaderboard-duo">${block('Squad pulse','Top health performers at a glance.','squad')}${block('KAM pulse','The clearest compact view of ownership.','owner')}</section>`;
-}
-
-/* ---------- NEEDS ATTENTION — 2 categories, squad rollup with dropdown ---------- */
-let attnActiveTab = 'exp';
-function setAttnTab(t){ attnActiveTab = t; renderActiveTab(); }
-
-function urgencyRing(daysVal, isAwaiting){
-  const r = 12, stroke = 4, circ = 2*Math.PI*r;
-  let pct, color, label;
-  if(isAwaiting){
-    pct = Math.min((daysVal||0)/30, 1);
-    color = daysVal>=30 ? '#a13f30' : daysVal>=21 ? '#b58a1f' : '#c9a227';
-    label = daysVal;
-  } else if(daysVal < 0){
-    pct = 1; color = '#6b1f14'; label = '!';
-  } else {
-    pct = 1 - Math.min(daysVal/30, 1);
-    color = daysVal<=7 ? '#a13f30' : '#b58a1f';
-    label = daysVal;
+    frag.append(el('div', { class: 'panel' }, [
+      el('div', { class: 'panel-head' }, [el('h3', { text: 'Send this if something still looks wrong' })]),
+      el('div', { class: 'panel-body' }, [
+        el('p', { style: 'margin:0 0 12px', text: 'This copies the whole report as plain text — table name, status code, column mapping and every status value found. It contains no keys or property data.' }),
+        copy,
+      ]),
+    ]));
+    return frag;
   }
-  const dash = pct*circ;
-  return `<svg width="30" height="30" viewBox="0 0 30 30" class="urgency-ring" title="${isAwaiting?daysVal+'d waiting':(daysVal<0?'Expired':daysVal+'d left')}">
-    <circle cx="15" cy="15" r="${r}" fill="none" stroke="#eee" stroke-width="${stroke}"/>
-    <circle cx="15" cy="15" r="${r}" fill="none" stroke="${color}" stroke-width="${stroke}" stroke-dasharray="${dash.toFixed(2)} ${(circ-dash).toFixed(2)}" stroke-dashoffset="${(circ/4).toFixed(2)}" transform="rotate(-90 15 15)"/>
-    <text x="15" y="19" text-anchor="middle" font-size="9" font-weight="700" fill="${color}">${label}</text>
-  </svg>`;
-}
 
-function needsAttentionCompactHtml(){
-  const enriched = allRows.map(row=>{
-    const f = fieldsFor(row);
-    const lvl = urgencyLevel(f.endDateRaw);
-    const d = daysRemaining(f.endDateRaw);
-    const awaiting = isAwaitingResponse(f);
-    const waitingDays = awaiting ? daysSince(f.sentToOwnerRaw) : null;
-    return { row, f, lvl, d, awaiting, waitingDays };
-  });
-  const expiryGroup = enriched.filter(x=>x.lvl);
-  const responseGroup = enriched.filter(x=>x.awaiting);
+  if (state.sub === 'columns') {
+    const body = FIELD_DOCS.map(([field, use, expected, required]) => {
+      const found = state.cols[field];
+      const sample = found && state.raw.length
+        ? clean(state.raw.find((r) => clean(r[found]))?.[found] ?? '')
+        : '';
+      return el('tr', {}, [
+        el('td', { class: 'freeze', 'data-label': 'Used for', style: 'text-align:left', text: use }),
+        el('td', { 'data-label': 'Expected', style: 'text-align:left', text: expected }),
+        el('td', { 'data-label': 'Column found', style: 'text-align:left' }, [
+          found
+            ? el('span', { class: 'pill', text: found, style: 'background:#a8d5bd; color:#1e1e1e' })
+            : el('span', { class: 'pill', text: required ? 'NOT FOUND — required' : 'not found — optional', style: `background:${required ? '#e9a0a7' : '#ebe6de'}; color:#1e1e1e` }),
+        ]),
+        el('td', { 'data-label': 'Sample value', style: 'text-align:left', text: sample || '—' }),
+      ]);
+    });
 
-  function bySquad(list){
-    const map = {};
-    list.forEach(x=>{ (map[x.f.squad] = map[x.f.squad] || []).push(x); });
-    return Object.entries(map).sort((a,b)=>b[1].length-a[1].length);
+    const used = new Set(Object.values(state.cols).filter(Boolean));
+    const spare = (d.allColumns || []).filter((c) => !used.has(c));
+
+    frag.append(el('div', { class: 'panel' }, [
+      el('div', { class: 'panel-head' }, [
+        el('h3', { text: 'How each column was matched' }),
+        el('span', { class: 'hint right', text: 'Matching ignores case, spaces and punctuation' }),
+      ]),
+      el('div', { class: 'table-wrap stacked-wrap' }, [
+        el('table', { class: 'grid stacked' }, [
+          el('thead', {}, [el('tr', {}, ['Used for', 'Expected heading', 'Column found', 'Sample value'].map((h, i) =>
+            el('th', { scope: 'col', class: i === 0 ? 'freeze' : '', style: 'text-align:left', text: h })))]),
+          el('tbody', {}, body),
+        ]),
+      ]),
+    ]));
+
+    const det = d.statusDetection || [];
+    if (det.length) {
+      frag.append(el('div', { class: 'panel' }, [
+        el('div', { class: 'panel-head' }, [
+          el('h3', { text: 'How the status columns were told apart' }),
+          el('span', { class: 'hint right', text: 'Decided by the values, not the column name' }),
+        ]),
+        el('div', { class: 'table-wrap stacked-wrap' }, [
+          el('table', { class: 'grid stacked' }, [
+            el('thead', {}, [el('tr', {}, ['Column', 'Filled', 'Recognised', 'Pre-signature', 'Expiry', 'Valid', 'Used as'].map((h, i) =>
+              el('th', { scope: 'col', class: i === 0 ? 'freeze' : '', style: i < 1 ? 'text-align:left' : '', text: h })))]),
+            el('tbody', {}, det.map((c) => el('tr', {}, [
+              el('td', { class: 'freeze', 'data-label': 'Column', style: 'text-align:left', text: c.key }),
+              el('td', { 'data-label': 'Filled', text: fmtInt(c.filled) }),
+              el('td', { 'data-label': 'Recognised', text: fmtInt(c.mapped) }),
+              el('td', { 'data-label': 'Pre-signature', text: fmtInt(c.pre) }),
+              el('td', { 'data-label': 'Expiry', text: fmtInt(c.post) }),
+              el('td', { 'data-label': 'Valid', text: fmtInt(c.valid) }),
+              el('td', { 'data-label': 'Used as', style: 'text-align:left' }, [
+                c.key === state.cols.signing ? statusPill('Not Signed') : null,
+                c.key === state.cols.lifecycle ? statusPill('Valid') : null,
+                (c.key !== state.cols.signing && c.key !== state.cols.lifecycle)
+                  ? el('span', { class: 'zero', text: 'not used' }) : null,
+              ]),
+            ]))),
+          ]),
+        ]),
+      ]));
+    }
+
+    frag.append(el('div', { class: 'panel' }, [
+      el('div', { class: 'panel-head' }, [
+        el('h3', { text: 'Other columns in the table' }),
+        el('span', { class: 'hint right', text: `${fmtInt(spare.length)} unused` }),
+      ]),
+      el('div', { class: 'panel-body' }, [
+        spare.length
+          ? el('div', { style: 'display:flex; flex-wrap:wrap; gap:6px' }, spare.map((c) =>
+              el('span', { class: 'chip' }, [el('span', { class: 'chip-val', text: c })])))
+          : el('p', { style: 'margin:0', text: 'Every column in the table is being used.' }),
+      ]),
+    ]));
+    return frag;
   }
-  const expiryBySquad = bySquad(expiryGroup);
-  const responseBySquad = bySquad(responseGroup);
 
-  const isAwaitingTab = attnActiveTab === 'resp';
-  const entries = isAwaitingTab ? responseBySquad : expiryBySquad;
-  const emptyMsg = isAwaitingTab
-    ? (SENT_DATE_KEY ? 'No properties waiting on a response right now.' : 'This category needs a "sent to owner date" column in Supabase to work.')
-    : 'Nothing urgent right now.';
+  if (state.sub === 'values') {
+    const map = d.statusMap || [];
+    const bad = map.filter((s) => s.bucket === UNMAPPED);
 
-  const maxCount = Math.max(...entries.map(([,l])=>l.length), 1);
-  const miniChart = entries.length ? `
-    <div class="attn-mini-chart">
-      ${entries.slice(0,8).map(([sq,list])=>`
-        <div class="attn-mini-bar-row">
-          <span class="attn-mini-label">${escapeHtml(sq)}</span>
-          <div class="attn-mini-track"><div class="attn-mini-fill" style="width:${(list.length/maxCount)*100}%;background:${isAwaitingTab?'#b58a1f':'#a13f30'}"></div></div>
-          <span class="attn-mini-value">${list.length}</span>
-        </div>`).join('')}
-    </div>` : '';
+    frag.append(el('div', { class: 'panel' }, [
+      el('div', { class: 'panel-head' }, [
+        el('h3', { text: 'Every status value in the table, and where it lands' }),
+        el('span', { class: 'hint right', text: `${fmtInt(map.length)} distinct values` }),
+      ]),
+      el('div', { class: 'table-wrap stacked-wrap' }, [
+        el('table', { class: 'grid stacked' }, [
+          el('thead', {}, [el('tr', {}, [
+            el('th', { scope: 'col', class: 'freeze', style: 'text-align:left', text: 'Value in the table' }),
+            el('th', { scope: 'col', style: 'text-align:left', text: 'Counted as' }),
+            el('th', { scope: 'col', style: 'text-align:left', text: 'Decided by' }),
+            el('th', { scope: 'col', text: 'Rows' }),
+          ])]),
+          el('tbody', {}, map.length ? map.map((s) => el('tr', {}, [
+            el('td', { class: 'freeze', 'data-label': 'Value', style: 'text-align:left', text: s.raw || '(blank)' }),
+            el('td', { 'data-label': 'Counted as', style: 'text-align:left' }, [statusPill(s.bucket)]),
+            el('td', { 'data-label': 'Decided by', style: 'text-align:left', text: s.source || 'nothing matched' }),
+            el('td', { 'data-label': 'Rows', text: fmtInt(s.count) }),
+          ])) : [el('tr', {}, [el('td', { colspan: 4, class: 'freeze', text: 'No rows loaded.' })])]),
+        ]),
+      ]),
+    ]));
 
-  const squadListHtml = entries.length===0 ? `<div class="empty-note">${emptyMsg}</div>` : `
-    <div class="attn-squad-list">
-      ${entries.map(([sq, list], i)=>`
-        <div class="attn-squad-row">
-          <div class="attn-squad-head" onclick="toggleAttnSquad('${attnActiveTab}-${i}')">
-            <span class="attn-caret" id="attn-caret-${attnActiveTab}-${i}">▸</span>
-            <span class="attn-squad-name">${escapeHtml(sq)}</span>
-            <span class="attn-squad-count">${list.length}</span>
-          </div>
-          <div class="attn-squad-body hidden" id="attn-body-${attnActiveTab}-${i}">
-            ${list.map(x=>`
-              <div class="attn-prop-row" onclick='openDetailFromRow(${JSON.stringify(JSON.stringify(x.row))})'>
-                ${urgencyRing(isAwaitingTab ? x.waitingDays : x.d, isAwaitingTab)}
-                <span class="attn-prop-name">${escapeHtml(x.f.name)}</span>
-              </div>`).join('')}
-          </div>
-        </div>`).join('')}
-    </div>`;
+    if (bad.length) {
+      frag.append(el('div', { class: 'panel' }, [
+        el('div', { class: 'panel-body' }, [
+          el('p', { style: 'margin:0', html: `${bad.length} value(s) did not match any of the seven MIS buckets and are being counted under <strong>Unmapped</strong>. Send me the exact spellings and I will add them to <code>normalizeStatus()</code>.` }),
+        ]),
+      ]));
+    }
+    return frag;
+  }
 
-  return `
-    <div class="section-card">
-      <div class="section-title">Needs Attention</div>
-      <div class="section-desc">Click a squad to see property names.</div>
-      <div class="attn-tabs">
-        <div class="attn-tab ${attnActiveTab==='exp'?'active':''}" onclick="setAttnTab('exp')">Expired / Needs Renewal <span class="attn-tab-count">${expiryGroup.length}</span></div>
-        <div class="attn-tab ${attnActiveTab==='resp'?'active':''}" onclick="setAttnTab('resp')">Awaiting Owner Response <span class="attn-tab-count">${responseGroup.length}</span></div>
-      </div>
-      ${miniChart}
-      ${squadListHtml}
-    </div>`;
+  // raw sample
+  const sample = state.raw[0];
+  frag.append(el('div', { class: 'panel' }, [
+    el('div', { class: 'panel-head' }, [
+      el('h3', { text: 'First row exactly as Supabase returned it' }),
+      el('span', { class: 'hint right', text: 'Column names on the left are the real ones' }),
+    ]),
+    el('div', { class: 'panel-body' }, [
+      sample
+        ? el('pre', {
+            style: 'margin:0; overflow-x:auto; font-size:12px; line-height:1.6; background:var(--surface-2); padding:12px; border-radius:8px',
+            text: JSON.stringify(sample, null, 2),
+          })
+        : el('p', { style: 'margin:0', text: 'No rows came back, so there is nothing to show. Check the Connection tab.' }),
+    ]),
+  ]));
+  return frag;
 }
-function toggleAttnSquad(key){
-  const body = document.getElementById('attn-body-'+key);
-  const caret = document.getElementById('attn-caret-'+key);
-  if(!body) return;
-  body.classList.toggle('hidden');
-  caret.textContent = body.classList.contains('hidden') ? '▸' : '▾';
-}
-function openDetailFromRow(rowJsonStr){ activeRow = JSON.parse(rowJsonStr); renderActiveTab(); }
 
-/* ---------- PORTFOLIO OPERATIONS ---------- */
-function healthFor(row){
-  const f = fieldsFor(row); let score = 100; const status = f.status.toLowerCase();
-  if(status.includes('delist')) score -= 38; else if(status.includes('never')) score -= 32; else if(status.includes('pause')) score -= 24; else if(status.includes('hand')) score -= 12;
-  const urgency = urgencyLevel(f.endDateRaw);
-  if(urgency==='expired') score -= 34; else if(urgency==='red') score -= 24; else if(urgency==='orange') score -= 12;
-  else { const days = daysRemaining(f.endDateRaw); if(days !== null && days <= RENEWAL_WINDOW_DAYS) score -= 5; }
-  if(isAwaitingResponse(f)) score -= 10;
-  score = Math.max(0, Math.min(100, score));
-  const label = score >= 80 ? 'Thriving' : score >= 60 ? 'Stable' : score >= 40 ? 'Watchlist' : 'At risk';
-  const tone = score >= 80 ? 'good' : score >= 60 ? 'steady' : score >= 40 ? 'watch' : 'risk';
-  return {score,label,tone};
-}
-function healthSummaryHtml(rows, scopeName){
-  const values = rows.map(healthFor), average = values.length ? Math.round(values.reduce((sum, item)=>sum + item.score, 0) / values.length) : 0;
-  const atRisk = values.filter(item=>item.score < 40).length, thriving = values.filter(item=>item.score >= 80).length;
-  const tone = average >= 80 ? 'good' : average >= 60 ? 'steady' : average >= 40 ? 'watch' : 'risk';
-  return `<section class="scope-summary"><div class="scope-score ${tone}"><span class="scope-score-label">${escapeHtml(scopeName)} health</span><strong>${average}</strong><span>/ 100</span></div><div class="scope-insight"><b>${thriving}</b><span>homes are thriving</span></div><div class="scope-insight"><b>${atRisk}</b><span>homes need intervention</span></div><div class="scope-insight scope-tip"><span>Focus first on expired agreements and owner responses older than ${NO_RESPONSE_THRESHOLD_DAYS} days.</span></div></section>`;
-}
-function renewalTimelineHtml(rows){
-  const dated = rows.map(row=>({row, f:fieldsFor(row), days:daysRemaining(fieldsFor(row).endDateRaw)})).filter(item=>item.days !== null && item.days <= 120);
-  const upcoming = [...dated.filter(item=>item.days >= 0).sort((a,b)=>a.days-b.days).slice(0,5), ...dated.filter(item=>item.days < 0).sort((a,b)=>b.days-a.days).slice(0,3)];
-  if(!upcoming.length) return `<div class="section-card"><div class="section-title">Renewal runway</div><div class="empty-note">No agreement end dates are available for the next 120 days.</div></div>`;
-  return `<section class="section-card renewal-card"><div class="section-title">Renewal runway</div><div class="section-desc">A visual view of the next 120 days. Start with the homes closest to their renewal date.</div><div class="renewal-axis"><span>Overdue</span><span>30 days</span><span>60 days</span><span>90 days</span><span>120 days</span></div><div class="renewal-list">${upcoming.map(item=>{ const health = healthFor(item.row), position = Math.max(0, Math.min(100, (Math.max(item.days,0)/120)*100)), marker = item.days < 0 ? 'overdue' : item.days <= 30 ? 'soon' : item.days <= 60 ? 'watch' : 'planned', title = item.days < 0 ? `${Math.abs(item.days)}d overdue` : `${item.days}d to renewal`; return `<button class="renewal-row" onclick='openDetailFromRow(${JSON.stringify(JSON.stringify(item.row))})'><span class="renewal-name">${escapeHtml(item.f.name)}</span><span class="renewal-track"><i class="renewal-marker ${marker}" style="left:${position}%"></i></span><span class="renewal-days ${marker}">${title}</span><span class="health-mini ${health.tone}">${health.score}</span></button>`; }).join('')}</div></section>`;
-}
-function followUpWorkflowHtml(rows){
-  const dated = rows.map(row=>({row, f:fieldsFor(row), days:daysRemaining(fieldsFor(row).endDateRaw)})).filter(item=>item.days !== null && item.days <= 30);
-  const candidates = [...dated.filter(item=>item.days >= 0).sort((a,b)=>a.days-b.days).slice(0,3), ...dated.filter(item=>item.days < 0).sort((a,b)=>b.days-a.days).slice(0,2)];
-  if(!candidates.length) return '';
-  return `<section class="section-card followup-card"><div class="section-title">Owner follow-up queue</div><div class="section-desc">A focused working list for this session. Mark items done once the owner has been contacted.</div><div class="followup-list">${candidates.map(item=>{ const key = `${activeTabId}-${item.f.name}-${item.f.endDateRaw}`, done = followUpDone.has(key), due = item.days < 0 ? `Overdue by ${Math.abs(item.days)}d` : `Due in ${item.days}d`; return `<div class="followup-item ${done?'done':''}"><button class="followup-check" onclick="toggleFollowUp(${JSON.stringify(key)})" aria-label="Mark follow-up complete">${done?'✓':''}</button><div class="followup-copy"><b>${escapeHtml(item.f.name)}</b><span>${escapeHtml(item.f.owner)} · ${due}</span></div><button class="nudge-btn" onclick='prepareNudge(${JSON.stringify(JSON.stringify(item.row))})'>Prepare nudge</button></div>`; }).join('')}</div><div id="nudge-note" class="nudge-note" aria-live="polite"></div></section>`;
-}
-function portfolioAskHtml(){ return `<section class="ask-card"><div><span class="eyebrow">Portfolio intelligence</span><h3>Ask the portfolio</h3><p>Try “expiring in 30 days”, “at risk in Goa”, or “live homes with KAM Rahul”.</p></div><div class="ask-form"><input id="ask-portfolio-input" placeholder="Ask a portfolio question..." onkeydown="if(event.key==='Enter') askPortfolio()"><button onclick="askPortfolio()">Ask</button></div><div id="ask-portfolio-answer" class="ask-answer"></div></section>`; }
-function askPortfolio(){
-  const input = document.getElementById('ask-portfolio-input'), answer = document.getElementById('ask-portfolio-answer'); if(!input || !answer) return;
-  const query = input.value.trim().toLowerCase(); if(!query){ answer.textContent = 'Ask about renewals, health, status, a city, squad, or KAM.'; return; }
-  let matches = allRows.slice();
-  if(/expir|renew|overdue/.test(query)) matches = matches.filter(row=>{ const d=daysRemaining(fieldsFor(row).endDateRaw); return d !== null && (query.includes('overdue') ? d < 0 : d <= (query.includes('30') ? 30 : query.includes('60') ? 60 : 120)); });
-  if(/risk|health/.test(query)) matches = matches.filter(row=>healthFor(row).score < 60);
-  if(/live/.test(query)) matches = matches.filter(row=>fieldsFor(row).status.toLowerCase().includes('live'));
-  const token = [...squadList.map(x=>x.name),...pocList.map(x=>x.name),...allRows.map(r=>fieldsFor(r).city)].find(name=>name && query.includes(name.toLowerCase()));
-  if(token) matches = matches.filter(row=>{const f=fieldsFor(row); return f.squad===token || f.owner===token || f.city===token;});
-  const preview = matches.slice(0,3).map(row=>escapeHtml(fieldsFor(row).name)).join(', '); answer.innerHTML = `<b>${matches.length} home${matches.length===1?'':'s'} found.</b>${preview ? ` Start with ${preview}.` : ' Try a city, squad, KAM, status, or renewal window.'}`;
-}
-function toggleFollowUp(key){ followUpDone.has(key) ? followUpDone.delete(key) : followUpDone.add(key); renderActiveTab(); }
-function prepareNudge(rowJson){ const f = fieldsFor(JSON.parse(rowJson)), note = document.getElementById('nudge-note'); if(note) note.textContent = `Draft ready: Hi ${f.owner}, could you share an update on ${f.name} and its agreement renewal?`; }
-function sopHtml(){ return `<div class="view-header"><div><h2>Playbook & SOPs</h2><p class="desc">A shared rhythm for renewals, owner follow-ups, and portfolio health.</p></div></div><section class="sop-hero"><span class="eyebrow">Operations playbook</span><h1>Consistent actions.<br><em>Better stays.</em></h1><p>Use these lightweight SOPs to turn every dashboard signal into a clear next step.</p></section><div class="sop-grid"><article class="sop-card"><span>01</span><h3>Renewal runway</h3><p>Review the 120-day timeline weekly. Start outreach at 90 days; escalate at 30 days; flag overdue agreements immediately.</p></article><article class="sop-card"><span>02</span><h3>Owner follow-up</h3><p>Log an owner contact attempt, prepare a nudge, and mark it complete only when the next action and due date are clear.</p></article><article class="sop-card"><span>03</span><h3>Health review</h3><p>Investigate homes below 60. Prioritise expired agreements, paused homes, and unanswered owner communications.</p></article><article class="sop-card"><span>04</span><h3>Squad & KAM review</h3><p>Open each team tab in the weekly review. Agree one owner, one next step, and one due date for every at-risk home.</p></article></div>`; }
+/* 9 ------------------------------------------------------------------- chrome */
 
-/* ---------- MIS DOWNLOAD (button lives next to Refresh, no separate tab) ---------- */
-function csvEscape(v){
-  const s = (v===null||v===undefined) ? '' : String(v);
-  return /[",\n]/.test(s) ? '"'+s.replace(/"/g,'""')+'"' : s;
+function renderSidebar() {
+  const nav = $('#sidebar');
+  nav.replaceChildren();
+
+  const rows = activeRows();
+  const liveRows = rows.filter((r) => r.__live === true);
+  const countFor = {
+    // squad/KAM pages show LIVE properties only, so count distinct squads/KAMs
+    // among live properties — otherwise the badge (all rows) wouldn't match the
+    // number of cards on the page (live only).
+    overview: liveRows.length,
+    squad: new Set(liveRows.map((r) => r.__squad)).size,
+    kam: new Set(liveRows.map((r) => r.__kam)).size,
+    properties: rows.length,
+  };
+
+  for (const group of ['Summary', 'Detail', 'Setup']) {
+    const g = el('div', { class: 'nav-group' }, [el('div', { class: 'nav-label', text: group })]);
+
+    for (const v of VIEWS.filter((x) => x.group === group)) {
+
+      const a = el('a', {
+        class: 'nav-item',
+        href: urlFor(v.id, defaultSub(v.id)),
+        'aria-current': state.view === v.id ? 'page' : null,
+      }, [
+        el('span', { class: 'dot' }),
+        el('span', { class: 'label', text: v.label }),
+        countFor[v.id] === undefined ? null : el('span', { class: 'nav-count', text: fmtInt(countFor[v.id]) }),
+      ]);
+      a.addEventListener('click', (e) => {
+        if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return; // let the browser open a new tab
+        e.preventDefault();
+        go(v.id);
+      });
+      g.append(a);
+    }
+    nav.append(g);
+  }
 }
-function downloadReportCsv(){
-  const headers = ['Property','Squad','POC','Status','Live Date','Contract Status','Agreement End Date','Days Remaining','City'];
-  const lines = [headers.join(',')];
-  allRows.forEach(row=>{
-    const f = fieldsFor(row);
-    const d = daysRemaining(f.endDateRaw);
-    lines.push([f.name,f.squad,f.owner,f.status,f.kickoff,f.contractStatus,f.endDateRaw||'',d===null?'':d,f.city].map(csvEscape).join(','));
+
+function renderTabs() {
+  const strip = $('#tab-strip');
+  strip.replaceChildren();
+  const subs = SUBTABS[state.view] || [];
+  if (subs.length < 2) return;
+
+  for (const s of subs) {
+    const b = el('button', {
+      type: 'button',
+      class: 'tab',
+      role: 'tab',
+      'aria-selected': state.sub === s.id ? 'true' : 'false',
+      text: s.label,
+    });
+    b.addEventListener('click', () => { state.sub = s.id; syncUrl(); renderTabs(); renderView(); });
+    strip.append(b);
+  }
+  strip.setAttribute('role', 'tablist');
+}
+
+/* The three dropdowns are built once and kept mounted. Rebuilding them on every
+   change closed the panel after a single tick, which made multi-select useless. */
+const filterUI = { built: false, controls: {}, note: null, reset: null };
+
+const FILTER_FIELDS = {
+  squads:   { field: '__squad',  skip: 'squad',  key: 'squad',  label: 'Squad'  },
+  kams:     { field: '__kam',    skip: 'kam',    key: 'kam',    label: 'KAM'    },
+  statuses: { field: '__status', skip: 'status', key: 'status', label: 'Status' },
+};
+
+// Churn pages get their OWN top filter bar (no agreement Status/Search that
+// don't apply to churned data). Same visual style as the agreement bar.
+// Filters: Months, Years, Squad, KAM, F&B, Reason, Initiated-by, GCF, Search.
+const CHURN_VIEWS_WITH_BAR = ['churned', 'churn-detail', 'churn-rate', 'master-list'];
+
+// Tracks whether the churn search box was focused, so we can restore focus and
+// cursor position after the bar re-renders (fixes losing focus after 1 char).
+const churnSearchFocus = { active: false, pos: null };
+
+function renderChurnTopBar() {
+  const bar = $('#filter-bar');
+  if (!bar) return;
+  bar.replaceChildren();
+  const row = el('div', { class: 'filter-row' });
+
+  // universe of churn rows to populate dropdown options
+  const all = (state.churnAnalysis || []).map((r) => ({
+    squad: r.squad, kam: r.kam,
+    reason: r.reason_bucket || 'Unspecified',
+    initiatedBy: norm(r.delist_initiated_by) === 'ho' ? 'Home Owner' : norm(r.delist_initiated_by) === 'sv' ? 'StayVista' : (r.delist_initiated_by || 'Unknown'),
+  }));
+  const uniq = (key) => [...new Set(all.map((r) => r[key]).filter(Boolean))].sort();
+  const f = state.cdFilters || {};
+
+  // Months + Years — same style/behaviour as the agreement bar
+  const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+  const monthSel = el('select', { class: 'period-select', 'aria-label': 'Month' }, [
+    el('option', { value: '', text: 'All months' }),
+    ...MONTHS.map((m, i) => el('option', { value: String(i + 1), text: m })),
+  ]);
+  monthSel.value = state.period.month;
+  monthSel.classList.toggle('active', !!state.period.month);
+  monthSel.addEventListener('change', () => {
+    state.period.month = monthSel.value;
+    state.caMonth = monthSel.value ? MONTH_NAMES[Number(monthSel.value) - 1] : null;
+    state.cdPage = 1; syncUrl(); render();
   });
-  const blob = new Blob([lines.join('\n')], {type:'text/csv;charset=utf-8;'});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url; a.download = `vista-mis-report-${new Date().toISOString().slice(0,10)}.csv`;
-  document.body.appendChild(a); a.click(); document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+
+  // Churn years come from the churn window (Apr 2025 → today), not property
+  // live dates — so we don't offer irrelevant years like 2017.
+  const churnYearSet = new Set();
+  for (const r of (state.churnAnalysis || [])) {
+    if (!isChurned(r.current_status)) continue;
+    const d = parseDate(r.delist_date);
+    if (d && !Number.isNaN(d.getTime()) && d >= FY_START && d <= FY_END) churnYearSet.add(d.getFullYear());
+  }
+  const years = [...churnYearSet].sort((a, b) => b - a);
+  const yearSel = el('select', { class: 'period-select', 'aria-label': 'Year' }, [
+    el('option', { value: '', text: 'All years' }),
+    ...years.map((y) => el('option', { value: String(y), text: String(y) })),
+  ]);
+  yearSel.value = state.period.year;
+  yearSel.classList.toggle('active', !!state.period.year);
+  yearSel.addEventListener('change', () => { state.period.year = yearSel.value; state.cdPage = 1; syncUrl(); render(); });
+
+  row.append(monthSel, yearSel);
+
+  // the churn dropdowns
+  const addSelect = (label, key, options) => {
+    const sel = el('select', { class: 'flt' });
+    sel.classList.toggle('active', !!f[key]);
+    sel.append(el('option', { value: '', text: label }));
+    for (const o of options) {
+      const opt = el('option', { value: o, text: o });
+      if (f[key] === o) opt.selected = true;
+      sel.append(opt);
+    }
+    sel.addEventListener('change', () => {
+      state.cdFilters = { ...(state.cdFilters || {}), [key]: sel.value || null };
+      state.cdPage = 1; render();
+    });
+    row.append(sel);
+  };
+  addSelect('All squads', 'squad', uniq('squad'));
+  addSelect('All KAMs', 'kam', uniq('kam'));
+  addSelect('All reasons', 'reason', uniq('reason'));
+  addSelect('All initiated-by', 'initiatedBy', uniq('initiatedBy'));
+  addSelect('All GCF ranges', 'gcfRange', ['<5%', '5% & above']);
+
+  // search box (same style as agreement)
+  const search = el('input', {
+    class: 'filter-search', type: 'search',
+    placeholder: 'Search property, KAM or squad…', 'aria-label': 'Search',
+    value: state.search,
+  });
+  let t;
+  search.addEventListener('input', () => {
+    clearTimeout(t);
+    // remember that the search is focused + where the cursor is, so we can
+    // restore it after render() rebuilds this bar (otherwise focus is lost
+    // after every keystroke).
+    t = setTimeout(() => {
+      churnSearchFocus.active = true;
+      churnSearchFocus.pos = search.selectionStart;
+      state.search = search.value.trim();
+      state.cdPage = 1;
+      render();
+    }, 180);
+  });
+  row.append(search);
+
+  const anyChurnFilter = (state.cdFilters && Object.values(state.cdFilters).some(Boolean)) || state.period.month || state.period.year || state.search;
+  const reset = el('button', { type: 'button', class: 'reset-btn', text: 'Reset filters', disabled: !anyChurnFilter });
+  reset.addEventListener('click', () => {
+    state.cdFilters = {}; state.period = { month: '', year: '' }; state.caMonth = null; state.search = '';
+    state.cdPage = 1; syncUrl(); render();
+  });
+  row.append(reset);
+
+  bar.append(row);
+  filterUI.built = false;   // force agreement bar to rebuild when we leave churn views
+
+  // Restore focus + cursor to the search box if the user was typing in it, so a
+  // re-render doesn't kick them out after each character.
+  if (churnSearchFocus.active) {
+    search.focus();
+    const p = churnSearchFocus.pos == null ? search.value.length : churnSearchFocus.pos;
+    try { search.setSelectionRange(p, p); } catch { /* type=search may not support it in all browsers */ }
+    churnSearchFocus.active = false;
+  }
 }
 
-/* ---------- MAIN RENDER ---------- */
-function renderActiveTab(){
-  if(activeRow){ renderRowDetail(); return; }
+function renderFilters() {
+  const bar = $('#filter-bar');
+  if (!bar) return;
 
-  const p = parseTab(activeTabId);
-  if(p.type === 'SOP'){
-    document.getElementById('view-root').innerHTML = sopHtml();
+  if (state.loading || state.error || !state.rows.length || state.view === 'diagnostics') {
+    bar.replaceChildren();
+    filterUI.built = false;
+    filterUI.controls = {};
     return;
   }
-  const rows = rowsForTab(activeTabId);
-  const state = getTabState(activeTabId);
-  const root = document.getElementById('view-root');
 
-  // Top-level cards reflect plain property counts (not adjusted for agreement expiry).
-  const counts = {};
-  rows.forEach(r=>{ const k = statusKey(fieldsFor(r).status); counts[k]=(counts[k]||0)+1; });
-
-  // Alerts are only about agreements genuinely expiring soon — red (7d) / orange (30d).
-  // Already-expired agreements are not alerted here; they live in Needs Attention below.
-  let urgentRed=0, urgentOrange=0;
-  rows.forEach(r=>{
-    const lvl = urgencyLevel(fieldsFor(r).endDateRaw);
-    if(lvl==='red') urgentRed++;
-    else if(lvl==='orange') urgentOrange++;
-  });
-
-  const cityCounts = {};
-  rows.forEach(r=>{
-    const city = fieldsFor(r).city;
-    if(city && city !== '—') cityCounts[city] = (cityCounts[city] || 0) + 1;
-  });
-  const leadingCity = Object.entries(cityCounts).sort((a,b)=>b[1]-a[1])[0];
-  const timeOfDay = new Date().getHours() < 12 ? 'Good morning' : new Date().getHours() < 18 ? 'Good afternoon' : 'Good evening';
-  const heroHtml = p.type === 'ALL' ? `
-    <section class="portfolio-hero">
-      <div class="hero-copy">
-        <span class="eyebrow">Portfolio command centre</span>
-        <h1>${timeOfDay}.<br><em>Every stay</em> in view.</h1>
-        <p>${rows.length} homes across ${squadList.length || 0} squads, with the signals that need your attention first.</p>
-        <div class="hero-meta">
-          <span><b>${leadingCity ? leadingCity[1] : 0}</b> homes in ${escapeHtml(leadingCity ? leadingCity[0] : 'your top city')}</span>
-          <span><b>${urgentRed + urgentOrange}</b> renewals to watch</span>
-        </div>
-      </div>
-      <div class="hero-art" aria-hidden="true">
-        <div class="sun-orb"></div><div class="hill hill-one"></div><div class="hill hill-two"></div>
-        <div class="hero-home"><i></i><i></i><i></i></div>
-        <div class="hero-stamp">SV<br><small>EST. 2015</small></div>
-      </div>
-    </section>` : '';
-
-  const kpiHtml = `
-    <div class="kpi-card kpi-total ${state.statusFilter==='all'?'active':''}" onclick="setStatusFilter('all')">
-      <div class="kpi-number">${rows.length}</div><div class="kpi-label">Total</div>
-    </div>
-    ${KPI_ORDER.map(k=>{
-      const sem = semanticStyleFor(k);
-      return `
-      <div class="kpi-card ${state.statusFilter===k?'active':''}" style="background:linear-gradient(135deg, ${hexMix(sem.dot,0.82)}, ${hexMix(sem.dot,0.55)});border-color:${sem.dot};" onclick="setStatusFilter('${k}')">
-        <div class="kpi-number" style="color:${sem.fg}">${counts[k]||0}</div>
-        <div class="kpi-label" style="color:${sem.fg}">${escapeHtml(KPI_LABELS[k])}</div>
-      </div>`;
-    }).join('')}
-  `;
-
-  const healthHtml = `<div class="health-strip"><span class="health-dot"></span> Auto-synced from Supabase${lastSyncedAt ? ` · last synced ${lastSyncedAt.toLocaleTimeString()}` : ''}.</div>`;
-
-  let alertHtml = '';
-  if(urgentRed > 0) alertHtml += `<div class="alert-banner red" onclick="setUrgentFilter('red')">⚠ ${urgentRed} agreement${urgentRed===1?'':'s'} expiring within 7 days ${state.urgentOnly==='red' ? '<span class="clear-btn" onclick="clearUrgentFilter(event)">clear filter</span>' : ''}</div>`;
-  if(urgentOrange > 0) alertHtml += `<div class="alert-banner orange" onclick="setUrgentFilter('orange')">⚠ ${urgentOrange} agreement${urgentOrange===1?'':'s'} expiring within 30 days ${state.urgentOnly==='orange' ? '<span class="clear-btn" onclick="clearUrgentFilter(event)">clear filter</span>' : ''}</div>`;
-
-  let bodyExtra = '';
-  let propertiesSection = '';
-  const scopeSummary = p.type === 'SQUAD' ? healthSummaryHtml(rows, `${p.name} squad`) : p.type === 'POC' ? healthSummaryHtml(rows, `${p.name}'s portfolio`) : '';
-  if(p.type === 'ALL'){
-    // Main dashboard combines portfolio signals with action-oriented work queues.
-    bodyExtra = `
-      ${portfolioAskHtml()}
-      ${healthSummaryHtml(rows, 'Portfolio')}
-      ${compactLeaderboardHtml()}
-      ${renewalTimelineHtml(rows)}
-      ${followUpWorkflowHtml(rows)}
-      ${squadDistributionChartHtml()}
-      ${topSquadStripsHtml()}
-      ${needsAttentionCompactHtml()}
-    `;
-  } else {
-    propertiesSection = `
-      ${renewalTimelineHtml(rows)}
-      ${followUpWorkflowHtml(rows)}
-      <div class="section-card">
-        <div class="section-title">Properties</div>
-        <div class="section-desc">Search within ${escapeHtml(p.name)}.</div>
-        <div class="search-row"><input id="search-box" placeholder="Search by property, city, or POC…" /></div>
-        <div id="result-area"></div>
-      </div>`;
-  }
-
-  root.innerHTML = `
-    ${heroHtml}
-    <div class="view-header">
-      <div><h2>${p.name}</h2><p class="desc">${p.type==='ALL' ? 'Portfolio-wide summary' : p.type==='SQUAD' ? 'Squad-level view' : 'POC-level view'} · live from Supabase</p></div>
-      ${p.type!=='ALL' ? '<div class="btn" style="cursor:default;">↓ Export</div>' : ''}
-    </div>
-    ${healthHtml}
-    ${scopeSummary}
-    <div class="kpi-row">${kpiHtml}</div>
-    ${alertHtml}
-    ${bodyExtra}
-    ${propertiesSection}
-  `;
-
-  if(p.type !== 'ALL' && p.type !== 'SOP'){
-    const searchBox = document.getElementById('search-box');
-    searchBox.value = state.search;
-    searchBox.addEventListener('input', (e)=>{ state.search = e.target.value.toLowerCase(); renderResultArea(); });
-    renderResultArea();
-  }
-}
-
-function setStatusFilter(key){ getTabState(activeTabId).statusFilter = key; renderActiveTab(); }
-function setUrgentFilter(level){
-  const state = getTabState(activeTabId);
-  state.urgentOnly = state.urgentOnly === level ? null : level;
-  renderActiveTab();
-}
-function clearUrgentFilter(evt){ evt.stopPropagation(); getTabState(activeTabId).urgentOnly = null; renderActiveTab(); }
-
-function applyFilters(rows){
-  const state = getTabState(activeTabId);
-  return rows.filter(row=>{
-    const f = fieldsFor(row);
-    const matchesSearch = !state.search || f.name.toLowerCase().includes(state.search) || f.owner.toLowerCase().includes(state.search) || f.city.toLowerCase().includes(state.search);
-    const matchesStatus = state.statusFilter === 'all' || statusKey(f.status) === state.statusFilter;
-    const matchesUrgent = !state.urgentOnly || urgencyLevel(f.endDateRaw) === state.urgentOnly;
-    return matchesSearch && matchesStatus && matchesUrgent;
-  });
-}
-
-function renderResultArea(){
-  const area = document.getElementById('result-area');
-  const rows = rowsForTab(activeTabId);
-  const filtered = applyFilters(rows);
-  window.__filteredRows = filtered;
-  if(filtered.length === 0){
-    area.innerHTML = `<div class="empty-note">No properties match this search/filter.</div>`;
+  // Churn pages get their own top filter bar (Months/Years/Squad/KAM/F&B/
+  // Reason/Initiated-by/GCF/Search) — the agreement Status/Search bar is hidden.
+  if (CHURN_VIEWS_WITH_BAR.includes(state.view)) {
+    renderChurnTopBar();
     return;
   }
-  area.innerHTML = `
-    <div class="result-count">${filtered.length} result${filtered.length===1?'':'s'}</div>
-    <div class="grid">${filtered.map((row,i)=>cardHtml(row,i)).join('')}</div>
-  `;
+
+  if (filterUI.built && bar.firstChild) { updateFilters(); return; }
+
+  bar.replaceChildren();
+  const row = el('div', { class: 'filter-row' });
+
+  // Month + Year period selects (filter on live_date)
+  const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+  const monthSel = el('select', { class: 'period-select', 'aria-label': 'Month' }, [
+    el('option', { value: '', text: 'All months' }),
+    ...MONTHS.map((m, i) => el('option', { value: String(i + 1), text: m })),
+  ]);
+  monthSel.value = state.period.month;
+  monthSel.classList.toggle('active', !!state.period.month);
+  monthSel.addEventListener('change', () => {
+    state.period.month = monthSel.value;
+    // keep the churn month (caMonth) in sync so churn cards filter by month too
+    state.caMonth = monthSel.value ? MONTHS[Number(monthSel.value) - 1] : null;
+    onFiltersChanged();
+  });
+
+  const years = [...new Set(state.rows.map((r) => r.__liveDateObj && r.__liveDateObj.getFullYear()).filter(Boolean))].sort((a, b) => b - a);
+  const yearSel = el('select', { class: 'period-select', 'aria-label': 'Year' }, [
+    el('option', { value: '', text: 'All years' }),
+    ...years.map((y) => el('option', { value: String(y), text: String(y) })),
+  ]);
+  yearSel.value = state.period.year;
+  yearSel.classList.toggle('active', !!state.period.year);
+  yearSel.addEventListener('change', () => { state.period.year = yearSel.value; onFiltersChanged(); });
+
+  row.append(monthSel, yearSel);
+  filterUI.monthSel = monthSel;
+  filterUI.yearSel = yearSel;
+
+  for (const [stateKey, cfg] of Object.entries(FILTER_FIELDS)) {
+    const ms = multiSelect({
+      key: cfg.key,
+      label: cfg.label,
+      options: uniqueValues(cfg.field, cfg.skip),
+      selected: state.filters[stateKey].slice(),
+      onChange: (vals) => {
+        state.filters[stateKey] = vals;
+        // liveOnly is only the status-card shortcut; a manual filter change drops it
+        state.filters.liveOnly = false;
+        onFiltersChanged();
+      },
+    });
+    filterUI.controls[stateKey] = ms;
+    row.append(ms);
+  }
+
+  const search = el('input', {
+    class: 'filter-search',
+    type: 'search',
+    placeholder: 'Search property, KAM or squad…',
+    'aria-label': 'Search',
+    value: state.search,
+  });
+  let t;
+  search.addEventListener('input', () => {
+    clearTimeout(t);
+    t = setTimeout(() => {
+      state.search = search.value.trim();
+      onFiltersChanged();
+    }, 180);
+  });
+  row.append(search);
+
+  const reset = el('button', { type: 'button', class: 'reset-btn', text: 'Reset filters', disabled: !hasAnyFilter() });
+  reset.addEventListener('click', () => {
+    state.filters = { squads: [], kams: [], statuses: [], newNoAgreement: false, expiring30: false };
+    state.period = { month: '', year: '' };
+    state.search = '';
+    onFiltersChanged();
+  });
+  row.append(reset);
+
+  const note = el('span', { class: 'result-note' });
+  row.append(note);
+
+  filterUI.search = search;
+  filterUI.reset = reset;
+  filterUI.note = note;
+  filterUI.built = true;
+
+  bar.append(row, el('div', { class: 'active-filters', id: 'active-filters' }));
+  updateFilters();
 }
 
-function cardHtml(row, idx){
-  const f = fieldsFor(row);
-  const st = styleFor(statusKey(f.status));
-  const health = healthFor(row);
-  const lvl = urgencyLevel(f.endDateRaw);
-  const d = daysRemaining(f.endDateRaw);
-  const badgeHtml = lvl ? `<div class="urgency-badge ${lvl}">${d<0 ? 'Expired' : d+' days left'}</div>` : '';
-  return `
-    <div class="card ${lvl?'urgent-'+lvl:''}">
-      ${badgeHtml}
-      <div class="card-top">
-        <h3>${escapeHtml(f.name)}</h3>
-        <div class="card-status"><span class="health-badge ${health.tone}">${health.score}<small>${health.label}</small></span><span class="pill" style="background:${st.bg};color:${st.fg}">${escapeHtml(f.status)}</span></div>
-      </div>
-      <div class="highlight-block">
-        <div class="highlight-row"><span class="k">POC</span><span class="v">${escapeHtml(f.owner)}</span></div>
-        <div class="highlight-row"><span class="k">Live Date</span><span class="v">${escapeHtml(f.kickoff)}</span></div>
-        <div class="highlight-row"><span class="k">Contract Status</span><span class="v">${escapeHtml(f.contractStatus)}</span></div>
-      </div>
-      <button class="view-btn" onclick="openRowDirect(${idx})">View full details →</button>
-    </div>`;
+/** Refresh what the mounted filter bar shows, without replacing its nodes. */
+function updateFilters() {
+  if (!filterUI.built) return;
+
+  for (const [stateKey, cfg] of Object.entries(FILTER_FIELDS)) {
+    filterUI.controls[stateKey]?._sync(
+      uniqueValues(cfg.field, cfg.skip),
+      state.filters[stateKey],
+    );
+  }
+
+  if (filterUI.search
+      && document.activeElement !== filterUI.search
+      && filterUI.search.value !== state.search) {
+    filterUI.search.value = state.search;
+  }
+  if (filterUI.reset) filterUI.reset.disabled = !hasAnyFilter();
+  if (filterUI.monthSel) { filterUI.monthSel.value = state.period.month; filterUI.monthSel.classList.toggle('active', !!state.period.month); }
+  if (filterUI.yearSel) { filterUI.yearSel.value = state.period.year; filterUI.yearSel.classList.toggle('active', !!state.period.year); }
+  if (filterUI.note) {
+    const shown = activeRows().length;
+    filterUI.note.textContent = hasAnyFilter()
+      ? `${fmtInt(shown)} of ${fmtInt(state.rows.length)} properties`
+      : `${fmtInt(state.rows.length)} properties`;
+  }
+
+  renderActiveFilters();
 }
 
-function openRowDirect(idx){
-  const filtered = window.__filteredRows || [];
-  activeRow = filtered[idx];
-  renderActiveTab();
+/** The visible readout of what's selected — chips, each individually removable. */
+function renderActiveFilters() {
+  const box = $('#active-filters');
+  if (!box) return;
+  box.replaceChildren();
+  if (!hasAnyFilter()) return;
+
+  box.append(el('span', { class: 'af-title', text: 'Filtering by' }));
+
+  const addChips = (list, key, keyLabel, cls) => {
+    list.forEach((v) => {
+      const x = el('button', { class: 'chip-x', type: 'button', 'aria-label': `Remove ${keyLabel} ${v}`, text: '×' });
+      x.addEventListener('click', () => {
+        state.filters[key] = state.filters[key].filter((s) => s !== v);
+        onFiltersChanged();
+      });
+      box.append(el('span', { class: `chip ${cls}`, title: `${keyLabel}: ${v}` }, [
+        el('span', { class: 'chip-key', text: keyLabel }),
+        el('span', { class: 'chip-val', text: v }),
+        x,
+      ]));
+    });
+  };
+
+  addChips(state.filters.squads,   'squads',   'Squad',  'chip-squad');
+  addChips(state.filters.kams,     'kams',     'KAM',    'chip-kam');
+  addChips(state.filters.statuses, 'statuses', 'Status', 'chip-status');
+
+  if (state.search) {
+    const x = el('button', { class: 'chip-x', type: 'button', 'aria-label': 'Clear search', text: '×' });
+    x.addEventListener('click', () => { state.search = ''; onFiltersChanged(); });
+    box.append(el('span', { class: 'chip chip-search' }, [
+      el('span', { class: 'chip-key', text: 'Search' }),
+      el('span', { class: 'chip-val', text: state.search }),
+      x,
+    ]));
+  }
+
+  const clearAll = el('button', { class: 'chip-x', type: 'button', 'aria-label': 'Clear all filters', text: '×' });
+  clearAll.addEventListener('click', () => {
+    state.filters = { squads: [], kams: [], statuses: [], newNoAgreement: false, expiring30: false };
+    state.period = { month: '', year: '' };
+    state.search = '';
+    onFiltersChanged();
+  });
+  box.append(el('span', { class: 'chip', style: 'border-style:dashed' }, [
+    el('span', { class: 'chip-val', text: 'Clear all' }),
+    clearAll,
+  ]));
 }
 
-function renderRowDetail(){
-  const root = document.getElementById('view-root');
-  const f = fieldsFor(activeRow);
-  const rowsHtml = Object.entries(activeRow).map(([key,val])=>`
-    <div class="detail-row"><div class="label">${escapeHtml(key)}</div><div class="val">${val===null||val===undefined||val===''?'<span style="color:#bbb">—</span>':escapeHtml(String(val))}</div></div>
-  `).join('');
-  root.innerHTML = `
-    <button class="back-link" onclick="activeRow=null; renderActiveTab();">← Back</button>
-    <div class="view-header"><div><h2>${escapeHtml(f.name)}</h2><p class="desc">Full record from Supabase</p></div></div>
-    <div class="detail-list">${rowsHtml}</div>
-  `;
+function onFiltersChanged() {
+  state.page = {};
+  state.returnTo = null;
+
+  // Filters now apply to whatever page the user is on — they no longer get
+  // yanked to Property Details. Each summary page (Live/Squad/KAM) already
+  // respects the active filters, so it just re-renders filtered in place.
+  // `focus` still tracks whether any filter is active (some views use it).
+  const onChurnPage = CHURN_VIEWS_WITH_BAR.includes(state.view);
+  if (!onChurnPage) {
+    state.focus = hasAnyFilter();
+  }
+
+  syncUrl();
+  renderSidebar();
+  renderFilters();
+  renderView();
 }
 
-function escapeHtml(str){
-  return String(str).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+function renderView() {
+  const root = $('#view-root');
+  root.replaceChildren();
+
+  // Help page is always available — even mid-error or while loading — so the
+  // team can read the guide whenever they need it.
+  if (state.view === 'help') { root.append(viewHelp()); return; }
+
+  if (state.loading) {
+    root.append(el('div', { class: 'state' }, [
+      el('div', { class: 'spinner' }),
+      el('h3', { text: 'Loading from Supabase' }),
+      el('p', { text: `Reading the “${SUPABASE_TABLE}” table.` }),
+    ]));
+    return;
+  }
+
+  if (state.error) {
+    const retry = el('button', { type: 'button', text: 'Try again' });
+    retry.addEventListener('click', boot);
+    const details = el('button', { type: 'button', text: 'Connection check' });
+    details.addEventListener('click', () => go('diagnostics'));
+    const help = el('button', { type: 'button', text: 'Open Help page' });
+    help.addEventListener('click', () => go('help'));
+
+    // Translate the technical error into plain words + what to do.
+    const raw = state.error || '';
+    let plain, steps;
+    if (/took longer|timed out|slow|network/i.test(raw)) {
+      plain = 'The dashboard could not finish loading the data in time. This is usually a slow internet connection, or the data is still syncing in the background.';
+      steps = ['Wait about a minute, then click “Try again”.',
+               'Check your internet connection.',
+               'If a data sync was just started, let it finish first, then try again.'];
+    } else if (/row level security|empty|zero rows|SELECT policy/i.test(raw)) {
+      plain = 'The dashboard connected, but no data came back. This is almost always a Supabase permission setting.';
+      steps = ['This one needs the tech team — it is a Supabase “Row Level Security” policy.',
+               'Share this screen with them; the Connection check page has the details they need.'];
+    } else if (/Missing VITE_|Environment Variables/i.test(raw)) {
+      plain = 'The dashboard is missing its connection settings (the keys that let it reach the database).';
+      steps = ['This needs the tech team — the Supabase keys need to be set in Vercel.',
+               'Share this screen and the Connection check page with them.'];
+    } else if (/returned 4|returned 5|status/i.test(raw)) {
+      plain = 'The database answered with an error instead of the data.';
+      steps = ['Click “Try again” once.',
+               'If it keeps happening, share this screen and the Connection check page with the tech team.'];
+    } else {
+      plain = 'Something stopped the dashboard from loading its data.';
+      steps = ['Click “Try again”.',
+               'If it keeps happening, open the Connection check page and share it with the tech team.'];
+    }
+
+    root.append(el('div', { class: 'state error' }, [
+      el('h3', { text: 'The dashboard could not load right now' }),
+      el('p', { class: 'err-plain', text: plain }),
+      el('p', { class: 'err-do-label', text: 'What to do:' }),
+      el('ol', { class: 'err-steps' }, steps.map((t) => el('li', { text: t }))),
+      el('details', { class: 'err-tech' }, [
+        el('summary', { text: 'Technical details (for the tech team)' }),
+        el('p', { text: raw }),
+      ]),
+      el('div', { style: 'display:flex; gap:8px; flex-wrap:wrap; justify-content:center; margin-top:6px' }, [retry, details, help]),
+    ]));
+    if (state.view === 'diagnostics') root.append(viewDiagnostics());
+    return;
+  }
+
+  if (!state.rows.length) {
+    const details = el('button', { type: 'button', text: 'Connection check' });
+    details.addEventListener('click', () => go('diagnostics'));
+    root.append(el('div', { class: 'state' }, [
+      el('h3', { text: 'No rows came back' }),
+      el('p', { html: `<code>${state.diag.tableUsed || SUPABASE_TABLE}</code> answered, but returned zero rows. That is almost always a missing <code>SELECT</code> policy under Supabase → Authentication → Policies.` }),
+      details,
+    ]));
+    if (state.view === 'diagnostics') root.append(viewDiagnostics());
+    return;
+  }
+
+  const rows = activeRows();
+
+  // Back button for a drilled-in (focused) view — top-left, returns to origin.
+  // Churn views (churned/churn-detail/churn-rate) render their own back button,
+  // so skip the global one there to avoid duplicates.
+  const churnViews = ['churned', 'churn-detail', 'churn-rate'];
+  if (state.focus && !churnViews.includes(state.view)) {
+    const back = el('button', { type: 'button', class: 'back-btn' }, [
+      el('span', { class: 'back-arrow', text: '‹' }),
+      'Go back',
+    ]);
+    back.addEventListener('click', goBack);
+    root.append(back);
+  }
+
+  // A missing required column means the pivots would quietly read "(blank)"
+  const missing = [['squad', 'squad'], ['kam', 'poc'], ['signing', 'contract_signing_status']]
+    .filter(([f]) => !state.cols[f]);
+  if (missing.length && state.view !== 'diagnostics') {
+    const link = el('button', { type: 'button', class: 'reset-btn', text: 'Open Connection check' });
+    link.addEventListener('click', () => go('diagnostics'));
+    root.append(el('div', { class: 'panel', style: 'border-color:#e8c9c7; background:var(--bad-bg)' }, [
+      el('div', { class: 'panel-body' }, [
+        el('p', { style: 'margin:0 0 10px' }, [
+          `The table loaded, but no column matched ${missing.map(([, l]) => `“${l}”`).join(' or ')}. Those figures will read “(blank)” until the column is found.`,
+        ]),
+        link,
+      ]),
+    ]));
+  }
+
+  switch (state.view) {
+    case 'diagnostics':
+      root.append(viewDiagnostics());
+      return;
+    case 'help':
+      root.append(viewHelp());
+      return;
+    case 'squad':
+      root.append(viewGroup(rows, '__squad', 'squad', 'Squad-wise summary',
+        'Agreement position by squad. Cards open filtered property details in another tab of this browser.'));
+      break;
+    case 'kam':
+      root.append(viewGroup(rows, '__kam', 'kam', 'KAM-wise summary',
+        'Agreement position by Owner Facing KAM. Cards open filtered property details in another tab of this browser.'));
+      break;
+    case 'properties':
+      root.append(viewProperties(rows));
+      break;
+    case 'churned':
+    case 'churn-detail':
+      root.append(viewChurnDetail());
+      break;
+    case 'churn-rate':
+      root.append(viewChurnRate());
+      break;
+    case 'master-list':
+      root.append(viewMasterList());
+      break;
+    case 'monthly-churn':
+      root.append(viewMonthlyChurn());
+      break;
+    case 'monthly-churn-detail':
+      root.append(viewMonthlyChurnDetail());
+      break;
+    default:
+      root.append(viewOverview(rows));
+  }
 }
 
-// Expose functions used via inline onclick/onchange attributes to the global scope,
-// since Vite builds this as an ES module (scoped by default, not global like a plain <script> tag).
+function render() {
+  renderSidebar();
+  renderTabs();
+  renderFilters();
+  renderView();
+}
+
+/* drawer ------------------------------------------------------------------- */
+
+function openDrawer() {
+  $('#sidebar')?.classList.add('open');
+  $('#nav-toggle')?.setAttribute('aria-expanded', 'true');
+  const scrim = $('#scrim');
+  if (scrim) {
+    scrim.hidden = false;
+    requestAnimationFrame(() => scrim.classList.add('show'));
+  }
+  document.body.style.overflow = 'hidden';
+}
+
+function closeDrawer() {
+  $('#sidebar')?.classList.remove('open');
+  $('#nav-toggle')?.setAttribute('aria-expanded', 'false');
+  const scrim = $('#scrim');
+  if (scrim) {
+    scrim.classList.remove('show');
+    setTimeout(() => { scrim.hidden = true; }, 200);
+  }
+  document.body.style.overflow = '';
+}
+
+/* auth --------------------------------------------------------------------- */
+
+const USER_KEY = 'vt.user';
+const validEmail = (v) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
+
+function showApp(email) {
+  state.user = email;
+  $('#login-screen').classList.add('hidden');
+  $('#app').classList.remove('hidden');
+  $('#who-label').textContent = email;
+}
+
+function handleLogin() {
+  const input = $('#email-input');
+  const value = input.value.trim();
+  if (!validEmail(value)) {
+    input.classList.add('invalid');
+    $('#login-error').classList.add('show');
+    input.focus();
+    return;
+  }
+  input.classList.remove('invalid');
+  $('#login-error').classList.remove('show');
+  try { localStorage.setItem(USER_KEY, value); } catch { /* private mode */ }
+  showApp(value);
+  boot();
+}
+
+function signOut() {
+  try { localStorage.removeItem(USER_KEY); } catch { /* ignore */ }
+  state.user = null;
+  $('#app').classList.add('hidden');
+  $('#login-screen').classList.remove('hidden');
+  $('#email-input').value = '';
+}
+
+/* 10 -------------------------------------------------------------------- boot */
+
+// ---- data cache (localStorage, shared across tabs, short expiry) ----------
+const DATA_CACHE_KEY = 'vt.datacache.v3';   // bumped: v1 caches lacked momChurn
+const DATA_CACHE_TTL = 10 * 60 * 1000;   // 10 minutes
+
+function readDataCache() {
+  try {
+    const raw = localStorage.getItem(DATA_CACHE_KEY);
+    if (!raw) return null;
+    const obj = JSON.parse(raw);
+    if (!obj || !obj.t || (Date.now() - obj.t) > DATA_CACHE_TTL) {
+      localStorage.removeItem(DATA_CACHE_KEY);
+      return null;
+    }
+    return obj.d;
+  } catch {
+    return null;
+  }
+}
+
+function writeDataCache(data) {
+  try {
+    localStorage.setItem(DATA_CACHE_KEY, JSON.stringify({ t: Date.now(), d: data }));
+  } catch {
+    // too big for storage, or private mode — skip caching, no harm done
+    try { localStorage.removeItem(DATA_CACHE_KEY); } catch { /* ignore */ }
+  }
+}
+
+async function boot(isRefresh = false) {
+  if (state.refreshing) return;
+  state.refreshing = true;
+  paintRefresh();
+
+  // A refresh keeps the current tab and filters on screen while it reloads
+  state.loading = !isRefresh || !state.rows.length;
+  state.error = null;
+  state.diag = {};
+  if (state.loading) render();
+
+  try {
+    const cached = !isRefresh ? readDataCache() : null;
+    let raw, churnAnalysis, gcfMarginal, momChurn;
+
+    if (cached && Array.isArray(cached.momChurn)) {
+      // reuse recently-fetched data — but only if it actually includes momChurn
+      ({ raw, churnAnalysis, gcfMarginal, momChurn } = cached);
+    } else {
+      raw = await fetchAllRows(state.diag);
+      // The churn and GCF tables are independent — load them in parallel.
+      [churnAnalysis, gcfMarginal, momChurn] = await Promise.all([
+        fetchTable('churn_analysis'),
+        fetchTable('gcf_marginal'),
+        fetchTable('mom_churn'),
+      ]);
+      writeDataCache({ raw, churnAnalysis, gcfMarginal, momChurn });
+    }
+
+    state.raw = raw;
+    state.churnAnalysis = churnAnalysis;
+    state.gcfMarginal = gcfMarginal;
+    state.momChurn = momChurn || [];
+    state.cols = resolveColumns(raw[0]);
+
+    // names can't separate the two status columns — the data can
+    const detected = detectStatusColumns(raw);
+    if (detected.signing)   state.cols.signing = detected.signing;
+    if (detected.lifecycle) state.cols.lifecycle = detected.lifecycle;
+    if (detected.signing && detected.lifecycle && detected.signing === detected.lifecycle) {
+      state.cols.lifecycle = null;   // one column carries everything
+    }
+    state.diag.statusDetection = detected.scored;
+
+    state.rows = normalizeRows(raw, state.cols);
+
+    // every column the table actually has — union, in case rows differ
+    const all = new Set();
+    for (const r of raw.slice(0, 50)) Object.keys(r).forEach((k) => all.add(k));
+    state.diag.allColumns = [...all];
+
+    // every distinct source-value combination and the bucket it produced
+    const seen = new Map();
+    for (const r of state.rows) {
+      const key = `${r.__statusRaw}||${r.__status}||${r.__source || 'derived'}`;
+      if (!seen.has(key)) seen.set(key, { raw: r.__statusRaw, bucket: r.__status, source: r.__source, count: 0 });
+      seen.get(key).count += 1;
+    }
+    state.diag.statusMap = [...seen.values()].sort((a, b) => b.count - a.count);
+
+    state.error = null;
+  } catch (err) {
+    state.error = err.message || String(err);
+    state.rows = [];
+    state.raw = [];
+  } finally {
+    state.loading = false;
+    state.refreshing = false;
+    state.loadedAt = new Date();
+    render();
+    paintRefresh();
+  }
+}
+
+/** Topbar refresh button: spinner while loading, last-updated time when idle. */
+function paintRefresh() {
+  const btn = $('#refresh-btn');
+  const stamp = $('#last-updated');
+  if (!btn) return;
+  btn.classList.toggle('spinning', !!state.refreshing);
+  btn.disabled = !!state.refreshing;
+  btn.setAttribute('aria-busy', state.refreshing ? 'true' : 'false');
+  btn.title = state.refreshing ? 'Reloading from Supabase…' : 'Reload from Supabase';
+  if (stamp) {
+    if (state.refreshing) {
+      stamp.textContent = 'Refreshing…';
+    } else if (state.loadedAt) {
+      const live = state.rows.filter((r) => r.__live === true).length;
+      const total = state.rows.length;
+      const time = state.loadedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      // dynamic header: live/total straight from the last Supabase pull
+      stamp.textContent = `${fmtInt(live)} live · ${fmtInt(total)} total · ${time}`;
+    } else {
+      stamp.textContent = '';
+    }
+  }
+}
+
+const SHORTCUTS = [
+  ['Backspace', 'Go back to the previous page'],
+  ['H', 'Go to Home (Live Properties)'],
+  ['L', 'Go to Live Properties'],
+  ['Esc', 'Clear all active filters'],
+  ['R', 'Refresh data from Supabase'],
+  ['F', 'Focus the search / filter bar'],
+  ['?', 'Show this shortcuts list'],
+];
+
+function clearAllFilters() {
+  state.filters = { squads: [], kams: [], statuses: [], newNoAgreement: false, liveOnly: false, expiring30: false };
+  state.period = { month: '', year: '' };
+  state.search = '';
+  state.cdFilters = {};
+  if (typeof onFiltersChanged === 'function') onFiltersChanged(); else render();
+}
+
+function setupShortcuts() {
+  // header button
+  const right = document.querySelector('.topbar-right');
+  if (right && !document.getElementById('shortcuts-btn')) {
+    const btn = el('button', { id: 'shortcuts-btn', class: 'shortcuts-btn', type: 'button',
+      title: 'Keyboard shortcuts (?)', 'aria-label': 'Keyboard shortcuts' }, ['⌨', el('span', { class: 'sc-text', text: ' Shortcuts' })]);
+    btn.addEventListener('click', toggleShortcutsPopup);
+    // place it just before the theme toggle if present, else at start
+    const themeBtn = document.getElementById('theme-toggle');
+    right.insertBefore(btn, themeBtn || right.firstChild);
+  }
+
+  document.addEventListener('keydown', (e) => {
+    // never hijack typing in inputs/textareas or with modifier keys
+    const tag = (e.target.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea' || tag === 'select' || e.metaKey || e.ctrlKey || e.altKey) {
+      if (e.key === 'Escape' && (tag === 'input' || tag === 'textarea')) e.target.blur();
+      return;
+    }
+    // ignore if login screen is up
+    if (!document.getElementById('app') || document.getElementById('app').classList.contains('hidden')) return;
+
+    switch (e.key) {
+      case 'Backspace':
+        e.preventDefault(); goBack(); break;
+      case 'h': case 'H':
+        e.preventDefault(); go('overview'); break;
+      case 'l': case 'L':
+        e.preventDefault(); go('overview'); break;
+      case 'r': case 'R':
+        e.preventDefault(); boot(true); break;
+      case 'f': case 'F': {
+        e.preventDefault();
+        const s = document.querySelector('.filter-search');
+        if (s) { s.focus(); } else { document.querySelector('.sticky-controls')?.scrollIntoView({ behavior: 'smooth' }); }
+        break;
+      }
+      case 'Escape':
+        clearAllFilters(); closeShortcutsPopup(); break;
+      case '?':
+        e.preventDefault(); toggleShortcutsPopup(); break;
+      default: break;
+    }
+  });
+}
+
+function toggleShortcutsPopup() {
+  const existing = document.getElementById('shortcuts-pop');
+  if (existing) { existing.remove(); return; }
+  const pop = el('div', { id: 'shortcuts-pop', class: 'shortcuts-pop', role: 'dialog', 'aria-label': 'Keyboard shortcuts' }, [
+    el('div', { class: 'sc-head' }, [el('strong', { text: 'Keyboard shortcuts' }),
+      (() => { const x = el('button', { class: 'sc-close', type: 'button', 'aria-label': 'Close', text: '×' }); x.addEventListener('click', closeShortcutsPopup); return x; })()]),
+    ...SHORTCUTS.map(([k, d]) => el('div', { class: 'sc-row' }, [el('kbd', { text: k }), el('span', { text: d })])),
+  ]);
+  document.body.appendChild(pop);
+  // close on outside click
+  setTimeout(() => document.addEventListener('click', outsideCloseSc), 0);
+}
+function outsideCloseSc(e) {
+  const pop = document.getElementById('shortcuts-pop');
+  if (pop && !pop.contains(e.target) && e.target.id !== 'shortcuts-btn' && !e.target.closest('#shortcuts-btn')) closeShortcutsPopup();
+}
+function closeShortcutsPopup() {
+  document.getElementById('shortcuts-pop')?.remove();
+  document.removeEventListener('click', outsideCloseSc);
+}
+
+function init() {
+  console.log('%cVista Tracker build: LIVE-FILTERS-v9', 'font-weight:bold;color:#2f7d5b');
+  readUrl();
+
+  $('#login-btn')?.addEventListener('click', handleLogin);
+  $('#email-input')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') handleLogin(); });
+  $('#email-input')?.addEventListener('input', () => {
+    $('#email-input').classList.remove('invalid');
+    $('#login-error')?.classList.remove('show');
+  });
+  $('#signout-btn')?.addEventListener('click', signOut);
+  $('#refresh-btn')?.addEventListener('click', () => boot(true));
+
+  $('#nav-toggle')?.addEventListener('click', () => {
+    $('#sidebar').classList.contains('open') ? closeDrawer() : openDrawer();
+  });
+  $('#scrim')?.addEventListener('click', closeDrawer);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDrawer(); });
+  setupShortcuts();
+  window.addEventListener('resize', () => { if (window.innerWidth > 980) closeDrawer(); });
+  window.addEventListener('popstate', () => { readUrl(); render(); });
+
+  let saved = null;
+  try { saved = localStorage.getItem(USER_KEY); } catch { /* ignore */ }
+
+  if (saved && validEmail(saved)) {
+    showApp(saved);
+    boot();
+  }
+}
+
+/* kept on window because index.html historically used inline onclick handlers */
 window.handleLogin = handleLogin;
 window.signOut = signOut;
-window.toggleSection = toggleSection;
-window.openTab = openTab;
-window.closeTab = closeTab;
-window.setStatusFilter = setStatusFilter;
-window.setUrgentFilter = setUrgentFilter;
-window.clearUrgentFilter = clearUrgentFilter;
-window.openRowDirect = openRowDirect;
-window.openDetailFromRow = openDetailFromRow;
-window.toggleAttnSquad = toggleAttnSquad;
-window.setAttnTab = setAttnTab;
-window.selectPieSlice = selectPieSlice;
-window.closePieInfo = closePieInfo;
-window.manualRefresh = manualRefresh;
-window.downloadReportCsv = downloadReportCsv;
-window.toggleFollowUp = toggleFollowUp;
-window.prepareNudge = prepareNudge;
-window.askPortfolio = askPortfolio;
+
+init();
