@@ -1,4 +1,4 @@
-/* VISTA-TRACKER BUILD MARKER: GLOBAL-FILTERS-v12 — if you see 209 Expired, this file is live */
+/* VISTA-TRACKER BUILD MARKER: KAM-DROPDOWN-v13 — if you see 209 Expired, this file is live */
 /* ==========================================================================
    Vista Tracker — application logic
    --------------------------------------------------------------------------
@@ -868,8 +868,8 @@ function uniqueValues(field, skip) {
  * Multi-select dropdown: search, select-all/clear, live counts, and a trigger
  * that always shows what's currently chosen.
  */
-function multiSelect({ key, label, options, selected, onChange }) {
-  const wrap = el('div', { class: 'ms' });
+function multiSelect({ key, label, options, selected, onChange, single = false }) {
+  const wrap = el('div', { class: 'ms' + (single ? ' ms-single' : '') });
   const panelId = `ms-${key}-panel`;
 
   const valueSpan = el('span', { class: 'ms-value' });
@@ -905,6 +905,7 @@ function multiSelect({ key, label, options, selected, onChange }) {
 
   const selectAll = el('button', { type: 'button', text: 'Select all' });
   const clearAll  = el('button', { type: 'button', text: 'Clear' });
+  if (single) selectAll.style.display = 'none';   // one KAM at a time on churn views
 
   const panel = el('div', { class: 'ms-panel', id: panelId, hidden: true }, [
     search,
@@ -923,6 +924,14 @@ function multiSelect({ key, label, options, selected, onChange }) {
       for (const o of shown) {
         const box = el('input', { type: 'checkbox', checked: selected.includes(o.value) });
         box.addEventListener('change', () => {
+          if (single) {
+            // one value at a time: replace any prior pick
+            selected = box.checked ? [o.value] : [];
+            paintTrigger();
+            paintList();
+            onChange(selected.slice());
+            return;
+          }
           if (box.checked) { if (!selected.includes(o.value)) selected.push(o.value); }
           else selected.splice(selected.indexOf(o.value), 1);
           paintTrigger();
@@ -2295,10 +2304,14 @@ function viewMasterList() {
   // Scope: the HEADER filter wins when the user has set one (so changing the
   // header re-filters the open list), otherwise fall back to the scope the card
   // was opened with. This makes header filters work live on the drill-down.
+  const cdf = state.cdFilters || {};
   const headerSquad = state.filters.squads.length === 1 ? state.filters.squads[0] : null;
   const headerKam = state.filters.kams.length === 1 ? state.filters.kams[0] : null;
-  const squad = headerSquad || (f.squad != null ? f.squad : null);
-  const kam = headerKam || (f.kam != null ? f.kam : null);
+  // The churn filter bar shown on this view writes Squad/KAM into cdFilters, so
+  // honour those FIRST — otherwise picking a KAM/Squad here does nothing (the
+  // header bar is hidden on churn views). Then header bar, then the card's scope.
+  const squad = cdf.squad || headerSquad || (f.squad != null ? f.squad : null);
+  const kam = cdf.kam || headerKam || (f.kam != null ? f.kam : null);
   const search = norm(state.search || '');
 
   // Live properties only — filter values and counts come from Live rows.
@@ -2323,7 +2336,6 @@ function viewMasterList() {
   // churn dropdowns that also make sense for master rows: F&B band + GCF range.
   // (reason / initiated-by are churn-only fields and don't exist here, so they're
   //  intentionally not applied to the master property list.)
-  const cdf = state.cdFilters || {};
   if (cdf.fnb) rows = rows.filter((r) => fnbBucket(r.fnb_owner) === cdf.fnb);
   if (cdf.gcfRange) rows = rows.filter((r) => {
     const n = pctToNumber(r.gcf_current); if (n === null) return false;
@@ -3290,7 +3302,19 @@ function renderChurnTopBar() {
     row.append(sel);
   };
   addSelect('All squads', 'squad', uniq('squad'));
-  addSelect('All KAMs', 'kam', uniq('kam'));
+  // KAM: same searchable dropdown + full live-KAM roster as the header bar, so the
+  // two KAM filters match. Single-select here on purpose — the churn cards and the
+  // churn list both read one KAM, so allowing several would split card vs list.
+  const kamMs = multiSelect({
+    key: 'churn-kam', label: 'KAM', single: true,
+    options: uniqueValues('__kam', 'kam'),
+    selected: f.kam ? [f.kam] : [],
+    onChange: (vals) => {
+      state.cdFilters = { ...(state.cdFilters || {}), kam: vals[0] || null };
+      state.cdPage = 1; render();
+    },
+  });
+  row.append(kamMs);
   addSelect('All reasons', 'reason', uniq('reason'));
   addSelect('All initiated-by', 'initiatedBy', uniq('initiatedBy'));
   addSelect('All GCF ranges', 'gcfRange', ['<5%', '5% & above']);
@@ -3761,7 +3785,7 @@ function signOut() {
 /* 10 -------------------------------------------------------------------- boot */
 
 // ---- data cache (localStorage, shared across tabs, short expiry) ----------
-const DATA_CACHE_KEY = 'vt.datacache.v3';   // bumped: v1 caches lacked momChurn
+const DATA_CACHE_KEY = 'vt.datacache.v4';   // bumped for KAM-dropdown + master-list filter fix
 const DATA_CACHE_TTL = 10 * 60 * 1000;   // 10 minutes
 
 function readDataCache() {
