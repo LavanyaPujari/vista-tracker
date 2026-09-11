@@ -1,4 +1,4 @@
-/* VISTA-TRACKER BUILD MARKER: DATA-ACCURACY-v10 — if you see 209 Expired, this file is live */
+/* VISTA-TRACKER BUILD MARKER: GLOBAL-FILTERS-v12 — if you see 209 Expired, this file is live */
 /* ==========================================================================
    Vista Tracker — application logic
    --------------------------------------------------------------------------
@@ -846,9 +846,20 @@ function uniqueValues(field, skip) {
   for (const r of rows) counts.set(r[field], (counts.get(r[field]) || 0) + 1);
   // every option stays listed even at zero, so a selection is never invisible
   for (const r of state.rows) if (!counts.has(r[field])) counts.set(r[field], 0);
-  return [...counts.entries()]
-    .map(([value, count]) => ({ value, count }))
-    .sort((a, b) => cmp(a.value, b.value));
+
+  let entries = [...counts.entries()].map(([value, count]) => ({ value, count }));
+
+  // KAM dropdown: only real KAMs — those assigned to at least one LIVE property.
+  // This drops blanks and any stale/non-KAM names that aren't on a live property.
+  if (field === '__kam') {
+    const liveKams = new Set(
+      (state.rows || []).filter((r) => r.__live === true && r.__kam && String(r.__kam).trim() !== '' && r.__kam !== BLANK)
+        .map((r) => r.__kam)
+    );
+    entries = entries.filter((e) => liveKams.has(e.value));
+  }
+
+  return entries.sort((a, b) => cmp(a.value, b.value));
 }
 
 /* 7 ----------------------------------------------------------- UI primitives - */
@@ -1351,8 +1362,8 @@ function heroStats(scopeRows, { label } = {}) {
   // (churned ÷ live-at-beginning). Region = the selected squad, else India.
   // Month selected → that month; year → sum of that year's months; nothing →
   // sum of all months to date. KAM has no MOM row, so KAM scope shows no rate.
-  const momRegion = selectedKam ? null : (selectedSquad || 'India');
-  const momChurnRate = momRegion ? momRate(momRegion, month, state.period.year || null) : null;
+  const churnScope = selectedKam ? { kam: selectedKam } : (selectedSquad ? { squad: selectedSquad } : 'India');
+  const momChurnRate = momRate(churnScope, month, state.period.year || null);
 
   // period label reflects the month/year filter (or the full window if none)
   const periodLabel = (month || state.period.year)
@@ -1381,8 +1392,8 @@ function heroStats(scopeRows, { label } = {}) {
 
   // Two-FY display: current FY big, previous FY small. Only when no specific
   // month/year is selected (a picked month/year narrows to that period instead).
-  const region = momRegion || 'India';
-  const showTwoFY = !month && !state.period.year && !selectedKam;
+  const region = churnScope;
+  const showTwoFY = !month && !state.period.year;
   const curFy = fyStartYear(new Date());
   const prevFy = curFy - 1;
 
@@ -1926,8 +1937,8 @@ function viewChurnRate() {
   }
 
   // Label reflects the selected month/year (or two-FY view if none picked).
-  const region = kam ? null : (squad || 'India');
-  const showTwoFY = !month && !state.period.year && !kam;
+  const region = kam ? { kam } : (squad ? { squad } : 'India');
+  const showTwoFY = !month && !state.period.year;
   const periodLabel = (month || state.period.year)
     ? [month, state.period.year].filter(Boolean).join(' ')
     : 'FY view';
@@ -2167,18 +2178,17 @@ function churnSection(dimension, focused) {
   const wrap = el('div', {});
   const scope = kam ? kam : squad ? squad : 'all India';
 
-  // Churn rate from the NEW formula (churned ÷ live at month start). Region =
-  // the squad (or India). KAM has no region-level churn row, so KAM scope shows
-  // the squad/India figure it belongs to via the churn list fallback.
-  const region = kam ? null : (squad || 'India');
+  // Churn rate from the NEW formula (churned ÷ live at month start). Scope by
+  // squad OR kam OR all-India — computed per-KAM from that KAM's own properties.
+  const churnScope = kam ? { kam } : (squad ? { squad } : 'India');
   const curFy = fyStartYear(new Date());
   let rate = null, rateSub = 'no data';
   if (month) {
-    const p = region ? primaryMonthRate(region, month, state.period.year || curFy) : null;
+    const p = primaryMonthRate(churnScope, month, state.period.year || curFy);
     rate = p ? p.rate : null;
     rateSub = `${scope} · ${month}${state.period.year ? ' ' + state.period.year : ''} · churned ÷ live at month start`;
-  } else if (region) {
-    const fy = fyChurnRate(region, curFy);
+  } else {
+    const fy = fyChurnRate(churnScope, curFy);
     rate = fy.rate;
     rateSub = `${scope} · ${fyLabel(curFy)} · cumulative to date`;
   }
@@ -2282,13 +2292,14 @@ function viewMasterList() {
   back.addEventListener('click', () => goBackHistory('overview'));
   frag.append(back);
 
-  // Scope comes from the card that opened this view (state.mlFilter), so the
-  // list uses the SAME squad/KAM the card counted — not a leftover top-bar
-  // filter. Search still comes from the live filter bar.
-  const sc = activeScope();
-  const squad = (f.squad !== undefined ? f.squad : sc.squad) || null;
-  const kam = (f.kam !== undefined ? f.kam : sc.kam) || null;
-  const search = sc.search;
+  // Scope: the HEADER filter wins when the user has set one (so changing the
+  // header re-filters the open list), otherwise fall back to the scope the card
+  // was opened with. This makes header filters work live on the drill-down.
+  const headerSquad = state.filters.squads.length === 1 ? state.filters.squads[0] : null;
+  const headerKam = state.filters.kams.length === 1 ? state.filters.kams[0] : null;
+  const squad = headerSquad || (f.squad != null ? f.squad : null);
+  const kam = headerKam || (f.kam != null ? f.kam : null);
+  const search = norm(state.search || '');
 
   // Live properties only — filter values and counts come from Live rows.
   let rows = (state.gcfMarginal || []).filter((r) => norm(r.current_status) === 'live');
@@ -2402,18 +2413,19 @@ function churnedInSquadMonth(squad, monthNum, year) {
 //   live_at_month_start = current_live + everyone who churned from that month on.
 // Rate = churned that month ÷ live_at_month_start × 100.
 
-function smChurnedList(region) {
-  // churned rows in the CHURN tab for a region (or all if 'india'/null), with a
-  // parsed churn date. Deduped by property_id.
-  const isAll = !region || norm(region) === 'india';
+// churned rows (from the churn tab) scoped by squad AND/OR kam, from Apr 2025
+// onward, deduped. Pass {squad, kam}; omit both for all-India.
+function smChurnedList(scope) {
+  const sc = scopeArg(scope);
   const seen = new Set();
   const out = [];
   for (const r of (state.churnAnalysis || [])) {
     if (!isChurned(r.current_status)) continue;              // Paused/Delisted/TAC
-    if (!isAll && norm(r.squad) !== norm(region)) continue;
+    if (sc.squad && norm(r.squad) !== norm(sc.squad)) continue;
+    if (sc.kam && norm(r.kam) !== norm(sc.kam)) continue;
     const d = parseDate(r.delist_date);
     if (!d) continue;                                        // need a churn date
-    if (d < FY_START) continue;                              // churn counts from Apr 2025 onward
+    if (d < FY_START) continue;                              // Apr 2025 onward
     const id = pidKey(r.property_id);
     if (id && seen.has(id)) continue;
     if (id) seen.add(id);
@@ -2422,16 +2434,27 @@ function smChurnedList(region) {
   return out;
 }
 
-function smCurrentLive(region) {
-  // current live count for a region from the main table (agreement track)
-  const isAll = !region || norm(region) === 'india';
+// current live count scoped by squad AND/OR kam
+function smCurrentLive(scope) {
+  const sc = scopeArg(scope);
   let n = 0;
   for (const r of (state.rows || [])) {
     if (r.__live !== true) continue;
-    if (!isAll && norm(r.__squad) !== norm(region)) continue;
+    if (sc.squad && norm(r.__squad) !== norm(sc.squad)) continue;
+    if (sc.kam && norm(r.__kam) !== norm(sc.kam)) continue;
     n += 1;
   }
   return n;
+}
+
+// Accept either a region string (squad or 'India') or a {squad, kam} object,
+// so callers can scope by squad, KAM, or nothing (all-India).
+function scopeArg(scope) {
+  if (scope == null) return { squad: null, kam: null };
+  if (typeof scope === 'string') {
+    return norm(scope) === 'india' ? { squad: null, kam: null } : { squad: scope, kam: null };
+  }
+  return { squad: scope.squad || null, kam: scope.kam || null };
 }
 
 // One month's SM-tab churn for a region. year+monthNum identify the month.
@@ -2482,6 +2505,9 @@ function momNum(v) {
 //   (Paused + Delisted/TAC) ÷ Live Count at Beginning × 100.
 // Also cross-checks against the tab's own "Churn %" and warns (once) on a gap.
 function momMonth(region, monthName, year) {
+  // MOM tab only has India + squad rows (no KAM). For an object/KAM scope, or a
+  // KAM-scoped call, there's no MOM row — return null so the SM calc is used.
+  if (region && typeof region === 'object') return null;
   const rows = state.momChurn || [];
   const tgtRegion = norm(region || 'india');
   const tgtMonth = norm(monthName || '');
@@ -3946,7 +3972,7 @@ function closeShortcutsPopup() {
 }
 
 function init() {
-  console.log('%cVista Tracker build: DATA-ACCURACY-v10', 'font-weight:bold;color:#2f7d5b');
+  console.log('%cVista Tracker build: GLOBAL-FILTERS-v12', 'font-weight:bold;color:#2f7d5b');
   readUrl();
 
   $('#login-btn')?.addEventListener('click', handleLogin);
